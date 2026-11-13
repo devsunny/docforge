@@ -1,0 +1,235 @@
+{
+  "realm": "docforge",
+  "enabled": true,
+  "displayName": "DocForge",
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "editUsernameAllowed": false,
+  "rememberMe": true,
+  "verifyEmail": false,
+  "accessTokenLifespan": 3600,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "offlineSessionIdleTimeout": 2592000,
+  "defaultSignatureAlgorithm": "RS256",
+  "internationalizationEnabled": false,
+  "supportedLocales": [],
+  "defaultDefaultClientScopes": ["convert", "convert:read", "mcp"],
+  "users": [
+    {
+      "username": "demo",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Demo",
+      "lastName": "User",
+      "email": "demo@example.com",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "demo",
+          "temporary": false
+        }
+      ]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "docforge-rest",
+      "name": "DocForge REST API",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "consentRequired": false,
+      "fullScopeAllowed": false,
+      "redirectUris": [
+        "http://localhost:9876/callback",
+        "http://127.0.0.1:9876/callback"
+      ],
+      "webOrigins": [
+        "http://localhost:9876",
+        "http://127.0.0.1:9876"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:8080/*##http://127.0.0.1:8080/*"
+      },
+      "defaultClientScopes": ["convert", "convert:read"],
+      "optionalClientScopes": ["mcp"]
+    },
+    {
+      "clientId": "docforge-mcp",
+      "name": "DocForge MCP server",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "consentRequired": false,
+      "fullScopeAllowed": false,
+      "redirectUris": [
+        "http://localhost:6274/oauth/callback",
+        "http://127.0.0.1:6274/oauth/callback",
+        "http://localhost:9876/callback",
+        "http://127.0.0.1:9876/callback"
+      ],
+      "webOrigins": [
+        "http://localhost:6274",
+        "http://127.0.0.1:6274"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "defaultClientScopes": ["mcp"],
+      "optionalClientScopes": ["convert", "convert:read"]
+    },
+    {
+      "clientId": "docforge-api",
+      "name": "DocForge automation client",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "docforge-api-secret",
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "consentRequired": false,
+      "fullScopeAllowed": false,
+      "redirectUris": [],
+      "webOrigins": [],
+      "defaultClientScopes": ["convert", "convert:read"]
+    }
+  ],
+  "clientScopes": [
+    {
+      "name": "basic",
+      "description": "OpenID Connect basic scope",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": []
+    },
+    {
+      "name": "convert",
+      "description": "Create DocForge conversions and jobs",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Create conversions and jobs"
+      },
+      "protocolMappers": [
+        {
+          "name": "docforge-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "http://localhost:8080/api",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "userinfo.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "name": "convert:read",
+      "description": "Read DocForge formats and jobs",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Read formats and jobs"
+      },
+      "protocolMappers": [
+        {
+          "name": "docforge-api-read-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "http://localhost:8080/api",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "userinfo.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "name": "mcp",
+      "description": "Use DocForge MCP tools",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Use DocForge MCP tools"
+      },
+      "protocolMappers": [
+        {
+          "name": "docforge-mcp-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "http://localhost:8080/mcp",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "userinfo.token.claim": "false"
+          }
+        }
+      ]
+    }
+  ],
+  "components": {
+    "org.keycloak.services.clientregistration.policy.ClientRegistrationPolicy": [
+      {
+        "name": "Trusted Hosts",
+        "providerId": "trusted-hosts",
+        "subType": "anonymous",
+        "subComponents": {},
+        "config": {
+          "trusted-hosts": [
+            "localhost",
+            "127.0.0.1",
+            "host.docker.internal",
+            "code.visualstudio.com",
+            "*.vscode.dev",
+            "*.vscode-cdn.net"
+          ],
+          "host-sending-registration-request-must-match": ["false"],
+          "client-uris-must-match": ["true"]
+        }
+      },
+      {
+        "name": "Allowed Client Scopes",
+        "providerId": "allowed-client-templates",
+        "subType": "anonymous",
+        "subComponents": {},
+        "config": {
+          "allow-default-scopes": ["true"],
+          "allowed-client-scopes": ["basic", "convert", "convert:read", "mcp"]
+        }
+      },
+      {
+        "name": "Max Clients Limit",
+        "providerId": "max-clients",
+        "subType": "anonymous",
+        "subComponents": {},
+        "config": {
+          "max-clients": ["100"]
+        }
+      }
+    ]
+  }
+}

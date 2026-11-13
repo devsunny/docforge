@@ -1,0 +1,54 @@
+[package]
+name = "docforge-core"
+description = "Format catalog, conversion graph, and document conversion engines for DocForge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+calamine.workspace = true
+chrono.workspace = true
+csv.workspace = true
+encoding_rs.workspace = true
+futures-util.workspace = true
+html2md.workspace = true
+image.workspace = true
+mail-parser.workspace = true
+mime.workspace = true
+mime_guess.workspace = true
+msg_parser.workspace = true
+parking_lot.workspace = true
+pdf-extract.workspace = true
+printpdf.workspace = true
+pulldown-cmark.workspace = true
+quick-xml.workspace = true
+quoted_printable.workspace = true
+regex.workspace = true
+resvg.workspace = true
+roxmltree.workspace = true
+rust_xlsxwriter.workspace = true
+scraper.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tiny-skia.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+url.workspace = true
+usvg.workspace = true
+uuid.workspace = true
+which.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true }
+uuid.workspace = true

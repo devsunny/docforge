@@ -1,0 +1,623 @@
+openapi: 3.1.0
+info:
+  title: DocForge API
+  version: 0.1.0
+  description: |
+    Document conversion REST API. The same service exposes an MCP endpoint at
+    `/mcp`, an OAuth 2.1 authorization server, PKCE, dynamic client
+    registration, and RFC 9728 protected-resource discovery.
+
+    All `/api/v1` routes require an OAuth 2.1 Bearer access token with the
+    `convert` (or `convert:read`) scope. Use the authorization-code + PKCE flow.
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local development
+security:
+  - OAuth2: [convert]
+tags:
+  - name: Discovery
+  - name: Conversion
+  - name: Jobs
+  - name: Auth
+paths:
+  /healthz:
+    get:
+      tags: [Discovery]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    const: ok
+  /readyz:
+    get:
+      tags: [Discovery]
+      summary: Readiness probe
+      security: []
+      responses:
+        "200":
+          description: Service and directories are ready
+        "503":
+          description: Data directories or engines are unavailable
+  /api/v1/formats:
+    get:
+      tags: [Conversion]
+      summary: List canonical formats and catalog targets
+      security:
+        - OAuth2: [convert:read]
+      responses:
+        "200":
+          description: Formats
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                  formats:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/FormatInfo"
+  /api/v1/conversions:
+    get:
+      tags: [Conversion]
+      summary: List the 100 ranked conversions with live availability
+      security:
+        - OAuth2: [convert:read]
+      parameters:
+        - name: category
+          in: query
+          schema:
+            type: string
+        - name: available_only
+          in: query
+          schema:
+            type: boolean
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 100
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        "200":
+          description: Conversions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:
+                    type: integer
+                  count:
+                    type: integer
+                  conversions:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Conversion"
+  /api/v1/conversions/{rank}:
+    get:
+      tags: [Conversion]
+      summary: Get one catalog conversion
+      security:
+        - OAuth2: [convert:read]
+      parameters:
+        - name: rank
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+      responses:
+        "200":
+          description: Conversion details
+        "404":
+          description: Unknown rank
+  /api/v1/conversions/plan:
+    post:
+      tags: [Conversion]
+      summary: Plan the shortest engine route
+      security:
+        - OAuth2: [convert]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source_format, target_format]
+              properties:
+                source_format:
+                  type: string
+                  examples: [pdf]
+                target_format:
+                  type: string
+                  examples: [docx]
+                options:
+                  $ref: "#/components/schemas/ConversionOptions"
+      responses:
+        "200":
+          description: Plan
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConversionPlan"
+        "422":
+          description: No installed engine can perform the conversion
+  /api/v1/engines:
+    get:
+      tags: [Conversion]
+      summary: List conversion engines and whether they are installed
+      security:
+        - OAuth2: [convert:read]
+      responses:
+        "200":
+          description: Engines
+  /api/v1/stats:
+    get:
+      tags: [Discovery]
+      summary: Catalog and engine statistics
+      security:
+        - OAuth2: [convert:read]
+      responses:
+        "200":
+          description: Stats
+  /api/v1/convert:
+    post:
+      tags: [Conversion]
+      summary: Convert a file synchronously
+      description: |
+        Multipart upload. The response is the converted file with
+        `X-DocForge-Route` and `X-DocForge-Duration-Ms` headers. Intended for
+        files up to `MAX_SYNC_MB` (25 MiB by default).
+      security:
+        - OAuth2: [convert]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                target_format:
+                  type: string
+                source_format:
+                  type: string
+                options:
+                  type: string
+                  description: JSON-encoded ConversionOptions
+                rank:
+                  type: integer
+                  description: Use a catalog row instead of explicit formats
+      responses:
+        "200":
+          description: Converted file
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "422":
+          description: Conversion rejected
+        "504":
+          description: Conversion timed out
+  /api/v1/jobs:
+    post:
+      tags: [Jobs]
+      summary: Create an asynchronous conversion job
+      security:
+        - OAuth2: [convert]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                target_format:
+                  type: string
+                source_format:
+                  type: string
+                options:
+                  type: string
+                rank:
+                  type: integer
+      responses:
+        "202":
+          description: Job accepted
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+    get:
+      tags: [Jobs]
+      summary: List your jobs
+      security:
+        - OAuth2: [convert:read]
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 25
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [queued, running, succeeded, failed, cancelled]
+      responses:
+        "200":
+          description: Jobs
+  /api/v1/jobs/{id}:
+    get:
+      tags: [Jobs]
+      summary: Get job status
+      security:
+        - OAuth2: [convert:read]
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: Job
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "404":
+          description: Not found or not owned by this subject
+    delete:
+      tags: [Jobs]
+      summary: Cancel or delete a job
+      security:
+        - OAuth2: [convert]
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "202":
+          description: Cancellation requested
+        "204":
+          description: Job deleted
+  /api/v1/jobs/{id}/download:
+    get:
+      tags: [Jobs]
+      summary: Download a completed result
+      security:
+        - OAuth2: [convert]
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: Converted file
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "409":
+          description: Job is not complete
+  /.well-known/oauth-authorization-server:
+    get:
+      tags: [Auth]
+      summary: RFC 8414 authorization-server metadata
+      security: []
+      responses:
+        "200":
+          description: Metadata
+  /.well-known/oauth-protected-resource/mcp:
+    get:
+      tags: [Auth]
+      summary: RFC 9728 MCP protected-resource metadata
+      security: []
+      responses:
+        "200":
+          description: Metadata
+  /oauth/register:
+    post:
+      tags: [Auth]
+      summary: Dynamic client registration (RFC 7591)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [redirect_uris]
+              properties:
+                redirect_uris:
+                  type: array
+                  items:
+                    type: string
+                client_name:
+                  type: string
+                scope:
+                  type: string
+                token_endpoint_auth_method:
+                  type: string
+                  enum: [none, client_secret_basic, client_secret_post]
+      responses:
+        "201":
+          description: Registered client
+  /oauth/token:
+    post:
+      tags: [Auth]
+      summary: Token endpoint (authorization_code + PKCE, refresh_token, client_credentials)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [grant_type]
+              properties:
+                grant_type:
+                  type: string
+                  enum: [authorization_code, refresh_token, client_credentials]
+                code:
+                  type: string
+                redirect_uri:
+                  type: string
+                client_id:
+                  type: string
+                client_secret:
+                  type: string
+                code_verifier:
+                  type: string
+                refresh_token:
+                  type: string
+                scope:
+                  type: string
+                resource:
+                  type: string
+      responses:
+        "200":
+          description: Token response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+        "400":
+          description: OAuth error
+components:
+  securitySchemes:
+    OAuth2:
+      type: oauth2
+      description: OAuth 2.1 authorization code with PKCE (S256), or client credentials for confidential clients.
+      flows:
+        authorizationCode:
+          authorizationUrl: /oauth/authorize
+          tokenUrl: /oauth/token
+          scopes:
+            convert: Create conversions and jobs
+            convert:read: Read formats and jobs
+            mcp: Use the MCP endpoint
+            offline_access: Receive a refresh token
+  parameters:
+    JobId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  schemas:
+    FormatInfo:
+      type: object
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+        kind:
+          type: string
+        extensions:
+          type: array
+          items:
+            type: string
+        mime:
+          type: string
+        description:
+          type: string
+        targets:
+          type: array
+          items:
+            type: string
+    Conversion:
+      type: object
+      properties:
+        rank:
+          type: integer
+        source:
+          type: string
+        target:
+          type: string
+        category:
+          type: string
+        use_case:
+          type: string
+        requires_ocr:
+          type: boolean
+        searchable:
+          type: boolean
+        available:
+          type: boolean
+        direct:
+          type: boolean
+        route:
+          type: string
+        engine_steps:
+          type: array
+          items:
+            type: string
+    ConversionOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        ocr:
+          type: boolean
+          default: false
+        ocr_language:
+          type: string
+          default: eng
+        preserve_layout:
+          type: boolean
+          default: false
+        page:
+          type: integer
+          minimum: 1
+        max_pages:
+          type: integer
+          minimum: 1
+        timeout_secs:
+          type: integer
+          minimum: 1
+          maximum: 3600
+        pdf:
+          type: object
+          properties:
+            page_size:
+              type: string
+              enum: [a4, letter, legal]
+            landscape:
+              type: boolean
+            margin_mm:
+              type: number
+            dpi:
+              type: integer
+            title:
+              type: string
+        image:
+          type: object
+          properties:
+            quality:
+              type: integer
+              minimum: 1
+              maximum: 100
+            max_width:
+              type: integer
+            background:
+              type: string
+        csv:
+          type: object
+          properties:
+            delimiter:
+              type: string
+            has_headers:
+              type: boolean
+            infer_types:
+              type: boolean
+        spreadsheet:
+          type: object
+          properties:
+            sheet_name:
+              type: string
+            header_row:
+              type: boolean
+    ConversionPlan:
+      type: object
+      properties:
+        source:
+          type: string
+        target:
+          type: string
+        steps:
+          type: array
+          items:
+            type: object
+        total_cost:
+          type: integer
+        direct:
+          type: boolean
+        identity:
+          type: boolean
+        catalog_rank:
+          type: integer
+          nullable: true
+        notes:
+          type: array
+          items:
+            type: string
+        summary:
+          type: string
+    Job:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [queued, running, succeeded, failed, cancelled]
+        source_format:
+          type: string
+        target_format:
+          type: string
+        input_name:
+          type: string
+        output_name:
+          type: string
+        input_bytes:
+          type: integer
+        output_bytes:
+          type: integer
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        route:
+          type: string
+          nullable: true
+        download_url:
+          type: string
+          nullable: true
+        error:
+          type: string
+          nullable: true
+    TokenResponse:
+      type: object
+      properties:
+        access_token:
+          type: string
+        token_type:
+          type: string
+          const: Bearer
+        expires_in:
+          type: integer
+        refresh_token:
+          type: string
+        scope:
+          type: string
