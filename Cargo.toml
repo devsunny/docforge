@@ -78,6 +78,8 @@ usvg = "0.44.0"
 uuid = { version = "1.11.0", features = ["serde", "v4"] }
 which = "7.0.0"
 zip = { version = "=2.2.2", default-features = false, features = ["deflate"] }
+deckcraft-pdf = "0.6.1"
+deckcraft-pptx = "0.6.1"
 djvu-rs = { version = "0.45.0", features = ["pdf"] }
 rars = { version = "0.12.4", default-features = false, features = ["write"] }
 heic-rs = { version = "0.1.4", default-features = false, features = ["std"] }

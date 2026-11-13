@@ -37,6 +37,13 @@ licenses.
 | `iwork` | MIT | Pages/Numbers/Keynote content extraction |
 | `stet` | Apache-2.0 OR MIT | PostScript interpretation/rendering; embeds URW base-35 fonts under SIL OFL 1.1 |
 
+## Optional DeckCraft spike
+
+When built with `--features deckcraft`, DocForge links:
+
+- `deckcraft-pptx` — MIT OR Apache-2.0
+- `deckcraft-pdf` — MIT OR Apache-2.0
+
 ## Rust crates
 
 All other Rust dependencies are declared in `Cargo.toml` / `Cargo.lock` and

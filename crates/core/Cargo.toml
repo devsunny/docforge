@@ -55,6 +55,12 @@ epub3-kindle.workspace = true
 mobi.workspace = true
 iwork.workspace = true
 stet.workspace = true
+deckcraft-pdf = { workspace = true, optional = true }
+deckcraft-pptx = { workspace = true, optional = true }
+
+[features]
+deckcraft = ["dep:deckcraft-pdf", "dep:deckcraft-pptx"]
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true }

@@ -9,6 +9,9 @@ license.workspace = true
 name = "docforge"
 path = "src/main.rs"
 
+[features]
+deckcraft = ["docforge-core/deckcraft"]
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true

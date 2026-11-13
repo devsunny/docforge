@@ -334,6 +334,16 @@ DocForge ships a set of pure-Rust engines and probes optional external tools at 
 | `native-iwork` | Pages → DOCX/PDF/TXT/MD; Numbers → XLSX/PDF/CSV; KEY → PPTX/PDF | Native content extraction; not a layout renderer |
 | `native-postscript` | PS → PDF/PNG | `stet` Level 3 interpreter; PDF output is rasterized |
 
+### Experimental DeckCraft PPTX path
+
+A feature-gated spike uses [DeckCraft](https://github.com/storytold/deckcraft) for PPTX → PDF:
+
+```bash
+cargo build --release -p docforge-server --features deckcraft
+```
+
+When enabled, `deckcraft` outranks `office2pdf`/LibreOffice for PPTX→PDF and produces a slide render with a selectable text layer. It is **not default**: DeckCraft is alpha, PDFs are larger, and conversion is slower. See [the spike report](docs/SPIKE_DECKDRAFT.md).
+
 Office-to-PDF is preferred on a cost tie with LibreOffice, so a normal installation uses the pure-Rust path first. PDF rasterization is native-first; Poppler/Ghostscript remain for vector SVG and unsupported PDF features. Native OCR is a fallback: when Tesseract is installed its lower cost keeps it preferred for higher accuracy, more languages, and searchable PDF.
 
 ### Optional external engines

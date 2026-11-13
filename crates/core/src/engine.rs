@@ -105,6 +105,8 @@ fn native_engines() -> Vec<Arc<dyn Engine>> {
         Arc::new(crate::native_extra2::EbookEngine),
         Arc::new(crate::native_extra2::IworkEngine),
         Arc::new(crate::native_extra2::PostScriptEngine),
+        #[cfg(feature = "deckcraft")]
+        Arc::new(crate::native_deckcraft::DeckCraftEngine),
     ]
 }
 
