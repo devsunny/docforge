@@ -167,6 +167,16 @@ fn truncate(text: &str, limit: usize) -> String {
     }
 }
 
+async fn wait_for_output(dir: &Path, extension: &str, attempts: usize) -> Option<PathBuf> {
+    for _ in 0..attempts {
+        if let Some(path) = find_output(dir, extension) {
+            return Some(path);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    find_output(dir, extension)
+}
+
 fn find_output(dir: &Path, extension: &str) -> Option<PathBuf> {
     let mut matches: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
         .ok()?
@@ -373,11 +383,26 @@ impl Engine for LibreOfficeEngine {
                     .join(format!("{}.{}", stem.to_string_lossy(), extension))
             })
             .filter(|path| path.exists());
-        let found = expected.or_else(|| find_output(ctx.workdir, extension));
+        let found = expected
+            .or_else(|| find_output(ctx.workdir, extension))
+            .or(wait_for_output(ctx.workdir, extension, 75).await);
         let found = found.ok_or_else(|| {
+            let entries = std::fs::read_dir(ctx.workdir)
+                .ok()
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             ConvertError::engine(
                 self.id(),
-                format!("LibreOffice produced no .{extension} output"),
+                format!(
+                    "LibreOffice produced no .{extension} output in {} (entries: {:?})",
+                    ctx.workdir.display(),
+                    entries
+                ),
             )
         })?;
         finish_output(found, ctx.output)

@@ -288,13 +288,10 @@ async fn parse_upload(
             state.service.catalog().get(rank).ok_or_else(|| {
                 ApiError::not_found(format!("conversion rank {rank} does not exist"))
             })?;
-        let detected = docforge_core::detect::detect_bytes(
-            &bytes,
-            Some(&filename),
-            client_mime.as_deref(),
-        )
-        .ok()
-        .map(|detected| detected.format);
+        let detected =
+            docforge_core::detect::detect_bytes(&bytes, Some(&filename), client_mime.as_deref())
+                .ok()
+                .map(|detected| detected.format);
         source = detected
             .filter(|format| entry.source_formats.contains(format))
             .or_else(|| entry.source_formats.first().copied());

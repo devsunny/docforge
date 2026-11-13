@@ -1,5 +1,6 @@
 target/
 data/
+.docforge-tmp/
 *.log
 .env
 .DS_Store

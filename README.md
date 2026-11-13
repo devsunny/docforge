@@ -60,6 +60,40 @@ cargo run -p docforge-server -- serve
 
 With `AUTH_MODE=embedded` (the `.env.example` default) no external identity provider is needed. To run against a local Keycloak, set `AUTH_MODE=keycloak` and the `KEYCLOAK_*` URLs from `.env.example`, or use Compose.
 
+### Terminal CLI
+
+The same `docforge` binary is also a local conversion CLI. It does **not** require OAuth, Keycloak, or a running server:
+
+```bash
+docforge convert report.pdf --to docx -o report.docx
+docforge convert notes.md pdf
+docforge convert scan.jpg --to txt --ocr --ocr-language eng
+docforge convert mail.msg --to md -o mail.md
+
+# stdin/stdout pipelines
+cat notes.md | docforge convert - --to pdf --stdout > notes.pdf
+
+# batch a directory
+docforge batch ./inbox --to pdf --output-dir ./out --recursive
+
+# inspect before converting
+docforge plan msg md
+docforge formats --available-only
+docforge engines
+```
+
+Use `docforge convert --help` for PDF DPI/page options, OCR language, CSV delimiters, timeouts, and `--json`/`--force`/`--quiet`. `docforge batch` skips existing outputs unless `--force`; use `--continue-on-error` for large batches.
+
+Set `DOCFORGE_TMP` if the system temporary directory is not writable. Build/install the binary with:
+
+```bash
+cargo build --release -p docforge-server
+# binary: target/release/docforge
+# or: cargo install --path crates/server
+```
+
+See [CLI details](docs/CLI.md).
+
 Requirements: stable Rust 1.88+ (the workspace is tested with current stable) and, for the full catalog, optional external tools (see the engine matrix below). Native-only mode works without any external binary for the core text/data/image conversions.
 
 ```bash
