@@ -84,6 +84,18 @@ docforge engines
 
 Use `docforge convert --help` for PDF DPI/page options, OCR language, CSV delimiters, timeouts, and `--json`/`--force`/`--quiet`. `docforge batch` skips existing outputs unless `--force`; use `--continue-on-error` for large batches.
 
+On Windows PowerShell, `>` writes text, not raw bytes, so binary PDF output must use `--output`:
+
+```powershell
+.\\docforge.exe convert .\\input.docx --to pdf --output .\\output.pdf
+```
+
+or a `cmd.exe` redirect:
+
+```bat
+cmd /c "docforge.exe convert input.docx --to pdf --stdout > output.pdf"
+```
+
 Set `DOCFORGE_TMP` if the system temporary directory is not writable. Build/install the binary with:
 
 ```bash

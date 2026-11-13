@@ -67,6 +67,19 @@ docforge convert scan.png --to txt --ocr --stdout
 When reading stdin, write the input to a temporary file first. The CLI chooses
 a writable scratch directory automatically; set `DOCFORGE_TMP=/path` if needed.
 
+**Windows PowerShell:** `>` is a text redirect and will corrupt binary output
+(including PDFs). Use `--output` instead:
+
+```powershell
+.\\docforge.exe convert .\\input.docx --to pdf --output .\\output.pdf
+```
+
+Or use cmd.exe's byte-preserving redirect:
+
+```bat
+cmd /c "docforge.exe convert input.docx --to pdf --stdout > output.pdf"
+```
+
 ## Batch
 
 ```bash

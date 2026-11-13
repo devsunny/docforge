@@ -88,7 +88,11 @@ enum Command {
         /// Source format override; detected when omitted.
         #[arg(long = "from", value_name = "FORMAT")]
         source: Option<String>,
-        /// Write the converted bytes to stdout; logs go to stderr.
+        /// Write converted bytes to stdout; logs go to stderr.
+        ///
+        /// On Windows PowerShell, `>` is a text redirect and corrupts binary
+        /// PDFs. Prefer `--output`, or redirect from cmd.exe:
+        /// `cmd /c "docforge ... --stdout > file.pdf"`.
         #[arg(long, conflicts_with = "json")]
         stdout: bool,
         /// Overwrite an existing output file.
