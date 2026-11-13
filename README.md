@@ -94,7 +94,7 @@ cargo build --release -p docforge-server
 
 See [CLI details](docs/CLI.md).
 
-Requirements: stable Rust 1.88+ (the workspace is tested with current stable) and, for the full catalog, optional external tools (see the engine matrix below). Native-only mode works without any external binary for the core text/data/image conversions.
+Requirements: stable Rust 1.100+ (the workspace is tested with current stable) and, for the full catalog, optional external tools (see the engine matrix below). Native-only mode works without any external binary for the core text/data/image conversions, including Office-to-PDF and PDF rasterization.
 
 ```bash
 # See which engines were detected and which catalog rows are currently routable.
@@ -308,14 +308,14 @@ The native engine is pure Rust and always available. External engines are probed
 
 | Engine | Tool | Typical formats |
 | --- | --- | --- |
-| Native | â€” | TXT/MD/HTML/DOCX/ODT/RTF/PDF/EPUB/PPTX, CSV/TSV/XLSX/ODS/JSON/XML/YAML/TOML, VCF/ICS, JPG/PNG/TIFF/WEBP/BMP/SVG, CBZ, EML, Outlook MSG (including MSGâ†’Markdown/TXT/HTML/DOCX/PDF) |
+| Native | — | TXT/MD/HTML/DOCX/ODT/RTF/PDF/EPUB/PPTX, CSV/TSV/XLSX/ODS/JSON/XML/YAML/TOML, VCF/ICS, JPG/PNG/TIFF/WEBP/BMP/SVG, CBZ, EML, Outlook MSG; DOCX/PPTX/XLSX→PDF via Typst; PDF→PNG/JPG/TIFF; English/Latin OCR |
 | LibreOffice | `soffice` | DOC/DOCX/ODT/RTF, PPT/PPTX/ODP, XLS/XLSX/ODS, PDF, HTML |
 | Pandoc | `pandoc` | Markdown, HTML, DOCX, ODT, EPUB, LaTeX, RTF, PPTX |
 | Poppler | `pdftotext`, `pdftoppm`, `pdftohtml`, `pdftocairo` | PDF â†’ text/HTML/SVG/raster |
 | Ghostscript | `gs` | PS â†” PDF, PDF â†’ raster |
 | ImageMagick | `magick` | Images, HEIC, SVG, PDF raster |
 | Calibre | `ebook-convert` | EPUB â†” MOBI, EPUB â†’ PDF/DOCX |
-| Tesseract | `tesseract` + Poppler | OCR â†’ TXT/PDF, searchable PDF |
+| Tesseract | `tesseract` + Poppler | Higher-accuracy/multi-language OCR, searchable PDF |
 | 7-Zip | `7z` | CBR extraction |
 | DjVuLibre | `ddjvu`, `cjb2`, `djvm` | DjVu â†” PDF |
 | gxps | `gxps` | XPS â†’ PDF |
@@ -325,9 +325,9 @@ The native engine is pure Rust and always available. External engines are probed
 
 The full [Dockerfile](Dockerfile) installs the Linux-capable set. Pages/Key/Numbers are only available on macOS because they rely on AppleScript export; the catalog still lists them and reports them unavailable elsewhere.
 
-**Fidelity notes.** The native document route preserves block structure (headings, paragraphs, lists, tables, code) rather than pixel layout. LibreOffice/Pandoc routes are preferred when installed for higher fidelity. PDF text extraction uses the PDF text layer; scanned PDFs require Tesseract (`options.ocr=true`). PDF â†’ raster converts the selected/first page unless an engine supports multi-page output. PDF table extraction is heuristic.
+**Fidelity notes.** The native document route preserves block structure (headings, paragraphs, lists, tables, code) rather than pixel layout. DOCX/PPTX/XLSX→PDF uses the native `office2pdf`/Typst renderer and falls back to the structural model if a file is unsupported; LibreOffice remains available for exact/complex layout. PDF rasterization uses the pure-Rust `pdf-render` engine. PDF text extraction uses the PDF text layer; scanned PDFs use native `ocrs` (English/Latin) when Tesseract is not installed (`options.ocr=true`). PDF → raster converts the selected/first page unless an engine supports multi-page output. PDF table extraction is heuristic.
 
-See [Conversions](docs/CONVERSIONS.md) for the full routing policy and per-category notes.
+See [Conversions](docs/CONVERSIONS.md) for the full routing policy and per-category notes, and [Third-party notices](THIRD_PARTY.md) for bundled engine/model licenses.
 
 ---
 

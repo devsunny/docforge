@@ -21,7 +21,6 @@ docforge-core = { path = "../core" }
 docforge-mcp = { path = "../mcp" }
 futures-util.workspace = true
 http-body-util.workspace = true
-mime_guess.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true

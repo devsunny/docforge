@@ -1,0 +1,4425 @@
+use super::*;
+use crate::config::XlsxUiScript;
+use crate::ir::*;
+
+/// Helper: build a minimal XLSX as bytes with a single sheet.
+fn build_xlsx_bytes(sheet_name: &str, cells: &[(&str, &str)]) -> Vec<u8> {
+    let mut book = umya_spreadsheet::new_file();
+    {
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        sheet.set_name(sheet_name);
+        for &(coord, value) in cells {
+            sheet.get_cell_mut(coord).set_value(value);
+        }
+    }
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+    cursor.into_inner()
+}
+
+/// Helper: build XLSX with multiple sheets.
+fn build_xlsx_multi_sheet(sheets: &[(&str, &[(&str, &str)])]) -> Vec<u8> {
+    let mut book = umya_spreadsheet::new_file();
+    // Remove the default sheet first
+    for (i, &(name, cells)) in sheets.iter().enumerate() {
+        if i == 0 {
+            let sheet = book.get_sheet_mut(&0).unwrap();
+            sheet.set_name(name);
+            for &(coord, value) in cells {
+                sheet.get_cell_mut(coord).set_value(value);
+            }
+        } else {
+            let mut sheet = umya_spreadsheet::Worksheet::default();
+            sheet.set_name(name);
+            for &(coord, value) in cells {
+                sheet.get_cell_mut(coord).set_value(value);
+            }
+            book.add_sheet(sheet).unwrap();
+        }
+    }
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+    cursor.into_inner()
+}
+
+/// One sheet for `build_xlsx_multi_sheet_with_states`: its name, the
+/// visibility state to declare for it, and its cells as (coordinate, value).
+type SheetWithState<'a> = (
+    &'a str,
+    umya_spreadsheet::SheetStateValues,
+    &'a [(&'a str, &'a str)],
+);
+
+/// Helper: build XLSX with multiple sheets, each declaring the visibility
+/// state `xl/workbook.xml` carries on its `<sheet>` entry.
+fn build_xlsx_multi_sheet_with_states(sheets: &[SheetWithState<'_>]) -> Vec<u8> {
+    let mut book = umya_spreadsheet::new_file();
+    for (index, (name, state, cells)) in sheets.iter().enumerate() {
+        if index > 0 {
+            book.add_sheet(umya_spreadsheet::Worksheet::default())
+                .unwrap();
+        }
+        let sheet = book.get_sheet_mut(&index).unwrap();
+        sheet.set_name(*name);
+        sheet.set_state(state.clone());
+        for &(coord, value) in *cells {
+            sheet.get_cell_mut(coord).set_value(value);
+        }
+    }
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+    cursor.into_inner()
+}
+
+/// Helper: extract SheetPage from Document by index.
+fn get_sheet_page(doc: &Document, idx: usize) -> &SheetPage {
+    match &doc.pages[idx] {
+        Page::Sheet(sp) => sp,
+        _ => panic!("Expected SheetPage at index {idx}"),
+    }
+}
+
+/// Helper: get cell text from a TableCell.
+fn cell_text(cell: &TableCell) -> String {
+    cell.content
+        .iter()
+        .filter_map(|b| match b {
+            Block::Paragraph(p) => Some(p.runs.iter().map(|r| r.text.as_str()).collect::<String>()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Helper: extract the first run's TextStyle from a cell.
+fn first_run_style(cell: &TableCell) -> &TextStyle {
+    match &cell.content[0] {
+        Block::Paragraph(p) => &p.runs[0].style,
+        _ => panic!("Expected Paragraph"),
+    }
+}
+
+// ----- Basic parsing tests -----
+
+#[test]
+fn test_parse_single_cell() {
+    let data = build_xlsx_bytes("Sheet1", &[("A1", "Hello")]);
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    assert_eq!(doc.pages.len(), 1);
+    let tp = get_sheet_page(&doc, 0);
+    assert_eq!(tp.name, "Sheet1");
+    assert_eq!(tp.table.rows.len(), 1);
+    assert_eq!(tp.table.rows[0].cells.len(), 1);
+    assert_eq!(cell_text(&tp.table.rows[0].cells[0]), "Hello");
+}
+
+#[test]
+fn test_parse_multiple_cells() {
+    let data = build_xlsx_bytes(
+        "Data",
+        &[("A1", "Name"), ("B1", "Age"), ("A2", "Alice"), ("B2", "30")],
+    );
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let tp = get_sheet_page(&doc, 0);
+    assert_eq!(tp.table.rows.len(), 2);
+    assert_eq!(tp.table.rows[0].cells.len(), 2);
+    assert_eq!(cell_text(&tp.table.rows[0].cells[0]), "Name");
+    assert_eq!(cell_text(&tp.table.rows[0].cells[1]), "Age");
+    assert_eq!(cell_text(&tp.table.rows[1].cells[0]), "Alice");
+    assert_eq!(cell_text(&tp.table.rows[1].cells[1]), "30");
+}
+
+#[test]
+fn test_parse_empty_cells_in_grid() {
+    // A1 filled, B1 empty, A2 empty, B2 filled → 2-row grid with gaps.
+    // "Bottom-Right" overflows B2's default-width column, so the printed
+    // range extends one column past the used range, as Excel prints an
+    // unwrapped overflow (issue #718) — a third, empty column follows.
+    let data = build_xlsx_bytes("Sheet1", &[("A1", "Top-Left"), ("B2", "Bottom-Right")]);
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let tp = get_sheet_page(&doc, 0);
+    assert_eq!(tp.table.rows.len(), 2);
+    assert_eq!(tp.table.rows[0].cells.len(), 3);
+    assert_eq!(cell_text(&tp.table.rows[0].cells[2]), "");
+    // A1 has content
+    assert_eq!(cell_text(&tp.table.rows[0].cells[0]), "Top-Left");
+    // B1 is empty
+    assert_eq!(cell_text(&tp.table.rows[0].cells[1]), "");
+    // A2 is empty
+    assert_eq!(cell_text(&tp.table.rows[1].cells[0]), "");
+    // B2 has content
+    assert_eq!(cell_text(&tp.table.rows[1].cells[1]), "Bottom-Right");
+}
+
+#[test]
+fn test_parse_numbers() {
+    let data = build_xlsx_bytes("Numbers", &[("A1", "42"), ("B1", "3.14")]);
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let tp = get_sheet_page(&doc, 0);
+    assert_eq!(cell_text(&tp.table.rows[0].cells[0]), "42");
+    assert_eq!(cell_text(&tp.table.rows[0].cells[1]), "3.14");
+}
+
+#[test]
+fn test_parse_dates_as_text() {
+    let data = build_xlsx_bytes("Dates", &[("A1", "2024-01-15"), ("A2", "December 25")]);
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let tp = get_sheet_page(&doc, 0);
+    assert_eq!(cell_text(&tp.table.rows[0].cells[0]), "2024-01-15");
+    assert_eq!(cell_text(&tp.table.rows[1].cells[0]), "December 25");
+}
+
+// ----- Sheet name tests -----
+
+#[test]
+fn test_sheet_name_preserved() {
+    let data = build_xlsx_bytes("Financial Report", &[("A1", "Revenue")]);
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let tp = get_sheet_page(&doc, 0);
+    assert_eq!(tp.name, "Financial Report");
+}
+
+// ----- Multi-sheet tests -----
+
+#[test]
+fn test_parse_multiple_sheets() {
+    let data = build_xlsx_multi_sheet(&[
+        ("Sheet1", &[("A1", "Data1")]),
+        ("Sheet2", &[("A1", "Data2")]),
+    ]);
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    assert_eq!(doc.pages.len(), 2);
+    let tp1 = get_sheet_page(&doc, 0);
+    let tp2 = get_sheet_page(&doc, 1);
+    assert_eq!(tp1.name, "Sheet1");
+    assert_eq!(tp2.name, "Sheet2");
+    assert_eq!(cell_text(&tp1.table.rows[0].cells[0]), "Data1");
+    assert_eq!(cell_text(&tp2.table.rows[0].cells[0]), "Data2");
+}
+
+// ----- Column width tests -----
+
+#[test]
+fn test_column_widths_default() {
+    let data = build_xlsx_bytes("Sheet1", &[("A1", "Hello"), ("B1", "World")]);
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let tp = get_sheet_page(&doc, 0);
+    assert_eq!(tp.table.column_widths.len(), 2);
+    // umya's writer auto-emits `<col min="1" max="2" width="8.38"
+    // customWidth="1"/>` for used columns, so this fixture takes the
+    // declared-width path: round(8.38 × 6pt Calibri-11 unit) = 50pt on the
+    // integer point grid (issue #621; the old pixel model printed 50.28pt).
+    for w in &tp.table.column_widths {
+        assert_eq!(
+            *w, 50.0,
+            "Expected declared 8.38-unit width of 50pt, got {w}"
+        );
+    }
+}
+
+#[test]
+fn test_carlito_column_widths_match_native_print_metrics() {
+    // Carlito 11 has a 6pt column unit (issue #621), so the pr_186 fixture's
+    // native 26/20/24-unit columns print 156/120/144pt.
+    assert_eq!(column_width_to_pt(26.0, 6.0), 156.0);
+    assert_eq!(column_width_to_pt(20.0, 6.0), 120.0);
+    assert_eq!(column_width_to_pt(24.0, 6.0), 144.0);
+}
+
+#[test]
+fn test_sheet_uses_dominant_carlito_font_for_column_metrics() {
+    let mut book = umya_spreadsheet::new_file();
+    let sheet = book.get_sheet_mut(&0).unwrap();
+    sheet
+        .get_cell_mut("A1")
+        .set_value("Header")
+        .get_style_mut()
+        .get_font_mut()
+        .set_name("Carlito");
+    sheet
+        .get_cell_mut("A2")
+        .set_value("Body")
+        .get_style_mut()
+        .get_font_mut()
+        .set_name("Carlito");
+
+    // Styles-unreadable fallback: the dominant Carlito face at the assumed
+    // 11pt Normal size gives the same 6pt unit as a declared Carlito-11
+    // Normal font (issue #621).
+    assert_eq!(sheet_column_unit_pt(sheet), 6.0);
+}
+
+/// The column character-unit is an INTEGER POINT count: round-half-up of the
+/// Normal font's max digit advance in points. Measured on 17 one-factor
+/// native Excel-for-Mac probes (issue #621): each family/size pair below is a
+/// discriminator — Calibri 10 → 5pt kills every integer-96dpi-pixel model
+/// (the old ceil gave 7px = 5.25pt), Times New Roman 13 (exactly 6.500pt)
+/// rounds UP to 7 (kills half-even), Calibri 9 and Verdana 11 kill
+/// truncation, Calibri 10 and Verdana 10 kill ceiling.
+#[test]
+fn test_column_unit_pt_is_integer_points_from_digit_advance() {
+    assert_eq!(column_unit_pt("Calibri", 9.0, false), 5.0);
+    assert_eq!(column_unit_pt("Calibri", 10.0, false), 5.0);
+    assert_eq!(column_unit_pt("Calibri", 11.0, false), 6.0);
+    assert_eq!(column_unit_pt("Calibri", 12.0, false), 6.0);
+    assert_eq!(column_unit_pt("Arial", 10.0, false), 6.0);
+    assert_eq!(column_unit_pt("Arial", 12.0, false), 7.0);
+    assert_eq!(column_unit_pt("Verdana", 10.0, false), 6.0);
+    assert_eq!(column_unit_pt("Verdana", 11.0, false), 7.0);
+    assert_eq!(column_unit_pt("Times New Roman", 12.0, false), 6.0);
+    assert_eq!(column_unit_pt("Times New Roman", 13.0, false), 7.0);
+    assert_eq!(column_unit_pt("Courier New", 10.0, false), 6.0);
+    assert_eq!(column_unit_pt("Courier New", 12.0, false), 7.0);
+    assert_eq!(column_unit_pt("Malgun Gothic", 10.0, false), 6.0);
+    assert_eq!(column_unit_pt("Malgun Gothic", 11.0, false), 6.0);
+    assert_eq!(column_unit_pt("Segoe UI", 10.0, false), 5.0);
+}
+
+/// The reference digit advances are the real `hmtx` maxima over U+0030..=0039
+/// of the faces Excel itself resolves (read from Excel's own DFonts/system
+/// faces by the issue #621 probe tooling). They pin the wasm/font-less arm so
+/// output stays deterministic, and they outrank live font resolution so a
+/// machine substituting a digit-incompatible face (Calibri → Liberation Sans
+/// is 0.556em against Calibri's 0.5068) cannot shift column geometry.
+#[test]
+fn test_reference_digit_advance_em_pins_excel_face_metrics() {
+    let calibri: f64 = reference_digit_advance_em("Calibri", false).unwrap();
+    assert!((calibri - 0.506836).abs() < 1e-6);
+    assert_eq!(
+        reference_digit_advance_em("Carlito", false),
+        reference_digit_advance_em("Calibri", false),
+        "Carlito is metrically identical to Calibri"
+    );
+    let arial: f64 = reference_digit_advance_em("Arial", false).unwrap();
+    assert!((arial - 0.556152).abs() < 1e-6);
+    let verdana: f64 = reference_digit_advance_em("Verdana", false).unwrap();
+    assert!((verdana - 0.635742).abs() < 1e-6);
+    let times: f64 = reference_digit_advance_em("Times New Roman", false).unwrap();
+    assert!((times - 0.500000).abs() < 1e-6);
+    let courier: f64 = reference_digit_advance_em("Courier New", false).unwrap();
+    assert!((courier - 0.600098).abs() < 1e-6);
+    // The repo's previous 0.529em Malgun estimate was wrong: the real face
+    // advances 0.550781em (issue #621 probe artifacts).
+    let malgun: f64 = reference_digit_advance_em("Malgun Gothic", false).unwrap();
+    assert!((malgun - 0.550781).abs() < 1e-6);
+    assert_eq!(
+        reference_digit_advance_em("맑은 고딕", false),
+        reference_digit_advance_em("Malgun Gothic", false),
+        "the localized Malgun name must map to the same face"
+    );
+    let segoe: f64 = reference_digit_advance_em("Segoe UI", false).unwrap();
+    assert!((segoe - 0.5390625).abs() < 1e-6);
+    assert_eq!(
+        reference_digit_advance_em("Selawik", false),
+        Some(segoe),
+        "Selawik shares Segoe UI's decimal digit advance"
+    );
+    assert_eq!(
+        reference_digit_advance_em("Definitely Not A Font", false),
+        None,
+        "unknown families fall through to live font resolution"
+    );
+}
+
+/// Cambria, Verdana, Segoe UI/Selawik, and Malgun Gothic are the reference
+/// families measured to advance their digits differently at bold than at
+/// regular (issue #1623), read from Excel's own `Cambriab.ttf`,
+/// `Verdana Bold.ttf`, and `malgunbd.ttf`, and from this crate's own bundled
+/// `Selawik-Bold.ttf` (Segoe UI itself is not shipped on the measuring
+/// platform). Calibri, Arial, Times New Roman, and Courier New are read from
+/// Excel's own regular/bold pairs and keep the same digit width at both
+/// weights, so `bold` must be a no-op for them.
+#[test]
+fn test_reference_digit_advance_em_is_bold_aware_only_where_measured() {
+    let cambria_regular: f64 = reference_digit_advance_em("Cambria", false).unwrap();
+    let cambria_bold: f64 = reference_digit_advance_em("Cambria", true).unwrap();
+    assert!((cambria_regular - 0.5537109375).abs() < 1e-9);
+    assert!((cambria_bold - 0.59228515625).abs() < 1e-9);
+    assert!(cambria_bold > cambria_regular);
+
+    let verdana_regular: f64 = reference_digit_advance_em("Verdana", false).unwrap();
+    let verdana_bold: f64 = reference_digit_advance_em("Verdana", true).unwrap();
+    assert!((verdana_regular - 0.635742).abs() < 1e-6);
+    assert!((verdana_bold - 0.7109375).abs() < 1e-9);
+    assert!(verdana_bold > verdana_regular);
+
+    let selawik_regular: f64 = reference_digit_advance_em("Selawik", false).unwrap();
+    let selawik_bold: f64 = reference_digit_advance_em("Selawik", true).unwrap();
+    assert!((selawik_regular - 0.5390625).abs() < 1e-9);
+    assert!((selawik_bold - 0.575195312500).abs() < 1e-9);
+    assert!(selawik_bold > selawik_regular);
+    assert_eq!(
+        reference_digit_advance_em("Segoe UI", true),
+        Some(selawik_bold),
+        "Segoe UI shares Selawik's bold digit advance too"
+    );
+
+    let malgun_regular: f64 = reference_digit_advance_em("Malgun Gothic", false).unwrap();
+    let malgun_bold: f64 = reference_digit_advance_em("Malgun Gothic", true).unwrap();
+    assert!((malgun_regular - 0.550781).abs() < 1e-6);
+    assert!((malgun_bold - 0.579589843750).abs() < 1e-9);
+    assert!(malgun_bold > malgun_regular);
+    assert_eq!(
+        reference_digit_advance_em("맑은 고딕", true),
+        Some(malgun_bold),
+        "the localized Malgun name must map to the same bold face"
+    );
+
+    for family in ["Calibri", "Arial", "Times New Roman", "Courier New"] {
+        assert_eq!(
+            reference_digit_advance_em(family, false),
+            reference_digit_advance_em(family, true),
+            "{family}'s digits are measured equal at both weights"
+        );
+    }
+}
+
+/// Tahoma is a Normal font whose substitute is digit-incompatible: Liberation
+/// Sans advances its digits 0.556em against Tahoma's 0.5459em, which rounds a
+/// 10pt column unit to 6pt where Excel prints 5pt. The reference values are
+/// the `hmtx` advances of the Tahoma and Tahoma Bold faces a Microsoft Word
+/// export embeds, so a host without Tahoma keeps Excel's column grid at both
+/// weights (issue #2235).
+#[test]
+fn tahoma_digit_advances_are_pinned_at_both_weights() {
+    let regular: f64 = reference_digit_advance_em("Tahoma", false).unwrap();
+    let bold: f64 = reference_digit_advance_em("Tahoma", true).unwrap();
+    assert!((regular - 1118.0 / 2048.0).abs() < 1e-9);
+    assert!((bold - 1304.0 / 2048.0).abs() < 1e-9);
+
+    for (size_pt, regular_unit_pt, bold_unit_pt) in [
+        (9.0, 5.0, 6.0),
+        (10.0, 5.0, 6.0),
+        (11.0, 6.0, 7.0),
+        (12.0, 7.0, 8.0),
+    ] {
+        assert_eq!(
+            column_unit_pt("Tahoma", size_pt, false),
+            regular_unit_pt,
+            "Tahoma {size_pt}pt"
+        );
+        assert_eq!(
+            column_unit_pt("Tahoma", size_pt, true),
+            bold_unit_pt,
+            "Tahoma Bold {size_pt}pt"
+        );
+    }
+}
+
+/// Families outside the reference table resolve their digit advance from the
+/// real face `hmtx`, exactly as Excel measures the face it resolves. The
+/// embedded Libertinus Serif face makes this deterministic on every target:
+/// its digit advance is 465/1000 em.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn test_max_digit_advance_em_reads_real_face_hmtx() {
+    let advance: f64 = crate::render::pdf::max_digit_advance_em("Libertinus Serif", false)
+        .expect("the embedded Libertinus Serif face must resolve");
+    assert!(
+        (advance - 0.465).abs() < 1e-6,
+        "Libertinus Serif digit advance should be 0.465em, got {advance}"
+    );
+    // And the column metric consumes it: round(0.465 × 11pt) = 5pt.
+    assert_eq!(column_unit_pt("Libertinus Serif", 11.0, false), 5.0);
+}
+
+/// The unresolved-face fallback prices each ASCII character against the
+/// family's own digit advance, so a line of narrow letters costs a fraction of
+/// a line of capitals. The flat half-em-per-character rule it replaced put a
+/// realistic sentence a third over its real advance, which walked the printed
+/// range past the page and split a one-page sheet in two (issue #1054).
+///
+/// Resolved faces use their fractional per-glyph advances for clip-box width;
+/// page-column continuation rounds each glyph to Excel's whole-point grid.
+/// Unresolved faces retain the portable ratio estimate and stay within 5% of
+/// the measured `hmtx` sums.
+#[test]
+fn test_estimate_line_width_tracks_real_face_advances() {
+    let cases: [(&str, &str, f64, f64); 3] = [
+        (
+            "Arial",
+            "Blue = target (input). Achievement = Actual / Target; \
+             for 'lower is better' metrics read inversely.",
+            9.0,
+            41.6772,
+        ),
+        (
+            "Verdana",
+            "Fractions, Tricky With Much Longer Text Here",
+            10.0,
+            22.9761,
+        ),
+        ("Calibri", "Monthly Active Users", 11.0, 8.6875),
+    ];
+    for (family, text, size_pt, truth_em) in cases {
+        let truth_pt: f64 = truth_em * size_pt;
+        let estimate: f64 = estimate_line_width_pt(text, Some(family), size_pt);
+        if let Some(advances_em) = crate::render::pdf::glyph_advances_em(family, false, text) {
+            let expected_width_pt: f64 = advances_em
+                .into_iter()
+                .map(|advance_em| advance_em * size_pt)
+                .sum();
+            assert_eq!(
+                estimate, expected_width_pt,
+                "{family} must use its own fractional per-glyph advances"
+            );
+        } else {
+            let error: f64 = (estimate - truth_pt) / truth_pt;
+            assert!(
+                error.abs() < 0.05,
+                "{family} {size_pt}pt: estimate {estimate:.2}pt is {:.1}% off the \
+                 face's own {truth_pt:.2}pt",
+                error * 100.0
+            );
+        }
+    }
+
+    // Triangulation: the estimate must follow the glyphs, not the character
+    // count. Ten Arial 'i' advance 2.2217em against ten 'W' at 9.4385em, a
+    // ratio the flat per-character rule collapsed to 1.
+    let narrow: f64 = estimate_line_width_pt(&"i".repeat(10), Some("Arial"), 10.0);
+    let wide: f64 = estimate_line_width_pt(&"W".repeat(10), Some("Arial"), 10.0);
+    assert!(
+        (wide / narrow - 9.4385 / 2.2217).abs() < 0.5,
+        "narrow-to-wide ratio {:.2} should track the face's 4.25",
+        wide / narrow
+    );
+
+    // A cell naming no family is priced on Excel's default Normal font, the
+    // same last resort `column_unit_pt` falls back to.
+    assert_eq!(
+        estimate_line_width_pt("Monthly Active Users", None, 11.0),
+        estimate_line_width_pt("Monthly Active Users", Some("Calibri"), 11.0),
+    );
+}
+
+/// A family-wide digit ratio cannot model faces whose ASCII glyphs are not
+/// proportional to that digit, such as Malgun Gothic (issue #1717). The clip
+/// box follows Typst's fractional glyph advances; page-column continuation
+/// uses Excel's whole-point grid separately.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn test_estimate_line_width_uses_resolved_face_advances() {
+    let text: &str = "Chief Configuration Representative";
+    let size_pt: f64 = 12.0;
+
+    for family in ["Malgun Gothic", "DejaVu Sans Mono", "New Computer Modern"] {
+        let Some(advances) = crate::render::pdf::glyph_advances_em(family, false, text) else {
+            continue;
+        };
+        let expected_width_pt: f64 = advances
+            .into_iter()
+            .map(|advance_em| advance_em * size_pt)
+            .sum();
+        let estimated_width_pt: f64 = estimate_line_width_pt(text, Some(family), size_pt);
+
+        assert_eq!(
+            estimated_width_pt, expected_width_pt,
+            "{family} must use its own per-glyph Excel advances"
+        );
+        return;
+    }
+
+    panic!("at least one embedded test face must resolve for width estimation");
+}
+
+#[test]
+fn issue_1717_boundary_fixture_uses_resolved_width_for_spill_decision() {
+    let data: &[u8] =
+        include_bytes!("../../../../tests/fixtures/xlsx/issue_1717_ascii_width_boundary.xlsx");
+    let (doc, _warnings) = XlsxParser.parse(data, &ConvertOptions::default()).unwrap();
+    let target_text: &str = "Customer Quality Executive";
+    let (table, target_cell): (&Table, &TableCell) = doc
+        .pages
+        .iter()
+        .find_map(|page| match page {
+            Page::Sheet(sheet) => sheet
+                .table
+                .rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .find(|cell| cell_text(cell) == target_text)
+                .map(|cell| (&sheet.table, cell)),
+            _ => None,
+        })
+        .expect("the near-edge occupation cell should be present");
+
+    let target_style: &TextStyle = first_run_style(target_cell);
+    let font_family: &str = target_style
+        .font_family
+        .as_deref()
+        .expect("the fixture's Normal style names a font");
+    let is_malgun_gothic: bool =
+        font_family == "맑은 고딕" || font_family.eq_ignore_ascii_case("Malgun Gothic");
+    let Some(advances_em) = crate::render::pdf::glyph_advances_em(font_family, false, target_text)
+    else {
+        // The generic resolved-font test covers native hosts without this face.
+        return;
+    };
+    if !is_malgun_gothic {
+        return;
+    }
+
+    let font_size_pt: f64 = target_style.font_size.unwrap_or(11.0);
+    let measured_width_pt: f64 = advances_em.into_iter().sum::<f64>() * font_size_pt;
+    let column_width_pt: f64 = *table
+        .column_widths
+        .get(4)
+        .expect("the target cell is in the fifth column");
+    let padding: Insets = target_cell
+        .padding
+        .or(table.default_cell_padding)
+        .unwrap_or_default();
+    let available_width_pt: f64 = column_width_pt - padding.left - padding.right;
+    if measured_width_pt <= available_width_pt {
+        assert!(
+            target_cell.spill_width.is_none(),
+            "text that fits its available width should not need a spill clip box"
+        );
+        return;
+    }
+    assert!(
+        target_cell.spill_width.is_some(),
+        "the actual per-glyph width ({measured_width_pt:.2}pt) crosses the cell's available width ({available_width_pt:.2}pt), so the line must stay unwrapped"
+    );
+}
+
+/// Excel for Mac advances every sheet glyph a whole point, so an unwrapped
+/// line ends at the sum of its advances each rounded to one — never at the
+/// face's fractional sum, and never at the rounding of that sum (issue #1659).
+///
+/// Measured on the faces typst embeds, which resolve on every host, so the
+/// rule is checked wherever the suite runs rather than only where Office
+/// fonts are installed.
+#[test]
+fn test_sheet_line_extent_prices_every_glyph_on_a_whole_point() {
+    fn line(text: &str, family: &str, size_pt: f64) -> Vec<Run> {
+        vec![Run {
+            text: text.to_string(),
+            style: TextStyle {
+                font_family: Some(family.to_string()),
+                font_size: Some(size_pt),
+                ..TextStyle::default()
+            },
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }]
+    }
+
+    let mut quantized_cases: usize = 0;
+    for family in ["DejaVu Sans Mono", "New Computer Modern"] {
+        for text in [
+            "Customer Group Developer",
+            "Chief Configuration Representative",
+            "Regional Intranet Associate",
+        ] {
+            for size_pt in [9.0, 11.0, 12.0, 14.5] {
+                let runs = line(text, family, size_pt);
+                let SheetLineExtent::Measured(width_pt) = sheet_line_extent(&runs, None, 0.0)
+                else {
+                    continue;
+                };
+                assert!(
+                    (width_pt - width_pt.round()).abs() < 1e-9,
+                    "{family} {size_pt}pt {text:?}: {width_pt}pt is not a whole-point advance sum"
+                );
+                quantized_cases += 1;
+
+                // Triangulation: rounding the line's total instead of each
+                // advance gives the same answer only by accident, and the
+                // face's own fractional sum almost never lands on a point.
+                let fractional_pt: f64 = estimate_line_width_pt(text, Some(family), size_pt);
+                assert!(
+                    fractional_pt > 0.0,
+                    "{family} {size_pt}pt {text:?}: the estimate priced nothing"
+                );
+            }
+        }
+    }
+    assert!(
+        quantized_cases > 0,
+        "at least one embedded face must resolve for the advance grid to be checked"
+    );
+
+    // The extent is measured from the cell's own left gridline, so the inset
+    // its text begins after is part of it.
+    let runs = line("Customer Group Developer", "DejaVu Sans Mono", 12.0);
+    let bare = sheet_line_extent(&runs, None, 0.0);
+    let inset = sheet_line_extent(&runs, None, 3.0);
+    match (bare, inset) {
+        (SheetLineExtent::Measured(bare_pt), SheetLineExtent::Measured(inset_pt)) => assert!(
+            (inset_pt - bare_pt - 3.0).abs() < 1e-9,
+            "the 3pt inset must shift the extent: {bare_pt}pt against {inset_pt}pt"
+        ),
+        (SheetLineExtent::Estimated(bare_pt), SheetLineExtent::Estimated(inset_pt)) => assert!(
+            (inset_pt - bare_pt - 3.0).abs() < 1e-9,
+            "the 3pt inset must shift the estimate: {bare_pt}pt against {inset_pt}pt"
+        ),
+        (bare, inset) => panic!("the same line cannot change how it is priced: {bare:?} {inset:?}"),
+    }
+
+    // A face no host resolves leaves nothing to round, so the line falls back
+    // to the estimate and says so.
+    let unresolvable = line("Customer Group Developer", "No Such Face 8f2a1c", 12.0);
+    assert!(
+        matches!(
+            sheet_line_extent(&unresolvable, None, 0.0),
+            SheetLineExtent::Estimated(_)
+        ),
+        "an unresolvable face cannot be reported as measured"
+    );
+}
+
+/// A declared column width prints as an integer point count: Excel quantizes
+/// `width × unit` per column. Probe calibri11frac (issue #621): width 10.6 at
+/// the 6pt Calibri-11 unit prints 64pt, not 63.6pt.
+#[test]
+fn test_declared_column_width_quantizes_to_integer_points() {
+    assert_eq!(column_width_to_pt(10.6, 6.0), 64.0);
+    // Whole-unit widths land on exact multiples — the pr_186 fixture's
+    // Carlito-11 26/20/24-unit columns stay 156/120/144pt.
+    assert_eq!(column_width_to_pt(26.0, 6.0), 156.0);
+    assert_eq!(column_width_to_pt(20.0, 6.0), 120.0);
+    assert_eq!(column_width_to_pt(24.0, 6.0), 144.0);
+}
+
+/// A column with no `<col>` entry and no declared `defaultColWidth` prints at
+/// `baseColWidth × unit` points plus the Normal font's inset pair — NOT 8.43
+/// character units. Verified by the issue #621 probes: at the 6pt Calibri-11
+/// unit, baseColWidth 10 → 65pt and 12 → 77pt (round-3 probes
+/// calibri11base10/12), the ECMA base 8 → 53pt; units 5/7 at base 8 →
+/// 45/61pt. Every unit here sits in the 5-8pt bracket, where the pair is 5pt;
+/// the brackets on either side of it are pinned by
+/// [`test_default_column_padding_is_the_normal_font_inset_pair`]. A declared
+/// `defaultColWidth` outranks `baseColWidth` and goes through the
+/// declared-units quantization instead.
+#[test]
+fn test_default_column_width_is_base_col_width_units_plus_the_inset_pair() {
+    assert_eq!(default_column_width_pt(None, 8, 5.0), 45.0);
+    assert_eq!(default_column_width_pt(None, 8, 6.0), 53.0);
+    assert_eq!(default_column_width_pt(None, 8, 7.0), 61.0);
+    // Measured baseColWidth probes (no defaultColWidth): 10 → 65, 12 → 77.
+    assert_eq!(default_column_width_pt(None, 10, 6.0), 65.0);
+    assert_eq!(default_column_width_pt(None, 12, 6.0), 77.0);
+    // Declared defaultColWidth quantizes like any declared width and
+    // outranks baseColWidth.
+    assert_eq!(default_column_width_pt(Some(10.6), 8, 6.0), 64.0);
+    assert_eq!(default_column_width_pt(Some(10.6), 12, 6.0), 64.0);
+}
+
+/// The base column width depends on whether the worksheet writes a
+/// `<sheetFormatPr>` element at all, not only on its `baseColWidth`
+/// attribute. Measured one factor at a time on native Excel-for-Mac exports
+/// of `100-customers.xlsx` (issue #1656): with no element the default column
+/// prints `10 × unit` plus the 5pt inset pair those units carry (75pt at the
+/// 7pt Malgun Gothic 12 unit, 65pt at 6pt, 85pt at 8pt); adding
+/// `<sheetFormatPr defaultRowHeight="15"/>` alone drops it to the same
+/// `8 × unit` plus that pair (61pt), `baseColWidth="10"` restores 75pt, and
+/// `defaultColWidth="8.43"` quantizes like a declared width (59pt). Every
+/// unit here sits in the 5pt-padding bracket, so these readings identify the
+/// base rather than the padding.
+#[test]
+fn test_absent_sheet_format_pr_prices_default_columns_at_excel_mac_base_ten() {
+    assert_eq!(base_column_width_chars(None, false), 10);
+    assert_eq!(base_column_width_chars(None, true), 8);
+    assert_eq!(base_column_width_chars(Some(12), true), 12);
+
+    let absent: u32 = base_column_width_chars(None, false);
+    let present: u32 = base_column_width_chars(None, true);
+    for (unit_pt, expected_pt) in [(6.0, 65.0), (7.0, 75.0), (8.0, 85.0)] {
+        assert_eq!(
+            default_column_width_pt(None, absent, unit_pt),
+            expected_pt,
+            "no sheetFormatPr at a {unit_pt}pt unit"
+        );
+    }
+    assert_eq!(default_column_width_pt(None, present, 7.0), 61.0);
+    assert_eq!(
+        default_column_width_pt(None, base_column_width_chars(Some(10), true), 7.0),
+        75.0
+    );
+    assert_eq!(default_column_width_pt(Some(8.43), absent, 7.0), 59.0);
+}
+
+/// The default column's padding is the Normal font's own horizontal inset
+/// pair — `cell_left_inset_pt + cell_right_inset_pt`, i.e.
+/// `2 × ceil(unit / 4) + 1` — not the constant 5pt the units 5-7 probes of
+/// issue #621 could not tell apart from it.
+///
+/// Measured by the issue #1657 sweep: 17 one-factor native Excel-for-Mac
+/// exports of `issue_1657_default_column_padding_probe.xlsx`, whose sheet
+/// declares `<sheetFormatPr defaultRowHeight="15"/>` (base 8) and no
+/// `<cols>`, patching only the Normal font in `xl/styles.xml`. Column pitch
+/// read from the five left-aligned row-1 labels' pen origins, every pitch on
+/// a page identical, and the re-zip control layout-identical to the base:
+///
+/// | Normal font | unit | default column | 8 × unit | padding |
+/// | --- | ---: | ---: | ---: | ---: |
+/// | Arial 6 | 3 | 27 | 24 | 3 |
+/// | Arial 7, Calibri 8 | 4 | 35 | 32 | 3 |
+/// | Arial 9, Calibri 9 | 5 | 45 | 40 | 5 |
+/// | Arial 10, Arial 11 | 6 | 53 | 48 | 5 |
+/// | Arial 12, Courier New 11 | 7 | 61 | 56 | 5 |
+/// | Arial 14, Calibri 16 | 8 | 69 | 64 | 5 |
+/// | Arial 16, Malgun Gothic 16 | 9 | 79 | 72 | 7 |
+/// | Arial 18 | 10 | 87 | 80 | 7 |
+/// | Arial 20 | 11 | 95 | 88 | 7 |
+/// | Arial 22 | 12 | 103 | 96 | 7 |
+/// | Arial 24 | 13 | 113 | 104 | 9 |
+/// | Courier New 24 | 14 | 121 | 112 | 9 |
+///
+/// Point size is not the driver: Calibri 16 and Arial 14 both price a 8pt
+/// unit and both print 69pt, while Arial 16 and Malgun Gothic 16 both price
+/// a 9pt unit and both print 79pt. The same exports move the first column's
+/// own text origin 52 → 53 → 54 → 55pt across the three steps, which is
+/// [`cell_left_inset_pt`] (2 → 3 → 4 → 5) on a grid origin of 50pt.
+#[test]
+fn test_default_column_padding_is_the_normal_font_inset_pair() {
+    for (unit_pt, expected_pt) in [
+        (3.0, 27.0),
+        (4.0, 35.0),
+        (5.0, 45.0),
+        (6.0, 53.0),
+        (7.0, 61.0),
+        (8.0, 69.0),
+        (9.0, 79.0),
+        (10.0, 87.0),
+        (11.0, 95.0),
+        (12.0, 103.0),
+        (13.0, 113.0),
+        (14.0, 121.0),
+    ] {
+        assert_eq!(
+            default_column_width_pt(None, 8, unit_pt),
+            expected_pt,
+            "base 8 at a {unit_pt}pt unit"
+        );
+    }
+    // The reading that filed the issue: a base-10 sheet on the 9pt unit of a
+    // 16pt scheme Normal font prints 97pt, not the 95pt a flat 5pt predicts.
+    assert_eq!(default_column_width_pt(None, 10, 9.0), 97.0);
+
+    // The padding is the very pair the per-cell model already carries, at
+    // every family and size — not a second table that happens to agree.
+    for (family, size_pt) in [
+        ("Arial", 6.0),
+        ("Calibri", 8.0),
+        ("Calibri", 11.0),
+        ("Calibri", 16.0),
+        ("Arial", 14.0),
+        ("Arial", 16.0),
+        ("Arial", 24.0),
+        ("Malgun Gothic", 16.0),
+        ("Courier New", 11.0),
+        ("Courier New", 24.0),
+        ("Times New Roman", 18.0),
+        ("Verdana", 20.0),
+    ] {
+        let unit_pt: f64 = column_unit_pt(family, size_pt, false);
+        assert_eq!(
+            default_column_width_pt(None, 8, unit_pt),
+            8.0 * unit_pt
+                + cell_left_inset_pt(family, size_pt, false)
+                + cell_right_inset_pt(family, size_pt, false),
+            "{family} {size_pt}pt (unit {unit_pt}pt)"
+        );
+    }
+}
+
+/// End to end on the package the sweep exported: the probe workbook prints
+/// 95pt default columns at its own Arial 20 Normal font, and 35/53/79/113pt
+/// once that font drops to the 4pt unit or reaches the 6, 9 and 13pt ones —
+/// the pitches the native Excel-for-Mac exports of those exact variants were
+/// measured to print (issue #1657).
+#[test]
+fn test_probe_workbook_default_columns_follow_the_measured_padding_steps() {
+    let base: &[u8] = include_bytes!(
+        "../../../../tests/fixtures/xlsx/issue_1657_default_column_padding_probe.xlsx"
+    );
+    let parser = XlsxParser;
+    for (normal_size_pt, expected_width_pt) in
+        [(7, 35.0), (11, 53.0), (16, 79.0), (20, 95.0), (24, 113.0)]
+    {
+        let package: Vec<u8> = with_normal_font_size(base, normal_size_pt);
+        let (doc, _warnings) = parser.parse(&package, &ConvertOptions::default()).unwrap();
+        let widths: Vec<f64> = get_sheet_page(&doc, 0).table.column_widths.clone();
+        assert_eq!(
+            widths,
+            vec![expected_width_pt; widths.len()],
+            "Arial {normal_size_pt}pt Normal font"
+        );
+    }
+}
+
+/// Rewrite the probe workbook's Normal font size, the one factor the issue
+/// #1657 sweep varied — the same patch `scripts/probes/`'s spec applies to
+/// the same part. The fixture's `xl/styles.xml` carries exactly one `<sz>`,
+/// so the edit cannot reach a cell font by accident.
+fn with_normal_font_size(xlsx: &[u8], size_pt: u32) -> Vec<u8> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(xlsx.to_vec())).unwrap();
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index).unwrap();
+        let name: String = file.name().expect("entry name should decode").into_owned();
+        let mut contents: Vec<u8> = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut contents).unwrap();
+        if name == "xl/styles.xml" {
+            let text: String = String::from_utf8(contents).unwrap();
+            assert_eq!(text.matches("<sz val=").count(), 1, "one font in the probe");
+            contents = text
+                .replace("<sz val=\"20\"/>", &format!("<sz val=\"{size_pt}\"/>"))
+                .into_bytes();
+        }
+        writer
+            .start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut writer, &contents).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+/// Remove every `<name .../>` or `<name ...>...</name>` element from the
+/// workbook's worksheet parts. umya's writer always emits `<sheetFormatPr>`,
+/// so the element-less shape Excel itself writes for `100-customers.xlsx`
+/// has to be produced by editing the archive.
+fn strip_worksheet_element(xlsx: &[u8], element_name: &str) -> Vec<u8> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(xlsx.to_vec())).unwrap();
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let open_tag: String = format!("<{element_name}");
+    let close_tag: String = format!("</{element_name}>");
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index).unwrap();
+        let name: String = file.name().expect("entry name should decode").into_owned();
+        let mut contents: Vec<u8> = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut contents).unwrap();
+        if name.starts_with("xl/worksheets/") && name.ends_with(".xml") {
+            let mut text: String = String::from_utf8(contents).unwrap();
+            while let Some(start) = text.find(&open_tag) {
+                let tag_end: usize = start + text[start..].find('>').unwrap();
+                let end: usize = if text[..=tag_end].ends_with("/>") {
+                    tag_end + 1
+                } else {
+                    let close: usize = text[tag_end..].find(&close_tag).unwrap();
+                    tag_end + close + close_tag.len()
+                };
+                text.replace_range(start..end, "");
+            }
+            contents = text.into_bytes();
+        }
+        writer
+            .start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut writer, &contents).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+/// End to end on a package: the same Calibri-11 workbook prints 53pt default
+/// columns while its worksheet declares `<sheetFormatPr>` and 65pt once the
+/// element is removed, the way Excel for Mac prints a sheet it never wrote
+/// the element for (issue #1656).
+#[test]
+fn test_workbook_without_sheet_format_pr_prints_ten_unit_default_columns() {
+    // umya also writes an auto-width `<col>` for every used column; drop
+    // them so all three printed columns are default columns.
+    let declared = strip_worksheet_element(
+        &build_xlsx_bytes("Sheet1", &[("A1", "x"), ("C3", "y")]),
+        "cols",
+    );
+    let undeclared = strip_worksheet_element(&declared, "sheetFormatPr");
+    let worksheet_part = |xlsx: &[u8]| -> String {
+        let mut archive = zip::ZipArchive::new(Cursor::new(xlsx.to_vec())).unwrap();
+        let mut text = String::new();
+        std::io::Read::read_to_string(
+            &mut archive.by_name("xl/worksheets/sheet1.xml").unwrap(),
+            &mut text,
+        )
+        .unwrap();
+        text
+    };
+    assert!(worksheet_part(&declared).contains("<sheetFormatPr"));
+    assert!(!worksheet_part(&undeclared).contains("sheetFormatPr"));
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&declared, &ConvertOptions::default()).unwrap();
+    let declared_widths: Vec<f64> = get_sheet_page(&doc, 0).table.column_widths.clone();
+    assert_eq!(
+        declared_widths,
+        vec![53.0; 3],
+        "ECMA base 8 while the element is present"
+    );
+
+    let (doc, _warnings) = parser
+        .parse(&undeclared, &ConvertOptions::default())
+        .unwrap();
+    let undeclared_widths: Vec<f64> = get_sheet_page(&doc, 0).table.column_widths.clone();
+    assert_eq!(
+        undeclared_widths,
+        vec![65.0; 3],
+        "Excel for Mac's base 10 once the element is absent"
+    );
+}
+
+/// `declared_base_column_width` surfaces `sheetFormatPr@baseColWidth` only
+/// when the file declares one — umya reports 0 for an absent attribute,
+/// a width Excel never writes.
+#[test]
+fn test_declared_base_column_width_reads_sheet_format_pr() {
+    let mut book = umya_spreadsheet::new_file();
+    let sheet = book.get_sheet_mut(&0).unwrap();
+    assert_eq!(declared_base_column_width(sheet), None);
+    sheet
+        .get_sheet_format_properties_mut()
+        .set_base_column_width(10);
+    assert_eq!(declared_base_column_width(sheet), Some(10));
+}
+
+#[test]
+fn test_extract_normal_font_reads_first_styles_font() {
+    let mut book = umya_spreadsheet::new_file();
+    book.get_sheet_mut(&0)
+        .unwrap()
+        .get_cell_mut("A1")
+        .set_value("x");
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+    let data = cursor.into_inner();
+
+    let normal_font = extract_normal_font(&data, Some(book.get_theme()), XlsxUiScript::Hangul)
+        .expect("styles.xml has a Normal font");
+    assert_eq!(normal_font.family, "Calibri");
+    assert_eq!(normal_font.size_pt, 11.0);
+}
+
+/// The pinned Excel-for-Mac footer probe behind issue #1210 uses a Segoe UI
+/// 10pt Normal font whose colour is theme slot 3 (`dk2`). The header/footer
+/// parser needs the resolved colour, not the unresolved stylesheet index.
+#[test]
+fn test_extract_normal_font_resolves_its_theme_colour() {
+    let data = build_xlsx_with_normal_font("Segoe UI", 10.0);
+    let data =
+        rewrite_first_styles_font_with_color(&data, "Segoe UI", 10.0, r#"<color theme="3"/>"#);
+    let book = umya_spreadsheet::reader::xlsx::read_reader(Cursor::new(&data), true)
+        .expect("readable workbook");
+
+    let normal_font = extract_normal_font(&data, Some(book.get_theme()), XlsxUiScript::Hangul)
+        .expect("styles.xml has a Normal font");
+    assert_eq!(normal_font.family, "Segoe UI");
+    assert_eq!(normal_font.size_pt, 10.0);
+    assert_eq!(normal_font.color, Some(Color::new(0x44, 0x54, 0x6A)));
+}
+
+#[test]
+fn test_column_overflow_splits_to_second_page_like_excel() {
+    // Quotation-style layout: A4 portrait with 0.75in side margins leaves a
+    // 487pt printable width. Columns of 5+30+16+8+14+16 = 89 chars under the
+    // Calibri-11 Normal font are 534pt at Excel's 8px MDW, so the last
+    // column overflows onto page 2 — exactly how Excel paginates the audit
+    // fixture (issue #366).
+    let mut book = umya_spreadsheet::new_file();
+    {
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        sheet.set_name("Sheet1");
+        for (index, (col, width)) in [
+            ("A", 5.0),
+            ("B", 30.0),
+            ("C", 16.0),
+            ("D", 8.0),
+            ("E", 14.0),
+            ("F", 16.0),
+        ]
+        .iter()
+        .enumerate()
+        {
+            sheet.get_column_dimension_mut(col).set_width(*width);
+            let cell_ref = format!("{}1", col);
+            sheet
+                .get_cell_mut(cell_ref.as_str())
+                .set_value(format!("Col {}", index + 1));
+        }
+        let margins = sheet.get_page_margins_mut();
+        margins.set_left(0.75);
+        margins.set_right(0.75);
+        margins.set_top(1.0);
+        margins.set_bottom(1.0);
+    }
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser
+        .parse(&cursor.into_inner(), &ConvertOptions::default())
+        .unwrap();
+    assert_eq!(
+        doc.pages.len(),
+        2,
+        "the sixth column must overflow onto its own page like Excel"
+    );
+}
+
+// ----- Page size and margins defaults -----
+
+/// A worksheet with no print metadata prints on Excel's application A4.
+///
+/// The customer fixture carries neither `<pageSetup>` nor `<pageMargins>`.
+/// Excel-for-Mac therefore uses its current paper selection, A4 on the
+/// reference machine, instead of applying the OOXML default that belongs to
+/// an initialised but silent `<pageSetup>` (issue #1382). That A4 is Excel's
+/// whole-point 595 x 842pt box, like a declared one (issue #1730).
+#[test]
+fn test_pristine_worksheet_uses_excels_a4_page_box() {
+    let data = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/xlsx/100-customers.xlsx"
+    ));
+    let (doc, _warnings) = XlsxParser
+        .parse(data, &ConvertOptions::default())
+        .expect("the customer fixture should parse");
+
+    assert!(!doc.pages.is_empty(), "the populated sheet should print");
+    for page in &doc.pages {
+        let Page::Sheet(sheet) = page else {
+            panic!("an XLSX page should be a sheet page");
+        };
+        assert!(
+            (sheet.size.width, sheet.size.height) == (595.0, 842.0),
+            "expected A4, got {:?}",
+            sheet.size
+        );
+    }
+}
+
+/// A sheet whose `<pageMargins>` has initialised print state but which has no
+/// `<pageSetup>` prints on the schema default, Letter (issue #717).
+///
+/// Confirmed against a native Excel export of this exact shape: the margin
+/// element makes the absent paper setup an initialised default rather than the
+/// fully pristine application-default case from issue #1382.
+#[test]
+fn test_page_margins_without_page_setup_default_to_letter() {
+    let data = build_xlsx_bytes("Sheet1", &[("A1", "Test")]);
+    let mut archive = zip::ZipArchive::new(Cursor::new(&data)).expect("readable workbook");
+    let mut worksheet_xml = String::new();
+    std::io::Read::read_to_string(
+        &mut archive
+            .by_name("xl/worksheets/sheet1.xml")
+            .expect("first worksheet part"),
+        &mut worksheet_xml,
+    )
+    .expect("worksheet XML");
+    assert!(worksheet_xml.contains("<pageMargins"));
+    assert!(!worksheet_xml.contains("<pageSetup"));
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let tp = get_sheet_page(&doc, 0);
+    assert!(
+        (tp.size.width - 612.0).abs() < 0.01 && (tp.size.height - 792.0).abs() < 0.01,
+        "expected Letter, got {:?}",
+        tp.size
+    );
+}
+
+/// Build a workbook whose only sheet declares `<pageSetup>` with an orientation
+/// but no `paperSize`. This is the exact shape Excel writes for a sheet left on
+/// the default paper, e.g. `<pageSetup orientation="portrait" .../>`.
+fn build_xlsx_with_page_setup_lacking_paper_size(
+    orientation: umya_spreadsheet::structs::OrientationValues,
+) -> Vec<u8> {
+    let mut book = umya_spreadsheet::new_file();
+    {
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        sheet.get_cell_mut("A1").set_value("Test");
+        sheet.get_page_setup_mut().set_orientation(orientation);
+    }
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+    cursor.into_inner()
+}
+
+/// A `<pageSetup>` that omits `paperSize` resolves to the schema default,
+/// Letter, rather than falling through to the renderer's A4 (issue #717).
+///
+/// A4 left such a workbook 16.7pt narrow and 49.9pt tall, which repaginated it:
+/// the audited sheet collapsed from Excel's 8 printed pages to 6.
+#[test]
+fn test_omitted_paper_size_resolves_to_letter() {
+    let data = build_xlsx_with_page_setup_lacking_paper_size(
+        umya_spreadsheet::structs::OrientationValues::Portrait,
+    );
+    let (doc, _warnings) = XlsxParser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = get_sheet_page(&doc, 0);
+    assert!(
+        (page.size.width - 612.0).abs() < 0.01 && (page.size.height - 792.0).abs() < 0.01,
+        "expected Letter, got {:?}",
+        page.size
+    );
+}
+
+/// The omitted-`paperSize` default is still just a default: a sheet that names
+/// its paper keeps it. Triangulation against a hardcoded Letter.
+#[test]
+fn test_declared_a4_paper_size_survives_the_letter_default() {
+    let mut book = umya_spreadsheet::new_file();
+    {
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        sheet.get_cell_mut("A1").set_value("Test");
+        // 9 = A4.
+        sheet.get_page_setup_mut().set_paper_size(9);
+    }
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+
+    let (doc, _warnings) = XlsxParser
+        .parse(&cursor.into_inner(), &ConvertOptions::default())
+        .unwrap();
+
+    let page = get_sheet_page(&doc, 0);
+    assert!(
+        (page.size.width, page.size.height) == (595.0, 842.0),
+        "expected A4, got {:?}",
+        page.size
+    );
+}
+
+/// Excel prints ISO paper on a whole-point page box: its native exports carry
+/// A3 as 842 x 1191pt and A4 as 595 x 842pt, not the exact 841.89 x 1190.55pt
+/// and 595.28 x 841.89pt. Anything measured from the bottom or right edge of
+/// the page, a footer included, is placed on that box (issue #1730).
+#[test]
+fn test_iso_paper_sizes_use_excels_whole_point_page_box() {
+    use umya_spreadsheet::structs::OrientationValues::{Landscape, Portrait};
+    // (paperSize, orientation, expected width x height)
+    let cases = [
+        (8, Portrait, (842.0, 1191.0)),  // A3
+        (8, Landscape, (1191.0, 842.0)), // A3, turned
+        (9, Portrait, (595.0, 842.0)),   // A4
+        (10, Portrait, (595.0, 842.0)),  // A4 Small
+        (11, Portrait, (420.0, 595.0)),  // A5
+    ];
+    for (paper_size, orientation, expected) in cases {
+        let mut book = umya_spreadsheet::new_file();
+        {
+            let sheet = book.get_sheet_mut(&0).unwrap();
+            sheet.get_cell_mut("A1").set_value("Test");
+            let page_setup = sheet.get_page_setup_mut();
+            page_setup.set_paper_size(paper_size);
+            page_setup.set_orientation(orientation.clone());
+        }
+        let mut cursor = Cursor::new(Vec::new());
+        umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+
+        let (doc, _warnings) = XlsxParser
+            .parse(&cursor.into_inner(), &ConvertOptions::default())
+            .unwrap();
+
+        let page = get_sheet_page(&doc, 0);
+        assert_eq!(
+            (page.size.width, page.size.height),
+            expected,
+            "paperSize {paper_size} {orientation:?}"
+        );
+    }
+}
+
+/// The defaulted paper still rotates with `orientation="landscape"`, so the
+/// default feeds the same path a declared code does.
+#[test]
+fn test_omitted_paper_size_still_honours_landscape() {
+    let data = build_xlsx_with_page_setup_lacking_paper_size(
+        umya_spreadsheet::structs::OrientationValues::Landscape,
+    );
+    let (doc, _warnings) = XlsxParser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = get_sheet_page(&doc, 0);
+    assert!(
+        (page.size.width - 792.0).abs() < 0.01 && (page.size.height - 612.0).abs() < 0.01,
+        "expected landscape Letter, got {:?}",
+        page.size
+    );
+}
+
+/// Build a workbook whose only sheet has no cells, carrying a paper size and a
+/// header/footer. LibreOffice writes exactly this shape for a workbook saved
+/// with nothing typed into it.
+///
+/// The header and footer are declared so the tests can assert they are *not*
+/// carried onto the blank page, not because the page renders them.
+fn build_empty_sheet_xlsx(paper_size: u32, header: &str, footer: &str) -> Vec<u8> {
+    let mut book = umya_spreadsheet::new_file();
+    {
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        sheet.get_page_setup_mut().set_paper_size(paper_size);
+        sheet
+            .get_header_footer_mut()
+            .get_odd_header_mut()
+            .set_value(header);
+        sheet
+            .get_header_footer_mut()
+            .get_odd_footer_mut()
+            .set_value(footer);
+    }
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+    cursor.into_inner()
+}
+
+/// A workbook whose only sheet has no cells still prints one page, and that
+/// page is the size the sheet asks for.
+///
+/// The sheet loop skips a sheet with no used range, so a single-sheet workbook
+/// reached codegen with no pages at all and the compiler's own default supplied
+/// a blank A4 — the file's `<pageSetup paperSize="1"/>` never reached the
+/// renderer (issue #632).
+#[test]
+fn test_empty_sheet_keeps_its_declared_paper_size() {
+    // 1 = Letter.
+    let data = build_empty_sheet_xlsx(1, "&CReport", "&CPage &P");
+    let (doc, _warnings) = XlsxParser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    assert_eq!(doc.pages.len(), 1, "an empty sheet still prints one page");
+    let page = get_sheet_page(&doc, 0);
+    assert!(
+        (page.size.width - 612.0).abs() < 0.01 && (page.size.height - 792.0).abs() < 0.01,
+        "expected Letter, got {:?}",
+        page.size
+    );
+}
+
+/// Triangulation: a different paper code must produce that code's size, so the
+/// page cannot be a hardcoded Letter.
+#[test]
+fn test_empty_sheet_keeps_a_non_letter_paper_size() {
+    // 5 = Legal.
+    let data = build_empty_sheet_xlsx(5, "&CReport", "&CPage &P");
+    let (doc, _warnings) = XlsxParser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = get_sheet_page(&doc, 0);
+    assert!(
+        (page.size.width - 612.0).abs() < 0.01 && (page.size.height - 1008.0).abs() < 0.01,
+        "expected Legal, got {:?}",
+        page.size
+    );
+}
+
+/// The page an empty sheet prints stays blank.
+///
+/// The ground truth for a sheet with no used range is a blank page — Excel
+/// declines to print one at all — so nothing is invented to fill it. Only the
+/// paper the file asks for is restored.
+#[test]
+fn test_empty_sheet_page_stays_blank() {
+    let data = build_empty_sheet_xlsx(1, "&CQuarterly", "&CPage &P");
+    let (doc, _warnings) = XlsxParser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = get_sheet_page(&doc, 0);
+    assert!(page.header.is_none(), "no header on a page with no cells");
+    assert!(page.footer.is_none(), "no footer on a page with no cells");
+    assert!(page.table.rows.is_empty());
+    assert!(page.images.is_empty() && page.charts.is_empty());
+}
+
+/// The page still carries the sheet's own print margins, not the renderer's.
+#[test]
+fn test_empty_sheet_page_keeps_its_print_margins() {
+    let mut book = umya_spreadsheet::new_file();
+    {
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        sheet.get_page_setup_mut().set_paper_size(1);
+        sheet.get_page_margins_mut().set_left(1.25);
+    }
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+
+    let (doc, _warnings) = XlsxParser
+        .parse(&cursor.into_inner(), &ConvertOptions::default())
+        .unwrap();
+
+    let page = get_sheet_page(&doc, 0);
+    assert!(
+        (page.margins.left - 90.0).abs() < 0.01,
+        "expected 1.25in = 90pt, got {}",
+        page.margins.left
+    );
+}
+
+/// A sheet that does have cells keeps deciding the page count on its own — an
+/// empty *second* sheet must not add a blank page, which is what Excel does.
+#[test]
+fn test_empty_sheet_alongside_a_used_sheet_adds_no_page() {
+    let mut book = umya_spreadsheet::new_file();
+    {
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        sheet.set_name("Data");
+        sheet.get_cell_mut("A1").set_value("Value");
+    }
+    book.new_sheet("Blank").unwrap();
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+
+    let (doc, _warnings) = XlsxParser
+        .parse(&cursor.into_inner(), &ConvertOptions::default())
+        .unwrap();
+
+    assert_eq!(doc.pages.len(), 1, "the blank sheet contributes no page");
+    assert_eq!(get_sheet_page(&doc, 0).name, "Data");
+}
+
+// ----- Table structure tests -----
+
+#[test]
+fn test_table_row_column_consistency() {
+    // 3x3 grid, only some cells filled
+    let data = build_xlsx_bytes(
+        "Grid",
+        &[("A1", "1"), ("C1", "3"), ("B2", "5"), ("C3", "9")],
+    );
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let tp = get_sheet_page(&doc, 0);
+    assert_eq!(tp.table.rows.len(), 3, "Expected 3 rows");
+    // All rows should have same number of columns
+    for row in &tp.table.rows {
+        assert_eq!(row.cells.len(), 3, "Expected 3 columns per row");
+    }
+}
+
+// ----- Error handling -----
+
+#[test]
+fn test_parse_invalid_data_returns_error() {
+    let parser = XlsxParser;
+    let result = parser.parse(b"not an xlsx file", &ConvertOptions::default());
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, ConvertError::Parse(_)),
+        "Expected Parse error, got {err:?}"
+    );
+}
+
+#[test]
+fn test_parse_error_includes_library_name() {
+    let parser = XlsxParser;
+    let result = parser.parse(b"not an xlsx file", &ConvertOptions::default());
+    let err = result.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("umya-spreadsheet"),
+        "Parse error should include upstream library name 'umya-spreadsheet', got: {msg}"
+    );
+}
+
+// ----- Empty cell content -----
+
+#[test]
+fn test_empty_cells_have_no_content() {
+    let data = build_xlsx_bytes("Sheet1", &[("A1", "Only A1"), ("C1", "Only C1")]);
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let tp = get_sheet_page(&doc, 0);
+    // B1 should be empty (no paragraphs)
+    assert!(
+        tp.table.rows[0].cells[1].content.is_empty(),
+        "Expected empty cell content for B1"
+    );
+}
+
+#[test]
+fn test_cell_default_span_values() {
+    let data = build_xlsx_bytes("Sheet1", &[("A1", "Test")]);
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let tp = get_sheet_page(&doc, 0);
+    let cell = &tp.table.rows[0].cells[0];
+    assert_eq!(cell.col_span, 1);
+    assert_eq!(cell.row_span, 1);
+    assert!(cell.border.is_none());
+    assert!(cell.background.is_none());
+}
+
+#[path = "xlsx_cell_format_tests.rs"]
+mod cell_format_tests;
+
+#[path = "xlsx_page_feature_tests.rs"]
+mod page_feature_tests;
+
+#[path = "xlsx_condfmt_tests.rs"]
+mod condfmt_tests;
+
+#[path = "xlsx_indent_tests.rs"]
+mod indent_tests;
+
+#[path = "xlsx_cell_inset_tests.rs"]
+mod cell_inset_tests;
+
+#[path = "xlsx_chart_tests.rs"]
+mod chart_tests;
+
+#[path = "xlsx_streaming_tests.rs"]
+mod streaming_tests;
+
+/// The style of the first run of the first cell a parsed workbook produces.
+fn first_cell_text_style(data: &[u8]) -> crate::ir::TextStyle {
+    let (doc, _warnings) = XlsxParser
+        .parse(data, &ConvertOptions::default())
+        .expect("workbook should parse");
+    let Page::Sheet(sheet) = &doc.pages[0] else {
+        panic!("expected a sheet page");
+    };
+    for row in &sheet.table.rows {
+        for cell in &row.cells {
+            for block in &cell.content {
+                if let Block::Paragraph(paragraph) = block
+                    && let Some(run) = paragraph.runs.first()
+                {
+                    return run.style.clone();
+                }
+            }
+        }
+    }
+    panic!("expected a cell run");
+}
+
+#[test]
+fn test_unstyled_cell_carries_the_workbook_normal_font() {
+    // A cell with no `s` attribute uses cellXfs[0], whose font is the
+    // workbook's Normal font. umya reports no font for such a cell, so the
+    // style path has to fall back to styles.xml itself or the renderer picks
+    // its own default family and size (issue #462).
+    let data = build_xlsx_with_normal_font("Malgun Gothic", 12.0);
+    let style = first_cell_text_style(&data);
+    assert_eq!(style.font_family.as_deref(), Some("Malgun Gothic"));
+    assert_eq!(style.font_size, Some(12.0));
+}
+
+#[test]
+fn test_unstyled_cell_keeps_a_calibri_normal_font() {
+    // Triangulation: Calibri is the most common Normal font and used to be
+    // dropped on the grounds that it was "the default". It has to survive
+    // like any other family, or Calibri workbooks render in the renderer's
+    // serif default (issue #462).
+    let data = build_xlsx_with_normal_font("Calibri", 11.0);
+    let style = first_cell_text_style(&data);
+    assert_eq!(style.font_family.as_deref(), Some("Calibri"));
+    assert_eq!(style.font_size, Some(11.0));
+}
+
+/// A Normal font that defers to the theme's font scheme paints and prices
+/// columns in the face the theme names for the reference machine's UI
+/// script, not in the `<name>` it declares (issue #1380).
+///
+/// Native Excel-for-Mac export of `100-customers.xlsx` (Calibri 12,
+/// `<scheme val="minor"/>`, an Office theme naming `맑은 고딕` for `Hang`):
+/// `pdffonts` lists only `MalgunGothic`, and the one-factor probe naming
+/// Malgun Gothic 12 outright prints the same column grid, while naming
+/// Calibri 12 outright narrows every default column by 10pt — a 6pt column
+/// unit where the resolved face prices a 7pt one.
+#[test]
+fn a_theme_scheme_normal_font_paints_and_prices_columns_in_the_ui_script_face() {
+    let data: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/xlsx/100-customers.xlsx"
+    ));
+    let book = umya_spreadsheet::reader::xlsx::read_reader(Cursor::new(data), true)
+        .expect("the customer fixture should load");
+    let normal_font: NormalFont =
+        extract_normal_font(data, Some(book.get_theme()), XlsxUiScript::Hangul)
+            .expect("a Normal font");
+
+    assert_eq!(normal_font.family, "Calibri", "the declared name is kept");
+    assert_eq!(normal_font.size_pt, 12.0);
+    assert_eq!(normal_font.resolved_family(), "맑은 고딕");
+    assert_eq!(
+        resolve_column_unit_pt(book.get_sheet(&0).unwrap(), Some(&normal_font)),
+        7.0,
+        "Malgun Gothic 12 prices a column unit at 7pt; Calibri 12 would price 6pt"
+    );
+    assert_eq!(
+        first_cell_text_style(data).font_family.as_deref(),
+        Some("맑은 고딕"),
+        "an unstyled cell paints in the resolved face"
+    );
+}
+
+/// Triangulation across sizes and themes: the face follows the theme, so
+/// the same declared Calibri prices its unit as Malgun Gothic over an Office
+/// theme and as Calibri over a theme with neither a usable Hang nor `ea` face
+/// — the bare theme LibreOffice writes, which issue #1141 measured keeping
+/// Calibri.
+#[test]
+fn a_theme_scheme_normal_font_resolves_through_the_theme_it_ships_with() {
+    for (size_pt, ui_face_unit_pt, declared_face_unit_pt) in [
+        (11.0, 6.0, 6.0),
+        (12.0, 7.0, 6.0),
+        (14.0, 8.0, 7.0),
+        (16.0, 9.0, 8.0),
+    ] {
+        let office_theme: Vec<u8> = build_xlsx_with_theme_scheme_normal_font("Calibri", size_pt);
+        let bare_theme: Vec<u8> = strip_theme_minor_font_script_faces(&office_theme);
+        for (data, expected_face, expected_unit_pt) in [
+            (&office_theme, "맑은 고딕", ui_face_unit_pt),
+            (&bare_theme, "Calibri", declared_face_unit_pt),
+        ] {
+            let book =
+                umya_spreadsheet::reader::xlsx::read_reader(Cursor::new(data.as_slice()), true)
+                    .expect("the built workbook should load");
+            let normal_font: NormalFont =
+                extract_normal_font(data, Some(book.get_theme()), XlsxUiScript::Hangul)
+                    .expect("a Normal font");
+            assert_eq!(normal_font.family, "Calibri", "Calibri {size_pt}");
+            assert_eq!(
+                normal_font.resolved_family(),
+                expected_face,
+                "Calibri {size_pt}"
+            );
+            assert_eq!(
+                resolve_column_unit_pt(book.get_sheet(&0).unwrap(), Some(&normal_font)),
+                expected_unit_pt,
+                "Calibri {size_pt} resolved to {expected_face}"
+            );
+            assert_eq!(
+                first_cell_text_style(data).font_family.as_deref(),
+                Some(expected_face),
+                "Calibri {size_pt} resolved to {expected_face}"
+            );
+        }
+    }
+}
+
+/// When a theme omits a Hang font entry, Excel resolves a scheme font through
+/// the East Asian face before falling back to the font's declared family.
+/// A Hang-specific entry still takes precedence when both are present.
+#[test]
+fn a_theme_scheme_normal_font_falls_back_to_the_east_asian_theme_face() {
+    let office_theme: Vec<u8> = build_xlsx_with_theme_scheme_normal_font("Calibri", 11.0);
+    let east_asian_fallback: Vec<u8> = rewrite_theme_minor_font_ea_face(
+        &strip_theme_minor_font_script_faces(&office_theme),
+        "Arial",
+    );
+    let explicit_hang_face: Vec<u8> = rewrite_theme_minor_font_ea_face(&office_theme, "Arial");
+
+    for (data, expected_face) in [
+        (&east_asian_fallback, "Arial"),
+        (&explicit_hang_face, "맑은 고딕"),
+    ] {
+        let book = umya_spreadsheet::reader::xlsx::read_reader(Cursor::new(data.as_slice()), true)
+            .expect("the built workbook should load");
+        let normal_font: NormalFont =
+            extract_normal_font(data, Some(book.get_theme()), XlsxUiScript::Hangul)
+                .expect("a Normal font");
+
+        assert_eq!(normal_font.resolved_family(), expected_face);
+        assert_eq!(
+            first_cell_text_style(data).font_family.as_deref(),
+            Some(expected_face),
+            "the cell should paint in {expected_face}"
+        );
+    }
+}
+
+/// Some Office exports retain an old theme part beside the active one. The
+/// workbook relationship, not archive order, identifies the theme Excel uses.
+#[test]
+fn a_theme_scheme_font_uses_the_theme_named_by_the_workbook_relationship() {
+    let office_theme: Vec<u8> = build_xlsx_with_theme_scheme_normal_font("Calibri", 11.0);
+    let stale_theme_xml: Vec<u8> = read_zip_part(&office_theme, "xl/theme/theme1.xml");
+    let active_theme: Vec<u8> = rewrite_theme_minor_font_ea_face(
+        &strip_theme_minor_font_script_faces(&office_theme),
+        "Arial",
+    );
+    let data: Vec<u8> = prepend_zip_part(&active_theme, "xl/theme/theme.xml", &stale_theme_xml);
+    let book = umya_spreadsheet::reader::xlsx::read_reader(Cursor::new(data.as_slice()), true)
+        .expect("the built workbook should load");
+    let normal_font: NormalFont =
+        extract_normal_font(&data, Some(book.get_theme()), XlsxUiScript::Hangul)
+            .expect("a Normal font");
+
+    assert_eq!(normal_font.resolved_family(), "Arial");
+    assert_eq!(
+        first_cell_text_style(&data).font_family.as_deref(),
+        Some("Arial")
+    );
+}
+
+/// A cell font that itself defers to the theme — `<scheme val="major"/>` on
+/// a heading style, `minor` on body text — resolves through the same list,
+/// slot by slot; a cell font naming its face outright keeps it (issue #1380).
+#[test]
+fn a_cell_font_with_its_own_theme_scheme_resolves_through_its_slot() {
+    let mut book = umya_spreadsheet::new_file();
+    {
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        let heading = sheet.get_cell_mut("A1");
+        heading.set_value("Title");
+        heading
+            .get_style_mut()
+            .get_font_mut()
+            .set_name_with_scheme("Calibri Light", "major");
+        let body = sheet.get_cell_mut("A2");
+        body.set_value("body");
+        body.get_style_mut()
+            .get_font_mut()
+            .set_name_with_scheme("Calibri", "minor");
+        let named = sheet.get_cell_mut("A3");
+        named.set_value("named");
+        named.get_style_mut().get_font_mut().set_name("Georgia");
+    }
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+    // Give the major slot a face of its own so the two slots are told apart.
+    let data: Vec<u8> = rewrite_theme_major_font_hang_face(&cursor.into_inner(), "Batang");
+
+    assert_eq!(
+        cell_run_font_families(&data),
+        vec![
+            Some("Batang".to_string()),
+            Some("맑은 고딕".to_string()),
+            Some("Georgia".to_string()),
+        ]
+    );
+
+    let east_asian_fallback: Vec<u8> =
+        rewrite_theme_minor_font_ea_face(&strip_theme_minor_font_script_faces(&data), "Arial");
+    assert_eq!(
+        cell_run_font_families(&east_asian_fallback),
+        vec![
+            Some("Batang".to_string()),
+            Some("Arial".to_string()),
+            Some("Georgia".to_string()),
+        ]
+    );
+}
+
+/// A rich-text run's `<rPr>` carries the same `<scheme>` as a cell font and
+/// resolves the same way; a run naming its face outright keeps it.
+#[test]
+fn a_rich_text_run_font_with_a_theme_scheme_resolves_through_the_theme() {
+    let normal_font: NormalFont = theme_scheme_normal_font(11.0);
+    let base = TextStyle::default();
+
+    let mut scheme_run = umya_spreadsheet::Font::default();
+    scheme_run.set_name_with_scheme("Calibri", "minor");
+    assert_eq!(
+        xlsx_style::apply_rich_run_font(&base, &scheme_run, None, Some(&normal_font))
+            .font_family
+            .as_deref(),
+        Some("맑은 고딕")
+    );
+
+    let mut named_run = umya_spreadsheet::Font::default();
+    named_run.set_name("Georgia");
+    assert_eq!(
+        xlsx_style::apply_rich_run_font(&base, &named_run, None, Some(&normal_font))
+            .font_family
+            .as_deref(),
+        Some("Georgia")
+    );
+}
+
+/// The first cell run's font family of every cell, in sheet order.
+fn cell_run_font_families(data: &[u8]) -> Vec<Option<String>> {
+    let (doc, _warnings) = XlsxParser
+        .parse(data, &ConvertOptions::default())
+        .expect("workbook should parse");
+    let Page::Sheet(sheet) = &doc.pages[0] else {
+        panic!("expected a sheet page");
+    };
+    sheet
+        .table
+        .rows
+        .iter()
+        .flat_map(|row| row.cells.iter())
+        .filter_map(|cell| {
+            cell.content.iter().find_map(|block| match block {
+                Block::Paragraph(paragraph) => paragraph
+                    .runs
+                    .first()
+                    .map(|run| run.style.font_family.clone()),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+/// A one-cell workbook whose Normal font is `family` at `size_pt` with
+/// `<scheme val="minor"/>`, as every Excel-authored stylesheet writes it,
+/// over the Office theme umya ships.
+fn build_xlsx_with_theme_scheme_normal_font(family: &str, size_pt: f64) -> Vec<u8> {
+    let mut book = umya_spreadsheet::new_file();
+    {
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        sheet.get_cell_mut("A1").set_value("title");
+    }
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+    rewrite_first_styles_font_element(
+        &cursor.into_inner(),
+        &format!(
+            "<font><sz val=\"{size_pt}\"/><name val=\"{family}\"/><family val=\"2\"/><scheme val=\"minor\"/></font>"
+        ),
+    )
+}
+
+/// Point the theme's major font scheme at `face` for the `Hang` script.
+fn rewrite_theme_major_font_hang_face(data: &[u8], face: &str) -> Vec<u8> {
+    rewrite_zip_parts(
+        data,
+        |name| name.starts_with("xl/theme/") && name.ends_with(".xml"),
+        |xml| {
+            let start: usize = xml.find("<a:majorFont>").expect("theme has a major font");
+            let end: usize = xml[start..]
+                .find("</a:majorFont>")
+                .expect("major font is closed")
+                + start;
+            let block: &str = &xml[start..end];
+            let hang: usize = block
+                .find("<a:font script=\"Hang\"")
+                .expect("major font names a Hang face");
+            let hang_end: usize = block[hang..].find("/>").expect("Hang face is closed") + hang + 2;
+            format!(
+                "{}{}<a:font script=\"Hang\" typeface=\"{face}\"/>{}{}",
+                &xml[..start],
+                &block[..hang],
+                &block[hang_end..],
+                &xml[end..]
+            )
+        },
+    )
+}
+
+/// Strip every worksheet's `<pageMargins .../>`, leaving a package whose
+/// sheets state no print margins at all.
+///
+/// umya's writer emits Excel's own defaults for margins the workbook never
+/// set, so a generated package can no longer stand in for an absent element —
+/// removing it from the part is the only way to reach the fallback (issue
+/// #1812).
+fn remove_page_margins(data: &[u8]) -> Vec<u8> {
+    rewrite_zip_parts(
+        data,
+        |name| name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml"),
+        |xml| {
+            let start = xml
+                .find("<pageMargins")
+                .expect("worksheet has page margins");
+            let end = start + xml[start..].find("/>").expect("page margins is closed") + "/>".len();
+            format!("{}{}", &xml[..start], &xml[end..])
+        },
+    )
+}
+
+/// Rewrite every XML part whose name `selects` through `rewrite`, copying
+/// the rest of the package as is.
+fn rewrite_zip_parts(
+    data: &[u8],
+    selects: impl Fn(&str) -> bool,
+    rewrite: impl Fn(&str) -> String,
+) -> Vec<u8> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(data)).expect("readable zip");
+    let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).expect("readable entry");
+        let name = entry.name().expect("entry name should decode").into_owned();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes).expect("readable entry body");
+        if selects(&name) {
+            let xml = String::from_utf8(bytes).expect("part is utf-8");
+            bytes = rewrite(&xml).into_bytes();
+        }
+        out.start_file(name, zip::write::SimpleFileOptions::default())
+            .expect("writable entry");
+        std::io::Write::write_all(&mut out, &bytes).expect("writable entry body");
+    }
+    out.finish().expect("finished zip").into_inner()
+}
+
+/// Read one package part into memory for a controlled fixture rewrite.
+fn read_zip_part(data: &[u8], part_name: &str) -> Vec<u8> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(data)).expect("readable zip");
+    let mut entry = archive.by_name(part_name).expect("package part exists");
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut entry, &mut bytes).expect("readable part body");
+    bytes
+}
+
+/// Put a package part before the existing entries without changing their data.
+fn prepend_zip_part(data: &[u8], part_name: &str, contents: &[u8]) -> Vec<u8> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(data)).expect("readable zip");
+    let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    out.start_file(part_name, zip::write::SimpleFileOptions::default())
+        .expect("writable new entry");
+    std::io::Write::write_all(&mut out, contents).expect("writable new entry body");
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).expect("readable entry");
+        let name = entry.name().expect("entry name should decode").into_owned();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes).expect("readable entry body");
+        out.start_file(name, zip::write::SimpleFileOptions::default())
+            .expect("writable entry");
+        std::io::Write::write_all(&mut out, &bytes).expect("writable entry body");
+    }
+    out.finish().expect("finished zip").into_inner()
+}
+
+#[test]
+fn test_explicit_cell_font_overrides_the_workbook_normal_font() {
+    let mut book = umya_spreadsheet::new_file();
+    {
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        let cell = sheet.get_cell_mut("A1");
+        cell.set_value("styled");
+        cell.get_style_mut().get_font_mut().set_name("Georgia");
+        cell.get_style_mut().get_font_mut().set_size(20.0);
+    }
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+    let style = first_cell_text_style(&cursor.into_inner());
+    assert_eq!(style.font_family.as_deref(), Some("Georgia"));
+    assert_eq!(style.font_size, Some(20.0));
+}
+
+/// A one-cell workbook whose Normal font (styles.xml font 0) is `family` at
+/// `size_pt`, with the cell itself left unstyled.
+fn build_xlsx_with_normal_font(family: &str, size_pt: f64) -> Vec<u8> {
+    let mut book = umya_spreadsheet::new_file();
+    {
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        sheet.get_cell_mut("A1").set_value("title");
+    }
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+    rewrite_first_styles_font(&cursor.into_inner(), family, size_pt)
+}
+
+/// Rewrite the first `<font>` of `xl/styles.xml` in place. umya always
+/// writes Calibri 11 there, so the fixture has to patch the part directly to
+/// exercise a different Normal font.
+fn rewrite_first_styles_font(data: &[u8], family: &str, size_pt: f64) -> Vec<u8> {
+    rewrite_first_styles_font_with_color(data, family, size_pt, "")
+}
+
+/// Variant of [`rewrite_first_styles_font`] that includes one raw OOXML
+/// `<color>` element in the first font.
+fn rewrite_first_styles_font_with_color(
+    data: &[u8],
+    family: &str,
+    size_pt: f64,
+    color_xml: &str,
+) -> Vec<u8> {
+    rewrite_first_styles_font_element(
+        data,
+        &format!("<font><sz val=\"{size_pt}\"/>{color_xml}<name val=\"{family}\"/></font>"),
+    )
+}
+
+/// Replace the first `<font>` element of `xl/styles.xml` with `font_xml`.
+fn rewrite_first_styles_font_element(data: &[u8], font_xml: &str) -> Vec<u8> {
+    rewrite_zip_parts(
+        data,
+        |name| name == "xl/styles.xml",
+        |xml| {
+            let start = xml.find("<font>").expect("styles.xml has a font");
+            let end = xml[start..].find("</font>").expect("font is closed") + start;
+            format!(
+                "{}{}{}",
+                &xml[..start],
+                font_xml,
+                &xml[end + "</font>".len()..]
+            )
+        },
+    )
+}
+
+/// Replace every worksheet's `<sheetFormatPr .../>` with `replacement`. umya
+/// models only `defaultRowHeight`, so a fixture that needs `customHeight` or a
+/// hint umya would not write has to patch the part directly.
+fn rewrite_sheet_format_pr(data: &[u8], replacement: &str) -> Vec<u8> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(data)).expect("readable zip");
+    let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).expect("readable entry");
+        let name = entry.name().expect("entry name should decode").into_owned();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes).expect("readable entry body");
+        if name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml") {
+            let xml = String::from_utf8(bytes).expect("worksheet part is utf-8");
+            let start = xml
+                .find("<sheetFormatPr")
+                .expect("worksheet has sheetFormatPr");
+            let end = xml[start..].find("/>").expect("sheetFormatPr is closed") + start + 2;
+            bytes = format!("{}{}{}", &xml[..start], replacement, &xml[end..]).into_bytes();
+        }
+        out.start_file(name, zip::write::SimpleFileOptions::default())
+            .expect("writable entry");
+        std::io::Write::write_all(&mut out, &bytes).expect("writable entry body");
+    }
+    out.finish().expect("finished zip").into_inner()
+}
+
+// ----- Drawing-only sheets (issue #620) -----
+
+/// A workbook whose only sheet has no cells but carries one picture anchored
+/// C1:F9 (cols 2..5, rows 0..8, zero offsets). umya cannot author drawings,
+/// so the drawing parts are spliced into the zip it writes.
+fn build_drawing_only_sheet_xlsx() -> Vec<u8> {
+    let book = umya_spreadsheet::new_file();
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+    splice_picture_drawing(&cursor.into_inner(), &one_pixel_png())
+}
+
+fn one_pixel_png() -> Vec<u8> {
+    let image = image::DynamicImage::new_rgba8(1, 1);
+    let mut encoded = Cursor::new(Vec::new());
+    image
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .expect("1x1 PNG encodes");
+    encoded.into_inner()
+}
+
+/// Splice `xl/drawings/drawing1.xml` (one twoCellAnchor picture), its rels,
+/// and the supplied PNG media part into a workbook zip, wiring the first
+/// worksheet to it.
+fn splice_picture_drawing(data: &[u8], media: &[u8]) -> Vec<u8> {
+    const DRAWING_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor><xdr:from><xdr:col>2</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>8</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="Picture 1"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#;
+    const DRAWING_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/></Relationships>"#;
+    const SHEET_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdDrawing1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#;
+    let mut archive = zip::ZipArchive::new(Cursor::new(data)).expect("readable zip");
+    let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let mut has_sheet_rels = false;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).expect("readable entry");
+        let name = entry.name().expect("entry name should decode").into_owned();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes).expect("readable entry body");
+        match name.as_str() {
+            "xl/worksheets/sheet1.xml" => {
+                let xml = String::from_utf8(bytes).expect("sheet1.xml is utf-8");
+                bytes = xml
+                    .replace(
+                        "</worksheet>",
+                        r#"<drawing r:id="rIdDrawing1"/></worksheet>"#,
+                    )
+                    .into_bytes();
+            }
+            "xl/worksheets/_rels/sheet1.xml.rels" => {
+                has_sheet_rels = true;
+                let xml = String::from_utf8(bytes).expect("sheet rels is utf-8");
+                bytes = xml
+                    .replace(
+                        "</Relationships>",
+                        r#"<Relationship Id="rIdDrawing1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#,
+                    )
+                    .into_bytes();
+            }
+            "[Content_Types].xml" => {
+                let xml = String::from_utf8(bytes).expect("content types is utf-8");
+                bytes = xml
+                    .replace(
+                        "</Types>",
+                        r#"<Default Extension="png" ContentType="image/png"/><Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/></Types>"#,
+                    )
+                    .into_bytes();
+            }
+            _ => {}
+        }
+        out.start_file(name, zip::write::SimpleFileOptions::default())
+            .expect("writable entry");
+        std::io::Write::write_all(&mut out, &bytes).expect("writable entry body");
+    }
+    if !has_sheet_rels {
+        out.start_file(
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .expect("writable sheet rels");
+        std::io::Write::write_all(&mut out, SHEET_RELS.as_bytes()).expect("writable sheet rels");
+    }
+    for (path, body) in [
+        ("xl/drawings/drawing1.xml", DRAWING_XML.as_bytes()),
+        (
+            "xl/drawings/_rels/drawing1.xml.rels",
+            DRAWING_RELS.as_bytes(),
+        ),
+        ("xl/media/image1.png", media),
+    ] {
+        out.start_file(path, zip::write::SimpleFileOptions::default())
+            .expect("writable drawing part");
+        std::io::Write::write_all(&mut out, body).expect("writable drawing part body");
+    }
+    out.finish().expect("finished zip").into_inner()
+}
+
+#[test]
+fn malformed_raster_image_is_omitted_with_warning_and_workbook_still_converts() {
+    let workbook = build_xlsx_bytes("Sheet1", &[("A1", "survives")]);
+    let data = splice_picture_drawing(&workbook, b"not a png");
+
+    let (doc, warnings) = XlsxParser
+        .parse(&data, &ConvertOptions::default())
+        .expect("a malformed picture must not abort XLSX parsing");
+    let page = get_sheet_page(&doc, 0);
+    assert!(
+        page.images.is_empty(),
+        "the malformed picture must not reach the renderer"
+    );
+    assert!(
+        warnings.iter().any(|warning| matches!(
+            warning,
+            ConvertWarning::UnsupportedElement { format, element }
+                if format == "XLSX"
+                    && element.contains("image omitted")
+                    && element.contains("xl/media/image1.png")
+        )),
+        "expected an omission warning naming the malformed media part, got {warnings:?}"
+    );
+
+    let result = crate::convert_bytes(
+        &data,
+        crate::config::Format::Xlsx,
+        &ConvertOptions::default(),
+    )
+    .expect("the workbook must still produce a PDF");
+    assert!(result.pdf.starts_with(b"%PDF-"));
+    assert!(result.warnings.iter().any(|warning| matches!(
+        warning,
+        ConvertWarning::UnsupportedElement { format, element }
+            if format == "XLSX"
+                && element.contains("image omitted")
+                && element.contains("xl/media/image1.png")
+    )));
+}
+
+/// A sheet with no cells must resolve its drawing anchors against the
+/// workbook Normal font, producing the same column metric as a populated
+/// sheet (issue #620). umya writes Calibri 11 as the Normal font, whose 6pt
+/// unit prices an undeclared default column at 8 × 6 + 5 = 53pt (issue #621
+/// probes); the legacy hardcoded 7px metric produced 44.2575pt.
+#[test]
+fn test_drawing_only_sheet_resolves_anchors_with_normal_font_metric() {
+    let data = build_drawing_only_sheet_xlsx();
+    let (doc, _warnings) = XlsxParser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = get_sheet_page(&doc, 0);
+    assert_eq!(
+        page.images.len(),
+        1,
+        "the spliced picture must survive parse"
+    );
+    let image: &crate::ir::SheetImage = &page.images[0];
+
+    let column_pt: f64 = default_column_width_pt(None, 8, 6.0);
+    assert_eq!(
+        column_pt, 53.0,
+        "Calibri-11 default column must be 53pt, got {column_pt}"
+    );
+    // Anchor spans cols 2..5 with zero offsets: x = 2 columns, width = 3.
+    assert!(
+        (image.x_offset_pt - 2.0 * column_pt).abs() < 0.01,
+        "x_offset_pt {} != 2 x {column_pt}",
+        image.x_offset_pt
+    );
+    let width: f64 = image.image.width.expect("twoCellAnchor resolves a width");
+    assert!(
+        (width - 3.0 * column_pt).abs() < 0.01,
+        "width {width} != 3 x {column_pt}"
+    );
+    // Negative: neither the legacy hardcoded-7px metric (44.2575pt columns)
+    // nor the pre-#621 8.43-character model (50.58pt) may resurface.
+    for stale_column_pt in [44.2575_f64, 50.58_f64] {
+        assert!(
+            (width - 3.0 * stale_column_pt).abs() > 1.0,
+            "width {width} still matches the stale {stale_column_pt}pt column metric"
+        );
+    }
+}
+
+// ── Overrunning `to` column offsets (issue #1149) ────────────────────
+
+/// The width `anchored_image` resolves for the anchor of
+/// `tests/fixtures/xlsx/issue_1066_blip_effect_picture.xlsx` — `from` col 1 at
+/// 11880 EMU (0.935pt), `to` col 3 — on a sheet whose columns all measure the
+/// requested width. Calibri 11 prices a character unit at 6pt, the same unit
+/// that workbook's Calibri 12 Normal font resolves to, so a declared width of
+/// `W` characters lands on the `6W` points Excel reported for it.
+fn overrun_sweep_picture_width_pt(
+    declared_width_chars: Option<f64>,
+    base_column_width_chars: Option<u32>,
+    to_col_off_emu: i64,
+) -> f64 {
+    let mut book = umya_spreadsheet::new_file();
+    {
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        if let Some(base_width) = base_column_width_chars {
+            sheet
+                .get_sheet_format_properties_mut()
+                .set_base_column_width(base_width);
+        }
+        // Cover the whole span the anchor touches, `to` column included: an
+        // undeclared column falls through to the default width instead.
+        if let Some(width) = declared_width_chars {
+            for col in 1..=4u32 {
+                sheet
+                    .get_column_dimension_by_number_mut(&col)
+                    .set_width(width);
+            }
+        }
+    }
+    let sheet: &umya_spreadsheet::Worksheet = book.get_sheet(&0).unwrap();
+    let normal_font = NormalFont {
+        family: "Calibri".to_string(),
+        size_pt: 11.0,
+        color: None,
+        theme_scheme: None,
+        theme_ui_script_faces: ThemeUiScriptFaces::default(),
+    };
+    let ctx: SheetContext = empty_sheet_context(sheet, Some(&normal_font), None, None, true);
+    let placed: crate::ir::SheetImage = anchored_image(
+        xlsx_drawing::RawImageAnchor {
+            from_row: 6,
+            from_col: 1,
+            from_col_off_emu: 11_880,
+            from_row_off_emu: 0,
+            to: Some((3, to_col_off_emu, 13, 0)),
+            ext_emu: None,
+            data: Vec::new(),
+            format: crate::ir::ImageFormat::Png,
+        },
+        sheet,
+        &ctx,
+    );
+    placed.image.width.expect("a two-cell anchor sizes")
+}
+
+/// Sweeping the column width under a fixed 963720 EMU (75.883pt) `to` offset.
+/// Excel adds the offset as written only from 78pt up — once the column is
+/// wider than the offset; below that the picture comes out `3W - 1.052` wide,
+/// the offset behaving as if it stopped just short of the column's far edge.
+/// Every width here is `width of picture 1` read back through AppleScript from
+/// an Excel for Mac export of a one-factor variant (issue #1149).
+#[test]
+fn the_to_column_offset_stops_growing_once_it_overruns_its_column() {
+    // (declared `<col width>`, `baseColWidth`, column pt, Excel picture width)
+    let measured: [(Option<f64>, Option<u32>, f64, f64); 9] = [
+        (Some(5.0), None, 30.0, 88.948),
+        (Some(8.0), None, 48.0, 142.948),
+        (None, Some(10), 65.0, 193.948),
+        (Some(12.0), None, 72.0, 214.948),
+        (Some(12.5), None, 75.0, 223.948),
+        (Some(13.0), None, 78.0, 230.948),
+        (Some(16.0), None, 96.0, 266.948),
+        (Some(20.0), None, 120.0, 314.948),
+        (None, Some(20), 125.0, 324.948),
+    ];
+    for (declared, base_width, column_pt, expected) in measured {
+        let width: f64 = overrun_sweep_picture_width_pt(declared, base_width, 963_720);
+        assert!(
+            (width - expected).abs() < 0.001,
+            "{column_pt}pt columns: expected {expected}, got {width}"
+        );
+    }
+}
+
+/// Sweeping the offset instead, with the columns held at 65pt. The offset is
+/// taken as written while it stays inside the column, and past that edge the
+/// effective offset stays within half a point of the column width however far
+/// the anchor overruns — 2000000 EMU is 157.480pt of offset and still prints
+/// 194.545pt wide. Excel for Mac measurements again (issue #1149).
+#[test]
+fn an_overrunning_to_column_offset_keeps_only_the_fractional_overrun() {
+    // (`xdr:colOff` EMU, Excel picture width over 65pt columns)
+    let measured: [(i64, f64); 16] = [
+        (0, 129.065),
+        (400_000, 160.561),
+        (800_000, 192.057),
+        (823_000, 193.868),
+        (825_500, 194.065),
+        (830_000, 194.419),
+        (840_000, 194.206),
+        (850_000, 193.994),
+        (860_000, 193.781),
+        (870_000, 193.568),
+        (880_000, 194.356),
+        (900_000, 193.931),
+        (963_720, 193.948),
+        (1_100_000, 193.679),
+        (1_500_000, 194.175),
+        (2_000_000, 194.545),
+    ];
+    for (col_off_emu, expected) in measured {
+        let width: f64 = overrun_sweep_picture_width_pt(None, Some(10), col_off_emu);
+        assert!(
+            (width - expected).abs() < 0.001,
+            "colOff {col_off_emu}: expected {expected}, got {width}"
+        );
+    }
+}
+
+/// Triangulation for issue #620: the empty-sheet context must derive its
+/// metric from whatever Normal font it is given — not a hardcoded value —
+/// and fall back to the legacy 5.25pt unit only when no Normal font is
+/// readable. The carried `normal_font` keeps the stub structurally
+/// consistent with a populated-sheet context; nothing on the drawing-only
+/// path reads it today (text boxes take their fonts from DrawingML run
+/// properties and the theme).
+#[test]
+fn test_empty_sheet_context_derives_metric_from_normal_font() {
+    let book = umya_spreadsheet::new_file();
+    let sheet: &umya_spreadsheet::Worksheet = book.get_sheet(&0).unwrap();
+
+    let calibri_11 = NormalFont {
+        family: "Calibri".to_string(),
+        size_pt: 11.0,
+        color: None,
+        theme_scheme: None,
+        theme_ui_script_faces: ThemeUiScriptFaces::default(),
+    };
+    let calibri_ctx = empty_sheet_context(sheet, Some(&calibri_11), None, None, true);
+    assert_eq!(resolve_column_unit_pt(sheet, Some(&calibri_11)), 6.0);
+    assert_eq!(calibri_ctx.default_column_width_pt, 53.0);
+    assert_eq!(calibri_ctx.normal_font, Some(calibri_11));
+
+    // A smaller Normal font must shrink the metric with it:
+    // round(0.506836 × 8pt) = 4pt unit → 8 × 4 + 3 = 35pt default columns,
+    // the padding a 4pt unit's inset pair carries — the issue #1657 sweep's
+    // calibri8-unit4 and arial7-unit4 exports both print a 35pt pitch.
+    let calibri_8 = NormalFont {
+        family: "Calibri".to_string(),
+        size_pt: 8.0,
+        color: None,
+        theme_scheme: None,
+        theme_ui_script_faces: ThemeUiScriptFaces::default(),
+    };
+    assert_eq!(resolve_column_unit_pt(sheet, Some(&calibri_8)), 4.0);
+    assert_eq!(
+        empty_sheet_context(sheet, Some(&calibri_8), None, None, true).default_column_width_pt,
+        35.0
+    );
+
+    // No readable Normal font: the shared cell-font fallback finds no cells
+    // on an empty sheet and keeps the legacy 5.25pt unit (7px × 0.75); the
+    // #621 probes never covered a stylesheet-less workbook.
+    let fallback_ctx = empty_sheet_context(sheet, None, None, None, true);
+    assert_eq!(resolve_column_unit_pt(sheet, None), 5.25);
+    assert_eq!(fallback_ctx.default_column_width_pt, 8.0 * 5.25 + 5.0);
+    assert_eq!(fallback_ctx.normal_font, None);
+}
+
+/// Rewrite the workbook's worksheet parts, inserting `insertion` before each
+/// closing `</worksheet>` tag. umya's writer does not model
+/// `printOptions@gridLines`, so the attribute is injected into the archive
+/// the way Excel writes it — after `sheetData`.
+fn inject_before_worksheet_close(xlsx: &[u8], insertion: &str) -> Vec<u8> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(xlsx.to_vec())).unwrap();
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index).unwrap();
+        let name: String = file.name().expect("entry name should decode").into_owned();
+        let mut contents: Vec<u8> = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut contents).unwrap();
+        if name.starts_with("xl/worksheets/") && name.ends_with(".xml") {
+            let text: String = String::from_utf8(contents).unwrap();
+            contents = text
+                .replace("</worksheet>", &format!("{insertion}</worksheet>"))
+                .into_bytes();
+        }
+        writer
+            .start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut writer, &contents).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn test_print_options_grid_lines_flags_the_sheet_table() {
+    let plain = build_xlsx_bytes("Sheet1", &[("A1", "x"), ("B2", "y")]);
+    let flagged = inject_before_worksheet_close(&plain, r#"<printOptions gridLines="1"/>"#);
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&flagged, &ConvertOptions::default()).unwrap();
+    let table = &get_sheet_page(&doc, 0).table;
+    assert!(
+        table.prints_gridlines,
+        "printOptions gridLines must set the table's gridline flag"
+    );
+    assert!(
+        table.border_paint_model == TableBorderPaintModel::ExcelBoundaryBands,
+        "the gridline flag rides on the boundary-band regime"
+    );
+
+    let (doc, _warnings) = parser.parse(&plain, &ConvertOptions::default()).unwrap();
+    assert!(
+        !get_sheet_page(&doc, 0).table.prints_gridlines,
+        "a sheet without printOptions must not print gridlines"
+    );
+}
+
+#[test]
+fn test_print_options_horizontal_centered_flags_the_sheet_table() {
+    let plain = build_xlsx_bytes("Sheet1", &[("A1", "x"), ("B2", "y")]);
+    let flagged =
+        inject_before_worksheet_close(&plain, r#"<printOptions horizontalCentered="1"/>"#);
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&flagged, &ConvertOptions::default()).unwrap();
+    let table = &get_sheet_page(&doc, 0).table;
+    assert!(
+        table.centers_between_print_margins,
+        "printOptions horizontalCentered must set the table's centering flag"
+    );
+    assert!(
+        !table.prints_gridlines && !table.prints_headings,
+        "centering alone must not turn gridlines or headings on"
+    );
+
+    let (doc, _warnings) = parser.parse(&plain, &ConvertOptions::default()).unwrap();
+    assert!(
+        !get_sheet_page(&doc, 0).table.centers_between_print_margins,
+        "a sheet without printOptions must print flush to the left margin"
+    );
+}
+
+#[test]
+fn test_print_options_headings_prepends_gutter_column_and_letter_strip() {
+    let plain = build_xlsx_bytes("Sheet1", &[("A1", "x"), ("B2", "y")]);
+    let flagged = inject_before_worksheet_close(&plain, r#"<printOptions headings="1"/>"#);
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&flagged, &ConvertOptions::default()).unwrap();
+    let table = &get_sheet_page(&doc, 0).table;
+    assert!(
+        table.prints_headings,
+        "printOptions headings must set the table's heading flag"
+    );
+    // GT geometry (issue #623): 23pt gutter track, 13pt letter-strip track.
+    assert_eq!(table.column_widths[0], 23.0);
+    assert_eq!(table.rows[0].height, Some(13.0));
+
+    // Strip row: empty corner + letters covering the printed columns.
+    let strip = &table.rows[0];
+    assert!(strip.cells[0].content.is_empty());
+    assert_eq!(cell_text(&strip.cells[1]), "A");
+    assert_eq!(cell_text(&strip.cells[2]), "B");
+
+    // Gutter cells carry the sheet row numbers; data follows one column later.
+    assert_eq!(cell_text(&table.rows[1].cells[0]), "1");
+    assert_eq!(cell_text(&table.rows[2].cells[0]), "2");
+    assert_eq!(cell_text(&table.rows[1].cells[1]), "x");
+    assert_eq!(cell_text(&table.rows[2].cells[2]), "y");
+
+    let (doc, _warnings) = parser.parse(&plain, &ConvertOptions::default()).unwrap();
+    let table = &get_sheet_page(&doc, 0).table;
+    assert!(
+        !table.prints_headings,
+        "a sheet without printOptions must not print headings"
+    );
+    assert_eq!(
+        cell_text(&table.rows[0].cells[0]),
+        "x",
+        "an unflagged sheet must keep its grid unshifted"
+    );
+}
+
+#[test]
+fn test_print_headings_row_numbers_continue_across_manual_page_breaks() {
+    // A row break after row 2 splits the sheet; the second segment's gutter
+    // must continue at the actual sheet row number, not restart at 1.
+    let plain = {
+        let mut book = umya_spreadsheet::new_file();
+        {
+            let sheet = book.get_sheet_mut(&0).unwrap();
+            sheet.set_name("Sheet1");
+            for (coord, value) in [("A1", "r1"), ("A2", "r2"), ("A3", "r3")] {
+                sheet.get_cell_mut(coord).set_value(value);
+            }
+            let mut brk = umya_spreadsheet::Break::default();
+            brk.set_id(2);
+            brk.set_manual_page_break(true);
+            sheet.get_row_breaks_mut().add_break_list(brk);
+        }
+        let mut cursor = Cursor::new(Vec::new());
+        umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+        cursor.into_inner()
+    };
+    let flagged = inject_before_worksheet_close(&plain, r#"<printOptions headings="1"/>"#);
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&flagged, &ConvertOptions::default()).unwrap();
+    assert_eq!(doc.pages.len(), 2);
+
+    let first = &get_sheet_page(&doc, 0).table;
+    assert!(first.prints_headings);
+    assert_eq!(cell_text(&first.rows[1].cells[0]), "1");
+    assert_eq!(cell_text(&first.rows[2].cells[0]), "2");
+
+    let second = &get_sheet_page(&doc, 1).table;
+    assert!(second.prints_headings);
+    assert_eq!(cell_text(&second.rows[0].cells[1]), "A");
+    assert_eq!(cell_text(&second.rows[1].cells[0]), "3");
+    assert_eq!(cell_text(&second.rows[1].cells[1]), "r3");
+}
+
+/// A sheet with no used cells can still declare `<cols>`, and a drawing
+/// anchored to those columns is placed against their widths (issue #714).
+///
+/// The window used to be left empty, so every column fell through to the
+/// default and an anchored picture was priced at the 8.43-char width whatever
+/// the file declared.
+#[test]
+fn test_empty_sheet_context_reads_declared_column_widths() {
+    let mut book = umya_spreadsheet::new_file();
+    {
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        for col in 1..=3u32 {
+            sheet
+                .get_column_dimension_by_number_mut(&col)
+                .set_width(20.0);
+        }
+    }
+    let sheet: &umya_spreadsheet::Worksheet = book.get_sheet(&0).unwrap();
+    let calibri_11 = NormalFont {
+        family: "Calibri".to_string(),
+        size_pt: 11.0,
+        color: None,
+        theme_scheme: None,
+        theme_ui_script_faces: ThemeUiScriptFaces::default(),
+    };
+
+    let ctx = empty_sheet_context(sheet, Some(&calibri_11), None, None, true);
+
+    assert_eq!((ctx.col_start, ctx.col_end), (1, 3));
+    assert_eq!(ctx.column_widths.len(), 3);
+    for width in &ctx.column_widths {
+        assert!(
+            *width > ctx.default_column_width_pt,
+            "a declared width of 20 is wider than the 8.43-char default, got \
+             {width} against {}",
+            ctx.default_column_width_pt
+        );
+    }
+}
+
+/// A sheet declaring no `<cols>` at all keeps the empty window, so every
+/// column still falls through to the default width.
+#[test]
+fn test_empty_sheet_context_without_cols_keeps_the_default_window() {
+    let book = umya_spreadsheet::new_file();
+    let sheet: &umya_spreadsheet::Worksheet = book.get_sheet(&0).unwrap();
+
+    let ctx = empty_sheet_context(sheet, None, None, None, true);
+
+    assert!(ctx.column_widths.is_empty());
+    assert_eq!(ctx.num_cols, 0);
+    assert!(ctx.col_start > ctx.col_end, "an empty window");
+}
+
+// ── Dimension-less row heights (issues #715, #1047) ──────────────────
+
+/// A Normal font declared at `size_pt` that resolves through the theme's
+/// minor font scheme, as every Excel-authored stylesheet writes it.
+fn theme_scheme_normal_font(size_pt: f64) -> NormalFont {
+    NormalFont {
+        family: "Calibri".to_string(),
+        size_pt,
+        color: None,
+        theme_scheme: Some(ThemeFontSlot::Minor),
+        theme_ui_script_faces: office_theme_ui_script_faces(),
+    }
+}
+
+/// The `Hang` faces of the standard Office theme, major and minor alike —
+/// the list the reference machine resolves a scheme font through.
+fn office_theme_ui_script_faces() -> ThemeUiScriptFaces {
+    ThemeUiScriptFaces {
+        minor: Some("맑은 고딕".to_string()),
+        major: Some("맑은 고딕".to_string()),
+    }
+}
+
+/// Excel recomputes the default row height from the Normal font for rows
+/// that record no height, ignoring the `defaultRowHeight` hint unless the
+/// sheet marks it `customHeight` (issue #715).
+#[test]
+fn a_dimensionless_row_takes_the_normal_font_default() {
+    let mut book = umya_spreadsheet::new_file();
+    let sheet = book.get_sheet_mut(&0).unwrap();
+    sheet
+        .get_sheet_format_properties_mut()
+        .set_default_row_height(15.0);
+    assert_eq!(
+        xlsx_cells::worksheet_default_row_height_pt(sheet, Some(&theme_scheme_normal_font(11.0))),
+        17.0
+    );
+}
+
+/// The declared hint is not a floor or a starting point — it is ignored.
+/// Probe-measured (issue #1047): declaring 9, 15, 20 or 30 exports the same
+/// 17pt rows, so a hint that disagrees with the font changes nothing.
+#[test]
+fn a_declared_default_the_normal_font_disagrees_with_is_ignored() {
+    for declared in [9.0, 20.0, 30.0] {
+        let mut book = umya_spreadsheet::new_file();
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        sheet
+            .get_sheet_format_properties_mut()
+            .set_default_row_height(declared);
+        assert_eq!(
+            xlsx_cells::worksheet_default_row_height_pt(
+                sheet,
+                Some(&theme_scheme_normal_font(11.0))
+            ),
+            17.0,
+            "declared {declared} must not reach the recomputed default"
+        );
+    }
+}
+
+#[test]
+fn a_custom_height_default_is_honoured_as_declared() {
+    let mut book = umya_spreadsheet::new_file();
+    let sheet = book.get_sheet_mut(&0).unwrap();
+    let properties = sheet.get_sheet_format_properties_mut();
+    properties.set_default_row_height(30.0);
+    properties.set_custom_height(true);
+    assert_eq!(
+        xlsx_cells::worksheet_default_row_height_pt(sheet, Some(&theme_scheme_normal_font(11.0))),
+        30.0
+    );
+}
+
+/// Every size measured for a Normal font that resolves through the theme's
+/// per-script face list. The customer workbooks in issue #1226 exercise 12pt,
+/// but the native sweep measured one complete column, so the lookup must not
+/// leave the other seven added sizes on the declared hint either.
+#[test]
+fn the_theme_scheme_recomputes_from_the_full_ui_script_face_series() {
+    let sizes = [
+        8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 20.0, 22.0, 24.0,
+    ];
+    let heights = [
+        13.0, 14.0, 15.0, 17.0, 18.0, 19.0, 20.0, 22.0, 23.0, 26.0, 27.0, 30.0, 32.0, 35.0,
+    ];
+    for (size_pt, expected) in sizes.into_iter().zip(heights) {
+        let mut book = umya_spreadsheet::new_file();
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        sheet
+            .get_sheet_format_properties_mut()
+            .set_default_row_height(40.0);
+        assert_eq!(
+            xlsx_cells::worksheet_default_row_height_pt(
+                sheet,
+                Some(&theme_scheme_normal_font(size_pt))
+            ),
+            expected,
+            "{size_pt}pt Normal font"
+        );
+    }
+}
+
+/// A Normal font that names its own face instead of deferring to the theme
+/// scheme is a different measurement, not an absent one: Excel substitutes
+/// unavailable Calibri and Aptos independently on the reference machine and
+/// recomputes against the resolved face, ignoring the declared hint exactly
+/// as the scheme path does (issues #1102, #1225).
+fn substituted_face_normal_font(family: &str, size_pt: f64) -> NormalFont {
+    NormalFont {
+        family: family.to_string(),
+        size_pt,
+        color: None,
+        theme_scheme: None,
+        theme_ui_script_faces: ThemeUiScriptFaces::default(),
+    }
+}
+
+#[test]
+fn a_scheme_less_substituted_face_recomputes_over_the_declared_default() {
+    for declared in [15.0, 18.0, 30.0] {
+        let mut book = umya_spreadsheet::new_file();
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        sheet
+            .get_sheet_format_properties_mut()
+            .set_default_row_height(declared);
+        assert_eq!(
+            xlsx_cells::worksheet_default_row_height_pt(
+                sheet,
+                Some(&substituted_face_normal_font("Calibri", 12.0))
+            ),
+            16.0,
+            "declared {declared} must not reach a 12pt Calibri row"
+        );
+    }
+}
+
+/// Every size the scheme-less sweep measured for Calibri and Aptos. The two
+/// agree at nine sizes but separate at 9, 13, 16, 20 and 24pt, so neither may
+/// borrow the other face's series (issue #1225).
+#[test]
+fn calibri_and_aptos_recompute_from_their_own_full_size_series() {
+    let sizes = [
+        8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 20.0, 22.0, 24.0,
+    ];
+    for (family, heights) in [
+        (
+            "Calibri",
+            [
+                11.0, 12.0, 14.0, 15.0, 16.0, 17.0, 19.0, 20.0, 21.0, 23.0, 24.0, 26.0, 29.0, 31.0,
+            ],
+        ),
+        (
+            "Aptos",
+            [
+                11.0, 13.0, 14.0, 15.0, 16.0, 18.0, 19.0, 20.0, 22.0, 23.0, 24.0, 27.0, 29.0, 32.0,
+            ],
+        ),
+    ] {
+        for (size_pt, expected) in sizes.iter().zip(heights) {
+            let mut book = umya_spreadsheet::new_file();
+            let sheet = book.get_sheet_mut(&0).unwrap();
+            sheet
+                .get_sheet_format_properties_mut()
+                .set_default_row_height(18.0);
+            assert_eq!(
+                xlsx_cells::worksheet_default_row_height_pt(
+                    sheet,
+                    Some(&substituted_face_normal_font(family, *size_pt))
+                ),
+                expected,
+                "{size_pt}pt {family} Normal font"
+            );
+        }
+    }
+}
+
+/// A family no sweep has measured keeps the declared hint — as does a size
+/// its family's series skips, and a workbook with no readable stylesheet
+/// (issues #1047, #1150).
+#[test]
+fn an_unmeasured_normal_font_keeps_the_declared_default() {
+    let mut book = umya_spreadsheet::new_file();
+    let sheet = book.get_sheet_mut(&0).unwrap();
+    sheet
+        .get_sheet_format_properties_mut()
+        .set_default_row_height(15.0);
+    assert_eq!(
+        xlsx_cells::worksheet_default_row_height_pt(sheet, Some(&theme_scheme_normal_font(19.0))),
+        15.0,
+        "a size between the theme scheme's measured points keeps the declared hint"
+    );
+    assert_eq!(
+        xlsx_cells::worksheet_default_row_height_pt(
+            sheet,
+            Some(&substituted_face_normal_font("Wingdings", 12.0))
+        ),
+        15.0
+    );
+    for unmeasured_variant in ["Calibri Light", "Aptos Narrow", "Aptos Display"] {
+        assert_eq!(
+            xlsx_cells::worksheet_default_row_height_pt(
+                sheet,
+                Some(&substituted_face_normal_font(unmeasured_variant, 13.0))
+            ),
+            15.0,
+            "{unmeasured_variant} does not borrow the exact Calibri/Aptos recompute"
+        );
+    }
+    assert_eq!(
+        xlsx_cells::worksheet_default_row_height_pt(
+            sheet,
+            Some(&substituted_face_normal_font("Calibri", 19.0))
+        ),
+        15.0
+    );
+    assert_eq!(
+        xlsx_cells::worksheet_default_row_height_pt(
+            sheet,
+            Some(&substituted_face_normal_font("Arial", 10.5))
+        ),
+        15.0,
+        "a size between Arial's measured points has no series entry"
+    );
+    assert_eq!(
+        xlsx_cells::worksheet_default_row_height_pt(sheet, None),
+        15.0
+    );
+}
+
+/// Every family the issue #1150 sweep measured, at every size it measured.
+///
+/// One `xl/styles.xml` `<font>` per variant over
+/// `issue_1066_blip_effect_picture.xlsx`, reading `standard height of
+/// worksheet 1` back through AppleScript
+/// (`scripts/measure_excel_row_height.py`). Whole columns, not spot checks:
+/// no family here follows another's curve, so a size sampled from one proves
+/// nothing about the rest.
+#[test]
+fn every_measured_face_recomputes_its_own_series() {
+    let measured: [(&str, [f64; 14]); 8] = [
+        (
+            "Arial",
+            [
+                11.0, 12.0, 13.0, 14.0, 16.0, 17.0, 18.0, 19.0, 20.0, 22.0, 23.0, 25.0, 28.0, 30.0,
+            ],
+        ),
+        (
+            "Times New Roman",
+            [
+                11.0, 12.0, 13.0, 14.0, 16.0, 17.0, 18.0, 19.0, 20.0, 22.0, 23.0, 25.0, 28.0, 30.0,
+            ],
+        ),
+        (
+            "Verdana",
+            [
+                11.0, 12.0, 13.0, 14.0, 16.0, 17.0, 18.0, 19.0, 20.0, 22.0, 23.0, 25.0, 28.0, 30.0,
+            ],
+        ),
+        (
+            "Tahoma",
+            [
+                11.0, 12.0, 13.0, 14.0, 15.0, 17.0, 18.0, 19.0, 20.0, 22.0, 23.0, 25.0, 28.0, 30.0,
+            ],
+        ),
+        (
+            "Georgia",
+            [
+                11.0, 12.0, 13.0, 14.0, 16.0, 17.0, 18.0, 19.0, 21.0, 22.0, 23.0, 25.0, 28.0, 30.0,
+            ],
+        ),
+        (
+            "Helvetica",
+            [
+                11.0, 12.0, 13.0, 15.0, 16.0, 17.0, 18.0, 19.0, 21.0, 22.0, 23.0, 26.0, 28.0, 31.0,
+            ],
+        ),
+        (
+            "Courier New",
+            [
+                11.0, 13.0, 14.0, 15.0, 17.0, 18.0, 19.0, 21.0, 22.0, 23.0, 24.0, 27.0, 30.0, 32.0,
+            ],
+        ),
+        (
+            "Segoe UI",
+            [
+                11.0, 13.0, 14.0, 16.0, 16.0, 20.0, 21.0, 23.0, 23.0, 25.0, 26.0, 28.0, 31.0, 33.0,
+            ],
+        ),
+    ];
+    let sizes: [f64; 14] = [
+        8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 20.0, 22.0, 24.0,
+    ];
+    for (family, heights) in measured {
+        for (size_pt, expected) in sizes.iter().zip(heights) {
+            let mut book = umya_spreadsheet::new_file();
+            let sheet = book.get_sheet_mut(&0).unwrap();
+            sheet
+                .get_sheet_format_properties_mut()
+                .set_default_row_height(18.0);
+            assert_eq!(
+                xlsx_cells::worksheet_default_row_height_pt(
+                    sheet,
+                    Some(&substituted_face_normal_font(family, *size_pt))
+                ),
+                expected,
+                "{size_pt}pt {family} Normal font"
+            );
+        }
+    }
+}
+
+/// The Korean faces the same sweep measured. `나눔명조` answered Helvetica's
+/// column at all fourteen sizes, and `맑은 고딕` the theme scheme's — the
+/// reading that the scheme resolves to that face on the reference machine
+/// (issues #1047, #1150).
+#[test]
+fn a_normal_font_naming_a_korean_face_recomputes_its_measured_series() {
+    for (family, size_pt, expected) in [
+        ("나눔명조", 11.0, 15.0),
+        ("나눔명조", 12.0, 16.0),
+        ("나눔명조", 16.0, 21.0),
+        ("맑은 고딕", 10.0, 15.0),
+        ("맑은 고딕", 11.0, 17.0),
+        ("Malgun Gothic", 14.0, 20.0),
+        ("Malgun Gothic", 18.0, 27.0),
+    ] {
+        let mut book = umya_spreadsheet::new_file();
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        sheet
+            .get_sheet_format_properties_mut()
+            .set_default_row_height(18.0);
+        assert_eq!(
+            xlsx_cells::worksheet_default_row_height_pt(
+                sheet,
+                Some(&substituted_face_normal_font(family, size_pt))
+            ),
+            expected,
+            "{size_pt}pt {family} Normal font"
+        );
+    }
+}
+
+/// Two spellings of one family are aliased only where the sweep read them as
+/// one column. `Malgun Gothic` answers `맑은 고딕` at all fourteen sizes;
+/// `NanumMyeongjo` answers a column of its own — 16 at 12pt against 15 at
+/// 13pt, reproduced across two runs — so it keeps the declared hint instead
+/// of borrowing `나눔명조`'s series (issue #1150).
+#[test]
+fn an_ascii_spelling_is_aliased_only_where_it_was_measured() {
+    let mut book = umya_spreadsheet::new_file();
+    let sheet = book.get_sheet_mut(&0).unwrap();
+    sheet
+        .get_sheet_format_properties_mut()
+        .set_default_row_height(15.0);
+    assert_eq!(
+        xlsx_cells::worksheet_default_row_height_pt(
+            sheet,
+            Some(&substituted_face_normal_font("NanumMyeongjo", 12.0))
+        ),
+        15.0
+    );
+}
+
+/// A family name is matched whole and case-insensitively, never as a prefix:
+/// `Arial Narrow` and `Arial Black` are different faces with row heights of
+/// their own, and nothing has measured them.
+#[test]
+fn a_measured_family_matches_the_whole_name_only() {
+    let mut book = umya_spreadsheet::new_file();
+    let sheet = book.get_sheet_mut(&0).unwrap();
+    sheet
+        .get_sheet_format_properties_mut()
+        .set_default_row_height(15.0);
+    assert_eq!(
+        xlsx_cells::worksheet_default_row_height_pt(
+            sheet,
+            Some(&substituted_face_normal_font("arial", 10.0))
+        ),
+        13.0,
+        "the corpus writes the family lower-cased too"
+    );
+    for unmeasured in ["Arial Narrow", "Arial Black", "Arial Unicode MS"] {
+        assert_eq!(
+            xlsx_cells::worksheet_default_row_height_pt(
+                sheet,
+                Some(&substituted_face_normal_font(unmeasured, 10.0))
+            ),
+            15.0,
+            "{unmeasured} is not Arial"
+        );
+    }
+}
+
+/// The declared hint loses to a measured family exactly as it loses to
+/// Calibri, and `customHeight` restores it exactly as it does there
+/// (issue #1150).
+#[test]
+fn a_measured_family_overrides_the_declared_default_unless_custom() {
+    for declared in [12.75, 15.0, 18.0, 30.0] {
+        let mut book = umya_spreadsheet::new_file();
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        sheet
+            .get_sheet_format_properties_mut()
+            .set_default_row_height(declared);
+        assert_eq!(
+            xlsx_cells::worksheet_default_row_height_pt(
+                sheet,
+                Some(&substituted_face_normal_font("Arial", 10.0))
+            ),
+            13.0,
+            "declared {declared} must not reach a 10pt Arial row"
+        );
+    }
+    let mut book = umya_spreadsheet::new_file();
+    let sheet = book.get_sheet_mut(&0).unwrap();
+    let properties = sheet.get_sheet_format_properties_mut();
+    properties.set_default_row_height(30.0);
+    properties.set_custom_height(true);
+    assert_eq!(
+        xlsx_cells::worksheet_default_row_height_pt(
+            sheet,
+            Some(&substituted_face_normal_font("Arial", 10.0))
+        ),
+        30.0
+    );
+}
+
+/// The printed grid recomputes exactly as anchors do, and prints the
+/// recomputed height unscaled — the `native_excel_pdf_row_height`
+/// compaction is calibrated for declared heights, not for this one
+/// (issue #1047: `Formatting.xlsx` exports 17pt rows against our 14pt).
+#[test]
+fn a_dimensionless_printed_row_takes_the_recomputed_default() {
+    let data = build_xlsx_bytes("Sheet1", &[("A1", "one"), ("A2", "two")]);
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let table = &get_sheet_page(&doc, 0).table;
+    for row in &table.rows {
+        assert_eq!(row.height, Some(17.0));
+    }
+}
+
+#[test]
+fn a_dimensionless_printed_row_ignores_a_disagreeing_declared_default() {
+    let data = rewrite_sheet_format_pr(
+        &build_xlsx_bytes("Sheet1", &[("A1", "one"), ("A2", "two")]),
+        r#"<sheetFormatPr defaultRowHeight="30"/>"#,
+    );
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let table = &get_sheet_page(&doc, 0).table;
+    for row in &table.rows {
+        assert_eq!(row.height, Some(17.0));
+    }
+}
+
+// ── Auto-sized rows take their own cells' font (issue #1140) ─────────
+
+/// A cell that carries an explicit font, so the row it sits in is auto-sized
+/// against that font rather than against the workbook's Normal one.
+fn sheet_with_one_cell_font(row_idx: u32, size_pt: f64) -> umya_spreadsheet::Spreadsheet {
+    let mut book = umya_spreadsheet::new_file();
+    let sheet = book.get_sheet_mut(&0).unwrap();
+    sheet
+        .get_sheet_format_properties_mut()
+        .set_default_row_height(15.0);
+    let cell = sheet.get_cell_mut((1u32, row_idx));
+    cell.set_value("가나다");
+    cell.get_style_mut().get_font_mut().set_size(size_pt);
+    book
+}
+
+/// A row that records no `ht` is auto-sized, and Excel sizes it from the
+/// tallest font its own cells carry — not from the workbook's Normal font.
+///
+/// Measured on `issue_1060_sheet_row_line_box_probe.xlsx`, whose Normal font
+/// is a theme-scheme Calibri 11 that none of its cells use. Native
+/// Excel-for-Mac export; AppleScript `row height of row N` and the
+/// `mutool draw -F trace` baseline pitch agree (issue #1140):
+///
+/// | rows | cell font | Excel row |
+/// | --- | --- | ---: |
+/// | 1-6, 8-13 | Malgun Gothic 14 | 20.00pt |
+/// | 15-17 | Malgun Gothic 24 | 35.00pt |
+#[test]
+fn an_auto_row_is_sized_by_its_own_cells_tallest_font() {
+    for (cell_size_pt, expected) in [(14.0, 20.0), (18.0, 27.0), (24.0, 35.0)] {
+        let book = sheet_with_one_cell_font(1, cell_size_pt);
+        let sheet: &umya_spreadsheet::Worksheet = book.get_sheet(&0).unwrap();
+        assert_eq!(
+            xlsx_cells::printed_grid_row_height_pt(
+                sheet,
+                1,
+                Some(&theme_scheme_normal_font(11.0)),
+                None,
+                true,
+            ),
+            expected,
+            "a row of {cell_size_pt}pt cells"
+        );
+    }
+}
+
+/// Only the row's own cells count. A tall cell one row down leaves this row
+/// on the sheet's recomputed default.
+#[test]
+fn an_auto_row_ignores_another_rows_cell_font() {
+    let book = sheet_with_one_cell_font(2, 24.0);
+    let sheet: &umya_spreadsheet::Worksheet = book.get_sheet(&0).unwrap();
+    assert_eq!(
+        xlsx_cells::printed_grid_row_height_pt(
+            sheet,
+            1,
+            Some(&theme_scheme_normal_font(11.0)),
+            None,
+            true,
+        ),
+        17.0
+    );
+}
+
+/// The row-cell term only ever raises the track: what Excel gives a row whose
+/// cells are *smaller* than the Normal font is unmeasured, so such a row keeps
+/// the sheet's recomputed default rather than shrinking on a guess.
+#[test]
+fn an_auto_row_of_smaller_cells_keeps_the_recomputed_default() {
+    let book = sheet_with_one_cell_font(1, 8.0);
+    let sheet: &umya_spreadsheet::Worksheet = book.get_sheet(&0).unwrap();
+    assert_eq!(
+        xlsx_cells::printed_grid_row_height_pt(
+            sheet,
+            1,
+            Some(&theme_scheme_normal_font(11.0)),
+            None,
+            true,
+        ),
+        17.0
+    );
+}
+
+/// A size the face's series does not measure keeps the recomputed default
+/// too — the measured points are too irregular to interpolate between.
+#[test]
+fn an_auto_row_whose_cell_size_is_unmeasured_keeps_the_recomputed_default() {
+    let book = sheet_with_one_cell_font(1, 19.0);
+    let sheet: &umya_spreadsheet::Worksheet = book.get_sheet(&0).unwrap();
+    assert_eq!(
+        xlsx_cells::printed_grid_row_height_pt(
+            sheet,
+            1,
+            Some(&theme_scheme_normal_font(11.0)),
+            None,
+            true,
+        ),
+        17.0
+    );
+}
+
+/// A cell naming its face outright, so the row it sits in is auto-sized
+/// against that face's own series rather than the Normal font's.
+fn sheet_with_one_named_cell_font(
+    row_idx: u32,
+    family: &str,
+    size_pt: f64,
+    is_bold: bool,
+) -> umya_spreadsheet::Spreadsheet {
+    let mut book = umya_spreadsheet::new_file();
+    let sheet = book.get_sheet_mut(&0).unwrap();
+    sheet
+        .get_sheet_format_properties_mut()
+        .set_default_row_height(15.0);
+    let cell = sheet.get_cell_mut((2u32, row_idx));
+    cell.set_value("ABOUT THIS TEMPLATE");
+    let font = cell.get_style_mut().get_font_mut();
+    font.set_name(family).set_size(size_pt).set_bold(is_bold);
+    book
+}
+
+/// The Normal font of `issue_1181_fit_to_height.xlsx`: Trebuchet MS 10
+/// deferring to a minor scheme with neither a usable Hang nor `ea` face, so
+/// it resolves to Trebuchet MS itself — a face with no measured series.
+fn bare_theme_trebuchet_normal_font() -> NormalFont {
+    NormalFont {
+        family: "Trebuchet MS".to_string(),
+        size_pt: 10.0,
+        color: None,
+        theme_scheme: Some(ThemeFontSlot::Minor),
+        theme_ui_script_faces: ThemeUiScriptFaces::default(),
+    }
+}
+
+/// Excel sizes an auto row from the series of the face its tallest cell
+/// *names*, not from the Normal font's series at that cell's size. Native
+/// Excel-for-Mac one-factor exports of `issue_1181_fit_to_height.xlsx`
+/// (Trebuchet MS 10 Normal over a bare theme; its title row holds one
+/// Arial Bold 18 cell and records `ht="23.25"` without `customHeight`) print
+/// a 23pt title track — Arial's own 18pt series entry — where the UI face's
+/// 27pt entry used to be taken (issue #1550). The cell face sweep at 18pt
+/// reproduces each face's series: Courier New 24, Segoe UI 26, Georgia 23.
+#[test]
+fn an_auto_row_is_sized_by_the_series_of_the_face_its_cell_names() {
+    for (family, size_pt, is_bold, expected) in [
+        ("Arial", 18.0, true, 23.0),
+        ("Arial", 18.0, false, 23.0),
+        ("Arial", 24.0, true, 30.0),
+        ("Courier New", 18.0, true, 24.0),
+        ("Segoe UI", 18.0, true, 26.0),
+        ("Georgia", 16.0, false, 21.0),
+    ] {
+        let book = sheet_with_one_named_cell_font(1, family, size_pt, is_bold);
+        let sheet: &umya_spreadsheet::Worksheet = book.get_sheet(&0).unwrap();
+        for normal_font in [
+            theme_scheme_normal_font(11.0),
+            bare_theme_trebuchet_normal_font(),
+        ] {
+            assert_eq!(
+                xlsx_cells::printed_grid_row_height_pt(sheet, 1, Some(&normal_font), None, true),
+                expected,
+                "a row of {family} {size_pt}pt (bold: {is_bold}) under {} {}pt",
+                normal_font.family,
+                normal_font.size_pt
+            );
+        }
+    }
+}
+
+/// A cell font that itself defers to the theme scheme resolves the way the
+/// Normal font does: through the theme's UI-script face where the theme
+/// names one, and to its declared family over a bare theme.
+#[test]
+fn a_scheme_cell_font_resolves_its_series_through_the_theme() {
+    let mut book = sheet_with_one_named_cell_font(1, "Calibri", 18.0, false);
+    book.get_sheet_mut(&0)
+        .unwrap()
+        .get_cell_mut((2u32, 1u32))
+        .get_style_mut()
+        .get_font_mut()
+        .set_scheme("minor");
+    let sheet: &umya_spreadsheet::Worksheet = book.get_sheet(&0).unwrap();
+
+    assert_eq!(
+        xlsx_cells::printed_grid_row_height_pt(
+            sheet,
+            1,
+            Some(&theme_scheme_normal_font(11.0)),
+            None,
+            true,
+        ),
+        27.0,
+        "an Office theme resolves the scheme cell to the UI face"
+    );
+    assert_eq!(
+        xlsx_cells::printed_grid_row_height_pt(
+            sheet,
+            1,
+            Some(&bare_theme_trebuchet_normal_font()),
+            None,
+            true,
+        ),
+        24.0,
+        "a bare theme leaves the scheme cell on Calibri's own series"
+    );
+}
+
+/// A cell that names a face with no measured series, taller than the Normal
+/// font, still falls back to the row's cached `ht` — Excel's own last
+/// measurement of that very text — rather than to the Normal font's series.
+#[test]
+fn an_auto_row_of_an_unmeasured_named_face_keeps_its_cached_height() {
+    let mut book = sheet_with_one_named_cell_font(1, "Trebuchet MS", 18.0, true);
+    let row = book.get_sheet_mut(&0).unwrap().get_row_dimension_mut(&1);
+    // umya's `set_height` flags `customHeight` on its own; this row records a
+    // cached auto height, not a declared one.
+    row.set_height(25.5).set_custom_height(false);
+    let sheet: &umya_spreadsheet::Worksheet = book.get_sheet(&0).unwrap();
+
+    assert_eq!(
+        xlsx_cells::printed_grid_row_height_pt(
+            sheet,
+            1,
+            Some(&bare_theme_trebuchet_normal_font()),
+            None,
+            true,
+        ),
+        25.0
+    );
+}
+
+/// The reported workbook end to end: the instruction sheet's Arial Bold 18
+/// title row prints Excel's 23pt track (a 24pt band once the fill bleeds its
+/// point), not the 27pt of the UI face's series (issue #1550).
+#[test]
+fn the_instruction_sheets_arial_title_row_prints_its_faces_track() {
+    let data = include_bytes!("../../../../tests/fixtures/xlsx/issue_1181_fit_to_height.xlsx");
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(data, &ConvertOptions::default()).unwrap();
+
+    let table = &get_sheet_page(&doc, 0).table;
+    assert_eq!(table.rows[0].height, Some(23.0));
+}
+
+/// A recorded `ht` is the row's current worksheet height whatever its cells
+/// hold, so it still outranks the auto-size recompute.
+#[test]
+fn a_recorded_row_height_outranks_its_cells_font() {
+    let mut book = sheet_with_one_cell_font(1, 24.0);
+    let sheet = book.get_sheet_mut(&0).unwrap();
+    sheet.get_row_dimension_mut(&1).set_height(36.0);
+    let sheet: &umya_spreadsheet::Worksheet = book.get_sheet(&0).unwrap();
+    assert_eq!(
+        xlsx_cells::printed_grid_row_height_pt(
+            sheet,
+            1,
+            Some(&theme_scheme_normal_font(11.0)),
+            None,
+            true,
+        ),
+        36.0
+    );
+}
+
+/// The whole probe workbook end to end: its twelve 14pt auto rows print
+/// Excel's 20pt track and its three 24pt ones Excel's 35pt track, where every
+/// one of them used to print the Normal font's 17pt (issue #1140).
+#[test]
+fn the_probe_workbooks_auto_rows_print_their_own_cell_tracks() {
+    let heights: Vec<Option<f64>> = printed_row_heights_over_all_pages(THEME_SCHEME_PROBE);
+
+    assert_eq!(
+        heights
+            .iter()
+            .filter(|height| **height == Some(20.0))
+            .count(),
+        12,
+        "12 auto rows of Malgun Gothic 14 print a 20pt track, got {heights:?}"
+    );
+    assert_eq!(
+        heights
+            .iter()
+            .filter(|height| **height == Some(35.0))
+            .count(),
+        3,
+        "3 auto rows of Malgun Gothic 24 print a 35pt track, got {heights:?}"
+    );
+    assert!(
+        !heights.contains(&Some(17.0)),
+        "no row keeps the Normal font's own track, got {heights:?}"
+    );
+}
+
+/// `customHeight` marks the declared default as user-set, so it stays in play
+/// as a declared height and maps like one: 30 → 28 under a Normal font whose
+/// grid compacts (issue #1047).
+///
+/// The Normal font has to be a compacting one for that to be the answer. The
+/// same `defaultRowHeight="30" customHeight="1"` over umya's own scheme
+/// Calibri 11 and Office theme exports 30.00pt tracks natively, one factor
+/// against a byte-identical re-zip control — no compaction at all (#1094).
+#[test]
+fn a_custom_height_printed_default_maps_through_the_grid() {
+    let data = rewrite_first_styles_font(
+        &rewrite_sheet_format_pr(
+            &build_xlsx_bytes("Sheet1", &[("A1", "one"), ("A2", "two")]),
+            r#"<sheetFormatPr defaultRowHeight="30" customHeight="1"/>"#,
+        ),
+        "Calibri",
+        11.0,
+    );
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let table = &get_sheet_page(&doc, 0).table;
+    for row in &table.rows {
+        assert_eq!(row.height, Some(28.0));
+    }
+}
+
+/// A scheme-less Normal font recomputes too, and its recompute is the
+/// *worksheet* height rather than the printed one, so it still maps through
+/// the compaction: `functions-excel-2010.xlsx` (Calibri 11, no `scheme`,
+/// `defaultRowHeight="15"`) exports 14pt rows, and 11pt Calibri recomputes to
+/// the same 15 its sheet declares.
+#[test]
+fn a_scheme_less_dimensionless_printed_row_compacts_the_recomputed_default() {
+    let data = rewrite_sheet_format_pr(
+        &build_xlsx_with_normal_font("Calibri", 11.0),
+        r#"<sheetFormatPr defaultRowHeight="15"/>"#,
+    );
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let table = &get_sheet_page(&doc, 0).table;
+    assert_eq!(table.rows[0].height, Some(14.0));
+}
+
+/// And where the recompute disagrees with the hint, the hint is gone: 12pt
+/// Calibri recomputes a 16pt worksheet row whatever `defaultRowHeight` says,
+/// which its compacting grid prints as `round(16 x 0.92) = 15` — the track
+/// `issue_1066_blip_effect_picture.xlsx`'s native export measures, against
+/// the 17 the declared 18 would have given (issue #1102).
+#[test]
+fn a_scheme_less_dimensionless_printed_row_ignores_a_disagreeing_declared_default() {
+    let data = rewrite_sheet_format_pr(
+        &build_xlsx_with_normal_font("Calibri", 12.0),
+        r#"<sheetFormatPr defaultRowHeight="18"/>"#,
+    );
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let table = &get_sheet_page(&doc, 0).table;
+    assert_eq!(table.rows[0].height, Some(15.0));
+}
+
+/// Aptos diverges from Calibri at five sizes in the issue #1225 worksheet
+/// recompute sweep. Each recomputed height then maps through the separately
+/// measured Calibri/Aptos printed-grid rule. The 13pt case is also the visual
+/// probe: 18pt in the worksheet becomes a 17pt printed track.
+#[test]
+fn aptos_dimensionless_rows_print_from_the_aptos_recompute() {
+    for (size_pt, expected_printed) in [
+        (9.0, 13.0),
+        (13.0, 17.0),
+        (16.0, 20.0),
+        (20.0, 25.0),
+        (24.0, 29.0),
+    ] {
+        let data = rewrite_sheet_format_pr(
+            &build_xlsx_with_normal_font("Aptos", size_pt),
+            r#"<sheetFormatPr defaultRowHeight="18"/>"#,
+        );
+        let parser = XlsxParser;
+        let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+        assert_eq!(
+            get_sheet_page(&doc, 0).table.rows[0].height,
+            Some(expected_printed),
+            "{size_pt}pt Aptos Normal font"
+        );
+    }
+}
+
+/// Printed-grid compaction belongs to the resolved face, not to the
+/// Calibri/Aptos substitution set. Native Excel-for-Mac exports of
+/// `issue_1066_blip_effect_picture.xlsx` measure a 15pt printed track for
+/// both Arial 12 (16pt worksheet row) and Courier New 12 (17pt worksheet
+/// row), while Verdana 12 keeps its 16pt worksheet row whole (issue #1224).
+#[test]
+fn named_faces_map_dimensionless_rows_through_their_own_printed_grid() {
+    for (family, expected) in [("Arial", 15.0), ("Courier New", 15.0), ("Verdana", 16.0)] {
+        let data = rewrite_sheet_format_pr(
+            &build_xlsx_with_normal_font(family, 12.0),
+            r#"<sheetFormatPr defaultRowHeight="18"/>"#,
+        );
+        let parser = XlsxParser;
+        let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+        assert_eq!(
+            get_sheet_page(&doc, 0).table.rows[0].height,
+            Some(expected),
+            "{family} 12"
+        );
+    }
+}
+
+// ── Declared row tracks and the Normal font (issue #1068) ────────────
+
+/// A workbook whose Normal font names `family` at `size_pt` outright, with
+/// one `customHeight` row per entry of `heights`.
+fn build_xlsx_with_normal_font_and_row_heights(
+    family: &str,
+    size_pt: f64,
+    heights: &[f64],
+) -> Vec<u8> {
+    let mut book = umya_spreadsheet::new_file();
+    {
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        for (index, height) in heights.iter().enumerate() {
+            let row: u32 = index as u32 + 1;
+            sheet
+                .get_cell_mut(format!("A{row}").as_str())
+                .set_value("x");
+            let dimension = sheet.get_row_dimension_mut(&row);
+            dimension.set_height(*height);
+            dimension.set_custom_height(true);
+        }
+    }
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+    rewrite_first_styles_font(&cursor.into_inner(), family, size_pt)
+}
+
+fn printed_row_heights(data: &[u8]) -> Vec<Option<f64>> {
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(data, &ConvertOptions::default()).unwrap();
+    get_sheet_page(&doc, 0)
+        .table
+        .rows
+        .iter()
+        .map(|row| row.height)
+        .collect()
+}
+
+/// A Normal font the machine renders itself leaves the printed grid alone:
+/// the row prints its declared height, truncated to the whole point Excel's
+/// grid lands on. Probe-measured on the reported workbook (Segoe UI 10
+/// Normal), one factor per export: 30 -> 30, 25.5 -> 25, 49.5 -> 49
+/// (issue #1068).
+#[test]
+fn a_kept_normal_font_prints_a_declared_row_height_whole() {
+    assert_eq!(
+        printed_row_heights(&build_xlsx_with_normal_font_and_row_heights(
+            "Segoe UI",
+            10.0,
+            &[30.0, 25.5, 49.5]
+        )),
+        vec![Some(30.0), Some(25.0), Some(49.0)]
+    );
+}
+
+/// The same declared heights through a Normal font Excel remaps compact
+/// instead: 30 -> 28, 25.5 -> 23, 49.5 -> 46 (probe-measured, Calibri 11).
+#[test]
+fn a_remapped_normal_font_compacts_a_declared_row_height() {
+    assert_eq!(
+        printed_row_heights(&build_xlsx_with_normal_font_and_row_heights(
+            "Calibri",
+            11.0,
+            &[30.0, 25.5, 49.5]
+        )),
+        vec![Some(28.0), Some(23.0), Some(46.0)]
+    );
+}
+
+/// The native issue #1224 face sweep gives a different whole-point series per
+/// face. Every point below was exported independently from three equal fixed
+/// rows, with the PDF baseline pitch agreeing across both row pairs.
+#[test]
+fn named_faces_map_declared_rows_through_their_own_printed_grid() {
+    let heights = [
+        12.0, 15.0, 16.0, 17.0, 18.0, 20.0, 25.5, 30.0, 36.0, 40.0, 49.5,
+    ];
+    for (family, expected) in [
+        (
+            "Arial",
+            vec![
+                11.0, 14.0, 15.0, 16.0, 17.0, 18.0, 24.0, 28.0, 33.0, 37.0, 46.0,
+            ],
+        ),
+        (
+            "Courier New",
+            vec![
+                10.0, 13.0, 14.0, 15.0, 16.0, 17.0, 22.0, 26.0, 31.0, 35.0, 43.0,
+            ],
+        ),
+        (
+            "Verdana",
+            vec![
+                12.0, 15.0, 16.0, 17.0, 18.0, 20.0, 25.0, 30.0, 36.0, 40.0, 49.0,
+            ],
+        ),
+        (
+            "맑은 고딕",
+            vec![
+                12.0, 15.0, 16.0, 17.0, 18.0, 20.0, 25.0, 30.0, 36.0, 40.0, 49.0,
+            ],
+        ),
+    ] {
+        assert_eq!(
+            printed_row_heights(&build_xlsx_with_normal_font_and_row_heights(
+                family, 12.0, &heights
+            )),
+            expected.into_iter().map(Some).collect::<Vec<_>>(),
+            "{family} 12"
+        );
+    }
+}
+
+/// The half-point Arial sweep disproves a scale even within one face: these
+/// adjacent steps cannot all be derived by multiplying and rounding. Keep the
+/// measured staircase explicit (issue #1224).
+#[test]
+fn arial_12_uses_its_measured_half_point_staircase() {
+    assert_eq!(
+        printed_row_heights(&build_xlsx_with_normal_font_and_row_heights(
+            "Arial",
+            12.0,
+            &[10.5, 11.5, 19.0, 19.5, 24.0]
+        )),
+        vec![Some(9.0), Some(10.0), Some(17.0), Some(18.0), Some(22.0)]
+    );
+}
+
+/// Do not turn the measured table into interpolation or a family-prefix
+/// guess. An unmeasured height, size, or distinct Arial face keeps the
+/// conservative whole-point path until a native sweep covers it.
+#[test]
+fn named_face_printed_grid_measurements_are_not_extrapolated() {
+    for (family, size, height, expected) in [
+        ("Arial", 12.0, 24.25, 24.0),
+        ("Arial", 11.0, 16.0, 16.0),
+        ("Arial Narrow", 12.0, 16.0, 16.0),
+        ("Courier New", 12.0, 16.5, 16.0),
+    ] {
+        assert_eq!(
+            printed_row_heights(&build_xlsx_with_normal_font_and_row_heights(
+                family,
+                size,
+                &[height]
+            )),
+            vec![Some(expected)],
+            "{family} {size} at {height}pt"
+        );
+    }
+
+    let scheme_font = NormalFont {
+        family: "Arial".to_string(),
+        size_pt: 12.0,
+        color: None,
+        theme_scheme: Some(ThemeFontSlot::Minor),
+        theme_ui_script_faces: ThemeUiScriptFaces::default(),
+    };
+    assert_eq!(
+        xlsx_cells::native_excel_pdf_row_height(16.0, Some(&scheme_font), true),
+        16.0,
+        "a scheme font does not name Arial outright"
+    );
+}
+
+/// The conservative truncating path is not a bare `floor` for a row's own
+/// cell-painted height: a declared height already within a tenth of a point
+/// of the next whole point prints there, not one short. Four rounds of
+/// `scripts/probe_harness.py --backend office` one-factor exports of
+/// `issue_1181_fit_to_height.xlsx` (row 1 and the empty row 25 re-declared,
+/// byte-identical no-patch re-zip control) pin `printed = floor(declared +
+/// 0.1)` (issue #1632). Every point already measured by #1068 still lands
+/// the same place — 0.1 only crosses a whole point when
+/// the declared height already sits inside that last tenth. This is gated by
+/// `round_up_near_whole_point`, not the default behaviour: a drawing anchor
+/// keeps the un-rounded grid (see `native_excel_pdf_row_height`'s doc
+/// comment).
+#[test]
+fn a_bare_theme_named_face_rounds_a_near_whole_point_row_height_up() {
+    let font = bare_theme_trebuchet_normal_font();
+    for (declared, expected) in [
+        (18.5, 18.0),
+        (18.75, 18.0),
+        (19.5, 19.0),
+        (19.75, 19.0),
+        (19.8, 19.0),
+        (19.85, 19.0),
+        (19.9, 20.0),
+        (20.6, 20.0),
+        (22.4, 22.0),
+        (23.7, 23.0),
+        (23.9, 24.0),
+        (25.0, 25.0),
+        (61.5, 61.0),
+        (61.6, 61.0),
+        (61.75, 61.0),
+        (61.8, 61.0),
+        (61.9, 62.0),
+    ] {
+        assert_eq!(
+            xlsx_cells::native_excel_pdf_row_height(declared, Some(&font), true),
+            expected,
+            "declared {declared}pt"
+        );
+        assert_eq!(
+            xlsx_cells::native_excel_pdf_row_height(declared, Some(&font), false),
+            declared.floor().max(1.0),
+            "declared {declared}pt without the round-up stays a bare floor"
+        );
+    }
+}
+
+/// The reported workbook end to end: the budget sheet's row 1 (`ht="61.9"
+/// customHeight="1"`) prints Excel's 62pt track, not a truncated 61pt, so
+/// every fill and rule below it seats on the same sheet point as the native
+/// export (issue #1632). The sheet fits its print area at a 0.78 scale, so
+/// the table row carries the printed 62pt already scaled down to 48.36pt —
+/// the same 0.78pt-per-sheet-point gap the issue measures on the cell fills.
+#[test]
+fn the_budget_sheets_declared_row_height_rounds_up_near_the_next_point() {
+    // The 0.78 fit follows the Normal font's column unit.
+    if crate::test_support::budget_normal_font_substitute().is_some() {
+        return;
+    }
+    let data = include_bytes!("../../../../tests/fixtures/xlsx/issue_1181_fit_to_height.xlsx");
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(data, &ConvertOptions::default()).unwrap();
+
+    let budget_sheet_first_page = doc
+        .pages
+        .iter()
+        .filter_map(|page| match page {
+            Page::Sheet(sheet_page) => Some(sheet_page),
+            _ => None,
+        })
+        .find(|sheet_page| sheet_page.name == "Monthly college budget")
+        .expect("the budget sheet has at least one page");
+
+    assert_eq!(budget_sheet_first_page.table.rows[0].height, Some(48.36));
+}
+
+fn table_bottom_aligned_descent_floor_pt(data: &[u8]) -> f64 {
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(data, &ConvertOptions::default()).unwrap();
+    get_sheet_page(&doc, 0)
+        .table
+        .bottom_aligned_descent_floor_pt
+}
+
+/// The script-face theme family in the native floor probe matrix holds a
+/// bottom-aligned cell's baseline 4pt clear of the row boundary
+/// (issue #1097). umya writes a `<scheme val="minor"/>` Normal font over the
+/// full Office theme, which is the configuration those probes were built in.
+#[test]
+fn a_script_face_theme_font_floors_the_bottom_aligned_seat_at_four_points() {
+    assert_eq!(
+        table_bottom_aligned_descent_floor_pt(&build_xlsx_with_theme_scheme_normal_font(
+            "Calibri", 11.0,
+        )),
+        4.0
+    );
+}
+
+/// A Normal font Excel neither remaps nor resolves through a theme — a face
+/// the reference machine has, named outright or reached through a theme with
+/// neither usable Hang nor `ea` face — takes no floor at all: the seat is the
+/// bare rounded descent. Native one-factor exports of the budget workbook of
+/// issue #1545 (Trebuchet MS 10 Normal) rest 8, 10, 12, 14 and 16pt cells
+/// 2, 2, 3, 3 and 4pt above their fixed row's bottom boundary, one and two
+/// points under the 3pt and 4pt floors of the other two families.
+#[test]
+fn a_named_face_the_reference_machine_keeps_takes_no_bottom_seat_floor() {
+    assert_eq!(
+        table_bottom_aligned_descent_floor_pt(&build_xlsx_with_normal_font_and_row_heights(
+            "Segoe UI",
+            10.0,
+            &[40.0]
+        )),
+        0.0
+    );
+}
+
+/// A row flagged `thickBot="1"` seats every bottom-aligned line in it one
+/// sheet point higher than an unflagged row (issue #1545); the parser hands
+/// the renderer the flag, row by row, so a custom-height row carries it too.
+#[test]
+fn a_thick_bottom_row_flag_reaches_every_cell_of_that_row() {
+    let mut book = umya_spreadsheet::new_file();
+    {
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        for row in 1..=3u32 {
+            sheet
+                .get_cell_mut(format!("A{row}").as_str())
+                .set_value("Cash flow");
+            sheet
+                .get_cell_mut(format!("B{row}").as_str())
+                .set_value("169");
+            let dimension = sheet.get_row_dimension_mut(&row);
+            dimension.set_height(19.5);
+            dimension.set_custom_height(true);
+        }
+        sheet.get_row_dimension_mut(&2).set_thick_bot(true);
+        sheet.get_row_dimension_mut(&3).set_thick_top(true);
+    }
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser
+        .parse(&cursor.into_inner(), &ConvertOptions::default())
+        .unwrap();
+    let flags: Vec<Vec<bool>> = get_sheet_page(&doc, 0)
+        .table
+        .rows
+        .iter()
+        .map(|row| {
+            row.cells
+                .iter()
+                .map(|cell| cell.row_has_thick_bottom)
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        flags,
+        vec![vec![false, false], vec![true, true], vec![false, false]],
+        "only the thickBot row's cells carry the lift; thickTop does not"
+    );
+}
+
+/// The remapped Calibri/Aptos family in that floor probe matrix seats it a
+/// point lower, measured over an eleven-size sweep of a ruled native
+/// re-export (issue #1199).
+#[test]
+fn a_remapped_normal_font_floors_the_bottom_aligned_seat_at_three_points() {
+    assert_eq!(
+        table_bottom_aligned_descent_floor_pt(&build_xlsx_with_normal_font_and_row_heights(
+            "Calibri",
+            11.0,
+            &[40.0]
+        )),
+        3.0
+    );
+}
+
+/// The compaction belongs to the face Excel substitutes, not to the family
+/// name: the same Calibri below 11pt prints whole (probe: ht=40 exports a
+/// 40pt track at 9pt and 10pt, a 37pt one at 11pt).
+#[test]
+fn a_remapped_family_below_the_measured_size_prints_whole() {
+    assert_eq!(
+        printed_row_heights(&build_xlsx_with_normal_font_and_row_heights(
+            "Calibri",
+            10.0,
+            &[40.0]
+        )),
+        vec![Some(40.0)]
+    );
+}
+
+/// Aptos is the other face the standard theme resolves to, and it compacts
+/// exactly as Calibri does (probe: ht=40 exports a 37pt track for both
+/// "Aptos" and "Aptos Narrow" at 11pt).
+#[test]
+fn the_other_remapped_family_compacts_too() {
+    assert_eq!(
+        printed_row_heights(&build_xlsx_with_normal_font_and_row_heights(
+            "Aptos Narrow",
+            11.0,
+            &[40.0]
+        )),
+        vec![Some(37.0)]
+    );
+}
+
+// ── Thick row-border tracks (issue #1228) ────────────────────────────
+
+/// The customer workbook shared by the print-range and thick-row probes.
+const SH107_FORMATTED_TABLE: &[u8] =
+    include_bytes!("../../../../tests/fixtures/xlsx/SH107-9-x-9-Formatted-Table.xlsx");
+
+/// SH107 declares A1:K9 and writes quote-prefix-only J/K cells in two rows,
+/// but its native Excel-for-Mac export stops at the nine value-bearing columns
+/// A:I. The two value-less columns paint no fill, border or text and therefore
+/// must not claim a second horizontal page (issue #1229).
+#[test]
+fn value_less_unpainted_trailing_cells_do_not_extend_the_printed_grid() {
+    let (doc, _warnings) = XlsxParser
+        .parse(SH107_FORMATTED_TABLE, &ConvertOptions::default())
+        .unwrap();
+
+    assert_eq!(doc.pages.len(), 1, "the native export is one page");
+    assert_eq!(
+        get_sheet_page(&doc, 0).table.column_widths.len(),
+        9,
+        "the printed grid stops at value-bearing column I"
+    );
+}
+
+/// SH107's I1 has a pale-yellow direct fill and a regular theme-dark cell
+/// font, while its `TableStyleMedium2` header prints the `Col9` run white and
+/// bold. Excel composes those two sources: the direct fill stays yellow, but
+/// the table header's font colour still reaches the run (issue #1230).
+#[test]
+fn a_table_header_text_color_overrides_the_cell_xf_font_color() {
+    let (doc, _warnings) = XlsxParser
+        .parse(SH107_FORMATTED_TABLE, &ConvertOptions::default())
+        .unwrap();
+    let cell = &get_sheet_page(&doc, 0).table.rows[0].cells[8];
+
+    assert_eq!(cell_text(cell), "Col9");
+    assert_eq!(cell.background, Some(Color::new(255, 255, 204)));
+    assert_eq!(first_run_style(cell).color, Some(Color::white()));
+    assert_eq!(first_run_style(cell).bold, Some(true));
+}
+
+/// A non-default direct font colour is a real override, unlike the un-tinted
+/// theme-dark default copied into SH107's I1 XF. Keep that red while fixing
+/// the table header's missing white default (issue #1230).
+#[test]
+fn a_direct_non_default_header_text_color_still_wins() {
+    let cursor = Cursor::new(SH107_FORMATTED_TABLE);
+    let mut book = umya_spreadsheet::reader::xlsx::read_reader(cursor, true).unwrap();
+    book.get_sheet_mut(&0)
+        .unwrap()
+        .get_cell_mut("I1")
+        .get_style_mut()
+        .get_font_mut()
+        .get_color_mut()
+        .set_argb("FFFF0000");
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+
+    let (doc, _warnings) = XlsxParser
+        .parse(&cursor.into_inner(), &ConvertOptions::default())
+        .unwrap();
+    let cell = &get_sheet_page(&doc, 0).table.rows[0].cells[8];
+
+    assert_eq!(cell_text(cell), "Col9");
+    assert_eq!(first_run_style(cell).color, Some(Color::new(255, 0, 0)));
+    assert_eq!(first_run_style(cell).bold, Some(true));
+}
+
+/// Trimming is about paint, not merely the absence of a value: a fill on an
+/// empty trailing cell is visible and keeps that column in the printed grid.
+#[test]
+fn a_painted_value_less_trailing_cell_still_extends_the_printed_grid() {
+    let mut book = umya_spreadsheet::new_file();
+    let sheet = book.get_sheet_mut(&0).unwrap();
+    sheet.get_cell_mut("A1").set_value("Value");
+    sheet
+        .get_cell_mut("C1")
+        .get_style_mut()
+        .set_background_color("FFFF0000");
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+
+    let (doc, _warnings) = XlsxParser
+        .parse(&cursor.into_inner(), &ConvertOptions::default())
+        .unwrap();
+    let page = get_sheet_page(&doc, 0);
+
+    assert_eq!(page.table.column_widths.len(), 3);
+    assert_eq!(
+        page.table.rows[0].cells[2].background,
+        Some(Color::new(255, 0, 0))
+    );
+}
+
+/// Rows 1, 3 and 4 of SH107 end at a thick border, while rows 1, 2, 4 and 5
+/// start at one.
+/// A row receives one printed point when it begins with `thickTop`, plus one
+/// when the preceding row ends with `thickBot`. Native Excel-for-Mac PDF
+/// baselines on the probe are 68, 87, 104, 123, 142, 159, 176, 193 and 210pt:
+/// pitches of 19/17/19/19/17/17/17/17 against a bare 17pt track, while the
+/// first row's top term places its own baseline. A separate 8-24pt Normal-font
+/// sweep kept each individual term at exactly 1pt rather than scaling it with
+/// the font.
+#[test]
+fn thick_row_borders_expand_the_printed_boundary() {
+    assert_eq!(
+        printed_row_heights(SH107_FORMATTED_TABLE),
+        vec![
+            Some(18.0),
+            Some(19.0),
+            Some(17.0),
+            Some(19.0),
+            Some(19.0),
+            Some(17.0),
+            Some(17.0),
+            Some(17.0),
+            Some(17.0),
+        ]
+    );
+}
+
+/// A custom track already states the full printed boundary. The thick flags
+/// in `issue_1181_fit_to_height.xlsx` sit on custom-height rows, and adding
+/// their reservations again grows the native 161.87pt chart area to 163.43pt.
+#[test]
+fn custom_row_heights_already_include_thick_border_reservations() {
+    let data = include_bytes!("../../../../tests/fixtures/xlsx/issue_1181_fit_to_height.xlsx");
+    let points = row_boundaries::extract_row_boundary_points(data);
+
+    assert!(!points.contains_key("Monthly college budget"));
+}
+
+// ── Theme-resolved scheme Normal fonts (issue #1094) ─────────────────
+
+/// The probe workbook of issue #1094: a `<scheme val="minor"/>` Normal font
+/// nominally naming Calibri 11, over a full Office theme.
+const THEME_SCHEME_PROBE: &[u8] =
+    include_bytes!("../../../../tests/fixtures/xlsx/issue_1060_sheet_row_line_box_probe.xlsx");
+
+/// Every declared row track a workbook prints, across all of its sheet pages.
+fn printed_row_heights_over_all_pages(data: &[u8]) -> Vec<Option<f64>> {
+    printed_row_heights_over_all_pages_with(data, &ConvertOptions::default())
+}
+
+/// [`printed_row_heights_over_all_pages`] under explicit conversion options.
+fn printed_row_heights_over_all_pages_with(
+    data: &[u8],
+    options: &ConvertOptions,
+) -> Vec<Option<f64>> {
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(data, options).unwrap();
+    doc.pages
+        .iter()
+        .filter_map(|page| match page {
+            Page::Sheet(sheet_page) => Some(sheet_page),
+            _ => None,
+        })
+        .flat_map(|sheet_page| sheet_page.table.rows.iter().map(|row| row.height))
+        .collect()
+}
+
+/// Drop the script-font entries from a theme's minor scheme. This probe's
+/// `a:ea` typeface is empty, so the remaining fallback is the declared Calibri
+/// family on its Normal font.
+fn strip_theme_minor_font_script_faces(data: &[u8]) -> Vec<u8> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(data)).expect("readable zip");
+    let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).expect("readable entry");
+        let name = entry.name().expect("entry name should decode").into_owned();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes).expect("readable entry body");
+        if name.starts_with("xl/theme/") && name.ends_with(".xml") {
+            let xml = String::from_utf8(bytes).expect("theme is utf-8");
+            let start: usize = xml.find("<a:minorFont>").expect("theme has a minor font");
+            let end: usize = xml[start..]
+                .find("</a:minorFont>")
+                .expect("minor font is closed")
+                + start;
+            let stripped: String = strip_script_font_elements(&xml[start..end]);
+            bytes = format!("{}{}{}", &xml[..start], stripped, &xml[end..]).into_bytes();
+        }
+        out.start_file(name, zip::write::SimpleFileOptions::default())
+            .expect("writable entry");
+        std::io::Write::write_all(&mut out, &bytes).expect("writable entry body");
+    }
+    out.finish().expect("finished zip").into_inner()
+}
+
+/// Set only the East Asian fallback face on the theme's minor font scheme.
+fn rewrite_theme_minor_font_ea_face(data: &[u8], face: &str) -> Vec<u8> {
+    rewrite_zip_parts(
+        data,
+        |name| name.starts_with("xl/theme/") && name.ends_with(".xml"),
+        |xml| {
+            let start: usize = xml.find("<a:minorFont>").expect("theme has a minor font");
+            let end: usize = xml[start..]
+                .find("</a:minorFont>")
+                .expect("minor font is closed")
+                + start;
+            let block: &str = &xml[start..end];
+            let ea_start: usize = block.find("<a:ea ").expect("minor font has ea face");
+            let ea_end: usize =
+                block[ea_start..].find("/>").expect("ea face is closed") + ea_start + 2;
+            format!(
+                "{}{}<a:ea typeface=\"{face}\"/>{}{}",
+                &xml[..start],
+                &block[..ea_start],
+                &block[ea_end..],
+                &xml[end..]
+            )
+        },
+    )
+}
+
+/// Remove every `<a:font script=... />` element from one XML fragment.
+fn strip_script_font_elements(fragment: &str) -> String {
+    let mut kept = String::with_capacity(fragment.len());
+    let mut rest: &str = fragment;
+    while let Some(start) = rest.find("<a:font script=") {
+        kept.push_str(&rest[..start]);
+        let end: usize = rest[start..].find("/>").expect("script font is closed") + start + 2;
+        rest = &rest[end..];
+    }
+    kept.push_str(rest);
+    kept
+}
+
+/// A Normal font that defers its face to the theme scheme is laid out
+/// against whatever that scheme resolves to, and a full Office theme gives
+/// the minor scheme a Hang face Excel resolves through instead of the Normal
+/// font's declared Calibri family. The grid then keeps every declared height.
+///
+/// Native Excel-for-Mac export of the probe workbook, baselines read with
+/// `mutool draw -F trace`: its 16 `ht="36"` rows print a 36.00pt track and
+/// its 5 `ht="12"` rows a 12.00pt one (issue #1094).
+#[test]
+fn a_theme_resolved_scheme_normal_font_prints_declared_heights_whole() {
+    let heights: Vec<Option<f64>> = printed_row_heights_over_all_pages(THEME_SCHEME_PROBE);
+
+    assert_eq!(
+        heights
+            .iter()
+            .filter(|height| **height == Some(36.0))
+            .count(),
+        16,
+        "16 ht=36 rows print their declared track, got {heights:?}"
+    );
+    assert_eq!(
+        heights
+            .iter()
+            .filter(|height| **height == Some(12.0))
+            .count(),
+        5,
+        "5 ht=12 rows print their declared track, got {heights:?}"
+    );
+}
+
+/// The theme is what makes the difference, not the scheme flag on its own.
+/// Stripping the same workbook's script-font entries leaves `a:ea` empty, so
+/// the minor scheme resolves to the Normal font's declared Calibri family.
+/// The export compacts every track: 36 -> 33 and 12 -> 11 (issue #1094).
+#[test]
+fn a_scheme_normal_font_over_a_theme_without_usable_ui_face_compacts() {
+    let bare_theme: Vec<u8> = strip_theme_minor_font_script_faces(THEME_SCHEME_PROBE);
+
+    let heights: Vec<Option<f64>> = printed_row_heights_over_all_pages(&bare_theme);
+
+    assert_eq!(
+        heights
+            .iter()
+            .filter(|height| **height == Some(33.0))
+            .count(),
+        16,
+        "16 ht=36 rows compact to 33pt, got {heights:?}"
+    );
+    assert_eq!(
+        heights
+            .iter()
+            .filter(|height| **height == Some(11.0))
+            .count(),
+        5,
+        "5 ht=12 rows compact to 11pt, got {heights:?}"
+    );
+}
+
+// ── The UI script a scheme font resolves through ─────────────────────
+
+/// Parse options for an Excel whose user interface runs `ui_script`.
+fn ui_script_options(ui_script: XlsxUiScript) -> ConvertOptions {
+    ConvertOptions {
+        xlsx_ui_script: ui_script,
+        ..ConvertOptions::default()
+    }
+}
+
+/// The first cell's font family and every row track of a workbook parsed
+/// for an Excel whose user interface runs `ui_script`.
+fn first_cell_family_and_row_heights(
+    data: &[u8],
+    ui_script: XlsxUiScript,
+) -> (Option<String>, Vec<Option<f64>>) {
+    let (doc, _warnings) = XlsxParser
+        .parse(data, &ui_script_options(ui_script))
+        .expect("workbook should parse");
+    let table = &get_sheet_page(&doc, 0).table;
+    let family: Option<String> =
+        table
+            .rows
+            .iter()
+            .flat_map(|row| row.cells.iter())
+            .find_map(|cell| {
+                cell.content.iter().find_map(|block| match block {
+                    Block::Paragraph(paragraph) => paragraph
+                        .runs
+                        .first()
+                        .and_then(|run| run.style.font_family.clone()),
+                    _ => None,
+                })
+            });
+    let heights: Vec<Option<f64>> = table.rows.iter().map(|row| row.height).collect();
+    (family, heights)
+}
+
+/// Point the theme's minor font scheme's `<a:latin>` entry at `face`.
+fn rewrite_theme_minor_font_latin_face(data: &[u8], face: &str) -> Vec<u8> {
+    rewrite_zip_parts(
+        data,
+        |name| name.starts_with("xl/theme/") && name.ends_with(".xml"),
+        |xml| {
+            let start: usize = xml.find("<a:minorFont>").expect("theme has a minor font");
+            let end: usize = xml[start..]
+                .find("</a:minorFont>")
+                .expect("minor font is closed")
+                + start;
+            let block: &str = &xml[start..end];
+            let latin_start: usize = block.find("<a:latin ").expect("minor font has latin face");
+            let latin_end: usize = block[latin_start..]
+                .find("/>")
+                .expect("latin face is closed")
+                + latin_start
+                + 2;
+            format!(
+                "{}{}<a:latin typeface=\"{face}\"/>{}{}",
+                &xml[..start],
+                &block[..latin_start],
+                &block[latin_end..],
+                &xml[end..]
+            )
+        },
+    )
+}
+
+/// The default UI script stays the Korean one used for the historical XLSX
+/// ground truths: a scheme Normal font paints in the
+/// theme's `Hang` face and recomputes its dimension-less rows from that
+/// face's 17pt series at 11pt (issues #1047, #1380).
+#[test]
+fn the_default_ui_script_resolves_scheme_fonts_through_the_hang_face() {
+    assert_eq!(
+        ConvertOptions::default().xlsx_ui_script,
+        XlsxUiScript::Hangul
+    );
+    let data: Vec<u8> = build_xlsx_with_theme_scheme_normal_font("Calibri", 11.0);
+
+    let (family, heights) = first_cell_family_and_row_heights(&data, XlsxUiScript::default());
+
+    assert_eq!(family.as_deref(), Some("맑은 고딕"));
+    assert_eq!(heights, vec![Some(17.0)]);
+}
+
+/// An Excel with a Latin-script user interface (English, Danish, German, ...)
+/// resolves a scheme font to the theme's `<a:latin>` face, and that face then
+/// lays out exactly like a Normal font naming it outright: same face, same
+/// dimension-less row, never the Hang face's 17pt series.
+///
+/// Triangulated over three theme faces and two sizes: the face comes from the
+/// theme's Latin entry, not from the `<name>` the Normal font declares.
+#[test]
+fn a_latin_ui_script_resolves_a_scheme_normal_font_to_the_theme_latin_face() {
+    for (size_pt, theme_latin_face) in [
+        (11.0, "Calibri"),
+        (14.0, "Calibri"),
+        (11.0, "Georgia"),
+        (14.0, "Georgia"),
+        (11.0, "Aptos"),
+    ] {
+        let scheme_font: Vec<u8> = rewrite_theme_minor_font_latin_face(
+            &build_xlsx_with_theme_scheme_normal_font("Calibri", size_pt),
+            theme_latin_face,
+        );
+        let named_font: Vec<u8> = build_xlsx_with_normal_font(theme_latin_face, size_pt);
+
+        let (family, heights) =
+            first_cell_family_and_row_heights(&scheme_font, XlsxUiScript::Latin);
+        let (named_family, named_heights) =
+            first_cell_family_and_row_heights(&named_font, XlsxUiScript::Latin);
+        let (_hang_family, hang_heights) =
+            first_cell_family_and_row_heights(&scheme_font, XlsxUiScript::Hangul);
+
+        assert_eq!(
+            family.as_deref(),
+            Some(theme_latin_face),
+            "Calibri {size_pt} over a theme naming {theme_latin_face}"
+        );
+        assert_eq!(named_family.as_deref(), Some(theme_latin_face));
+        assert_eq!(
+            heights, named_heights,
+            "{theme_latin_face} {size_pt} lays out as the named face"
+        );
+        assert_ne!(
+            heights, hang_heights,
+            "{theme_latin_face} {size_pt} must leave the Hang face's series"
+        );
+    }
+}
+
+/// Georgia has a measured series of its own and is not one of the families
+/// the printed grid compacts, so its rows show the series directly: 11pt and
+/// 14pt print 14pt and 18pt where the Hang face prints 17pt and 20pt.
+#[test]
+fn a_latin_ui_script_recomputes_rows_from_the_latin_face_series() {
+    for (size_pt, latin_row_pt, hang_row_pt) in [(11.0, 14.0, 17.0), (14.0, 18.0, 20.0)] {
+        let data: Vec<u8> = rewrite_theme_minor_font_latin_face(
+            &build_xlsx_with_theme_scheme_normal_font("Calibri", size_pt),
+            "Georgia",
+        );
+
+        let (_family, latin_heights) =
+            first_cell_family_and_row_heights(&data, XlsxUiScript::Latin);
+        let (_family, hang_heights) =
+            first_cell_family_and_row_heights(&data, XlsxUiScript::Hangul);
+
+        assert_eq!(latin_heights, vec![Some(latin_row_pt)], "Georgia {size_pt}");
+        assert_eq!(hang_heights, vec![Some(hang_row_pt)], "Hang face {size_pt}");
+    }
+}
+
+/// The East Asian fallback belongs to the Korean UI: a Latin UI never reads
+/// the theme's `Hang` or `ea` entries, and a theme with no usable Latin face
+/// leaves the scheme font on the family it declares.
+#[test]
+fn a_latin_ui_script_ignores_the_east_asian_theme_faces() {
+    let office_theme: Vec<u8> = build_xlsx_with_theme_scheme_normal_font("Calibri", 11.0);
+    let east_asian_only: Vec<u8> = rewrite_theme_minor_font_ea_face(
+        &strip_theme_minor_font_script_faces(&office_theme),
+        "Arial",
+    );
+    let no_latin_face: Vec<u8> = rewrite_theme_minor_font_latin_face(&office_theme, "");
+    let (_family, named_calibri_heights) = first_cell_family_and_row_heights(
+        &build_xlsx_with_normal_font("Calibri", 11.0),
+        XlsxUiScript::Latin,
+    );
+
+    for data in [&east_asian_only, &no_latin_face] {
+        let (family, heights) = first_cell_family_and_row_heights(data, XlsxUiScript::Latin);
+
+        assert_eq!(family.as_deref(), Some("Calibri"));
+        assert_eq!(heights, named_calibri_heights);
+    }
+}
+
+/// A cell font carrying its own `<scheme>` resolves slot by slot through the
+/// same Latin list: `major` to the theme's Latin heading face, `minor` to
+/// its Latin body face, while a font naming its face outright keeps it.
+#[test]
+fn a_latin_ui_script_resolves_cell_scheme_fonts_through_their_latin_slot() {
+    let mut book = umya_spreadsheet::new_file();
+    {
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        let heading = sheet.get_cell_mut("A1");
+        heading.set_value("Title");
+        heading
+            .get_style_mut()
+            .get_font_mut()
+            .set_name_with_scheme("Calibri Light", "major");
+        let body = sheet.get_cell_mut("A2");
+        body.set_value("body");
+        body.get_style_mut()
+            .get_font_mut()
+            .set_name_with_scheme("Calibri", "minor");
+        let named = sheet.get_cell_mut("A3");
+        named.set_value("named");
+        named.get_style_mut().get_font_mut().set_name("Georgia");
+    }
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+    let data: Vec<u8> = rewrite_theme_minor_font_latin_face(&cursor.into_inner(), "Trebuchet MS");
+
+    let (doc, _warnings) = XlsxParser
+        .parse(&data, &ui_script_options(XlsxUiScript::Latin))
+        .expect("workbook should parse");
+    let families: Vec<Option<String>> = get_sheet_page(&doc, 0)
+        .table
+        .rows
+        .iter()
+        .flat_map(|row| row.cells.iter())
+        .filter_map(|cell| {
+            cell.content.iter().find_map(|block| match block {
+                Block::Paragraph(paragraph) => paragraph
+                    .runs
+                    .first()
+                    .map(|run| run.style.font_family.clone()),
+                _ => None,
+            })
+        })
+        .collect();
+
+    assert_eq!(
+        families,
+        vec![
+            Some("Calibri Light".to_string()),
+            Some("Trebuchet MS".to_string()),
+            Some("Georgia".to_string()),
+        ]
+    );
+}
+
+/// Under a Latin UI the probe workbook of issue #1094 resolves its scheme
+/// Normal font to the theme's Latin Calibri, so its printed grid compacts the
+/// way the same probe measured when its theme pointed the UI-script entry at
+/// Calibri (`script="Hang" -> Calibri`: 36 -> 33): the resolved face, not the
+/// scheme flag, decides the grid.
+#[test]
+fn a_latin_ui_script_compacts_the_grid_of_a_latin_calibri_scheme_font() {
+    let heights: Vec<Option<f64>> = printed_row_heights_over_all_pages_with(
+        THEME_SCHEME_PROBE,
+        &ui_script_options(XlsxUiScript::Latin),
+    );
+
+    assert_eq!(
+        heights
+            .iter()
+            .filter(|height| **height == Some(33.0))
+            .count(),
+        16,
+        "16 ht=36 rows compact to 33pt, got {heights:?}"
+    );
+    assert_eq!(
+        heights
+            .iter()
+            .filter(|height| **height == Some(11.0))
+            .count(),
+        5,
+        "5 ht=12 rows compact to 11pt, got {heights:?}"
+    );
+}
+
+#[test]
+fn xlsx_rejects_cells_past_excel_grid_limits() {
+    for address in ["XFE1", "ZZZ2", "A1048577", "B16777217"] {
+        let data = build_xlsx_bytes("Sheet1", &[("A1", "Report"), (address, "Outside grid")]);
+        let result = XlsxParser.parse(&data, &ConvertOptions::default());
+        assert!(result.is_err(), "{address} must fail before grid expansion");
+        assert!(result.unwrap_err().to_string().contains("Excel grid"));
+        let streaming = XlsxParser.parse_streaming(&data, &ConvertOptions::default(), 100);
+        assert!(streaming.is_err(), "streaming must reject {address}");
+        assert!(streaming.unwrap_err().to_string().contains("Excel grid"));
+    }
+}
+
+/// A one-cell workbook whose only shared string holds `characters` characters.
+/// umya registers every string cell in `xl/sharedStrings.xml`, so the item's
+/// length follows from the cell value alone.
+fn build_xlsx_with_shared_string_of(characters: usize) -> Vec<u8> {
+    build_xlsx_bytes("Sheet1", &[("A1", &"x".repeat(characters))])
+}
+
+#[test]
+fn xlsx_rejects_a_shared_string_past_excels_cell_character_limit() {
+    // One character past the limit is the whole difference: Excel stores at
+    // most 32,767 characters in a cell, and the reader copies each shared
+    // string into every cell that references it (issue #1702).
+    let data = build_xlsx_with_shared_string_of(32_768);
+    let result = XlsxParser.parse(&data, &ConvertOptions::default());
+    let message: String = result
+        .expect_err("a shared string past the cell limit must be rejected")
+        .to_string();
+    assert!(
+        message.contains("Excel's 32767-character cell limit"),
+        "{message}"
+    );
+    let streaming = XlsxParser.parse_streaming(&data, &ConvertOptions::default(), 100);
+    assert!(
+        streaming
+            .expect_err("streaming must reject it too")
+            .to_string()
+            .contains("Excel's 32767-character cell limit")
+    );
+}
+
+#[test]
+fn xlsx_accepts_a_shared_string_at_excels_cell_character_limit() {
+    // The boundary itself is a workbook Excel opens, so the guard must not
+    // round it away: the part is longer than the limit in bytes, which forces
+    // the scanner to count characters per item rather than trust the size.
+    let data = build_xlsx_with_shared_string_of(32_767);
+    let (document, _warnings) = XlsxParser
+        .parse(&data, &ConvertOptions::default())
+        .expect("the limit itself converts");
+    let sheet = get_sheet_page(&document, 0);
+    assert_eq!(
+        cell_text(&sheet.table.rows[0].cells[0]).chars().count(),
+        32_767
+    );
+    XlsxParser
+        .parse_streaming(&data, &ConvertOptions::default(), 100)
+        .expect("streaming accepts the limit itself");
+}
+
+#[test]
+fn native_english_excel_fixture_uses_latin_face_and_printed_row_pitches() {
+    let data = include_bytes!("../../../../tests/fixtures/xlsx/issue-2050-latin-ui-theme.xlsx");
+    let (family, heights) = first_cell_family_and_row_heights(data, XlsxUiScript::Latin);
+    assert_eq!(family.as_deref(), Some("Calibri"));
+    // Native Excel 16.113.4 in an English UI prints the declared 36pt rows
+    // at 33pt and the automatic Calibri 11pt rows at 14pt.
+    assert_eq!(
+        heights,
+        vec![
+            Some(33.0),
+            Some(33.0),
+            Some(33.0),
+            Some(14.0),
+            Some(14.0),
+            Some(14.0)
+        ]
+    );
+    let (default_family, default_heights) =
+        first_cell_family_and_row_heights(data, XlsxUiScript::Hangul);
+    assert_eq!(default_family.as_deref(), Some("맑은 고딕"));
+    assert_eq!(
+        default_heights,
+        vec![
+            Some(36.0),
+            Some(36.0),
+            Some(36.0),
+            Some(17.0),
+            Some(17.0),
+            Some(17.0)
+        ]
+    );
+}

@@ -1,0 +1,8140 @@
+use super::*;
+use crate::ir::{ChartAreaFill, ChartAreaOutline, DataLabelPosition, MarkerSymbol};
+use crate::render::font_subst;
+
+/// How a chart is drawn. Selecting the variant once lets the atomicity decision
+/// and the emitter agree on which geometry applies.
+enum ChartVariant {
+    /// Axis-scaled bar/column plot with gridlines, tick labels, and a legend.
+    AxisPlot,
+    /// Polyline plot over a value axis, for line and area charts.
+    LinePlot,
+    /// Circular plot whose wedges are each point's share of the total.
+    PiePlot,
+    /// One spoke per category radiating from a centre, each series a closed
+    /// polygon through its value on every spoke.
+    RadarPlot,
+    /// Bordered box holding a title/type label and a basic plot or data table.
+    FramedFallback,
+}
+
+fn chart_variant(chart: &Chart) -> ChartVariant {
+    if matches!(chart.chart_type, ChartType::Bar | ChartType::Column)
+        && !chart.series.is_empty()
+        && !chart.categories.is_empty()
+    {
+        return ChartVariant::AxisPlot;
+    }
+    if matches!(chart.chart_type, ChartType::Line | ChartType::Area)
+        && !chart.series.is_empty()
+        && chart.categories.len() >= 2
+    {
+        return ChartVariant::LinePlot;
+    }
+    // A radar needs a closed ring of spokes, so two categories cannot make one.
+    if is_radar(chart)
+        && !chart.series.is_empty()
+        && chart.categories.len() >= 3
+        && chart
+            .series
+            .iter()
+            .any(|series| series.present_values().any(|value| value > 0.0))
+    {
+        return ChartVariant::RadarPlot;
+    }
+    if matches!(chart.chart_type, ChartType::Pie | ChartType::Doughnut)
+        && chart
+            .series
+            .first()
+            .is_some_and(|series| series.present_values().any(|value| value > 0.0))
+    {
+        return ChartVariant::PiePlot;
+    }
+    ChartVariant::FramedFallback
+}
+
+/// Keep conversion warnings aligned with the renderer's actual fallback choice.
+pub(crate) fn chart_uses_data_table(chart: &Chart) -> bool {
+    matches!(chart_variant(chart), ChartVariant::FramedFallback)
+        && !chart.series.is_empty()
+        && !matches!(
+            chart.chart_type,
+            ChartType::Bar | ChartType::Column | ChartType::Line | ChartType::Pie
+        )
+}
+
+/// Height budget a chart must stay within to be kept atomic, in points.
+///
+/// Comfortably under the ~700pt text column an A4 page with default margins
+/// offers. An unbreakable block taller than the column does not move to the
+/// next page — it runs off the page edge and the overflow is never drawn — so
+/// a chart that cannot fit anywhere is left breakable instead.
+const MAX_ATOMIC_CHART_HEIGHT_PT: f64 = 620.0;
+
+/// Vertical space one row of the bordered-table fallback occupies, in points.
+const BORDERED_TABLE_ROW_PT: f64 = 16.0;
+
+/// Title, type label, header row, and box insets above the fallback's data
+/// rows, in points.
+const BORDERED_TABLE_CHROME_PT: f64 = 90.0;
+
+/// Report whether a chart is short enough that keeping it whole is safe.
+fn chart_fits_on_one_page(chart: &Chart) -> bool {
+    let height: f64 = match chart_variant(chart) {
+        // The plot box plus the title block above it.
+        ChartVariant::AxisPlot => chart_axis_extent(chart).1 + 24.0,
+        // The polyline, pie and radar plots are a fixed size regardless of how
+        // many points they carry.
+        ChartVariant::LinePlot | ChartVariant::PiePlot | ChartVariant::RadarPlot => return true,
+        ChartVariant::FramedFallback => {
+            BORDERED_TABLE_CHROME_PT + chart.categories.len() as f64 * BORDERED_TABLE_ROW_PT
+        }
+    };
+    height <= MAX_ATOMIC_CHART_HEIGHT_PT
+}
+
+/// Generate Typst markup for a chart.
+///
+/// Charts meeting their data requirements use axis, polyline, wedge, or radar
+/// plots. Other charts use a titled frame: bar/column, line, and pie retain
+/// basic plot emitters; other families use data tables. An empty series list
+/// produces only the frame's title and type label.
+///
+/// Excel and PowerPoint treat a chart as one floating graphic that never splits
+/// at a page boundary: it moves to the next page whole. Typst blocks are
+/// breakable by default, and every variant emits its title as a block separate
+/// from its plot, so the whole chart is wrapped once here rather than each
+/// sub-renderer repeating the flag. Charts too tall to fit on any page stay
+/// breakable — see [`MAX_ATOMIC_CHART_HEIGHT_PT`].
+pub(super) fn generate_chart(out: &mut String, chart: &Chart) {
+    generate_chart_in(out, chart, None);
+}
+
+/// Render a chart into a frame of a known size.
+///
+/// PowerPoint lays a chart out at its `<p:graphicFrame>` extent, so a chart
+/// authored to fill the left half of a slide is that size. Rendering at an
+/// intrinsic size instead left it at 44% of the frame height with a band of
+/// empty slide underneath (issue #548). Flowed charts have no frame and keep
+/// the intrinsic size.
+pub(super) fn generate_chart_in(out: &mut String, chart: &Chart, frame: Option<(f64, f64)>) {
+    generate_chart_in_with_sheet_origin(out, chart, frame, None);
+}
+
+/// Render a chart anchored on an Excel worksheet.
+///
+/// `sheet_frame_origin_pt` is the chart frame's top-left corner in Excel's
+/// unscaled sheet coordinate space, on the fitted sheet origin the frame is
+/// painted at (#1542). Excel lays the chart out in that space and snaps its
+/// column-axis chrome, columns and markers to whole sheet points there before
+/// applying the worksheet print scale (#1471, #1543), so the plot, text and
+/// area paint all share this one origin (issue #1607).
+pub(super) fn generate_sheet_chart_in(
+    out: &mut String,
+    chart: &Chart,
+    frame: (f64, f64),
+    sheet_frame_origin_pt: (f64, f64),
+) {
+    generate_chart_in_with_sheet_origin(out, chart, Some(frame), Some(sheet_frame_origin_pt));
+}
+
+fn generate_chart_in_with_sheet_origin(
+    out: &mut String,
+    chart: &Chart,
+    frame: Option<(f64, f64)>,
+    sheet_frame_origin_pt: Option<(f64, f64)>,
+) {
+    // A framed chart is already bounded by its frame, so the page-break guard
+    // only concerns the flowed case.
+    let atomic: bool = frame.is_none() && chart_fits_on_one_page(chart);
+    if atomic {
+        out.push_str("#block(breakable: false)[\n");
+    }
+    // `c:chartSpace/c:txPr` sets the face for every string the chart draws, and
+    // no sub-renderer below names a font of its own, so one scoped `set` reaches
+    // the title, tick labels, legend and data labels alike. Without it they all
+    // fell through to the engine's default serif, a face that appears nowhere
+    // else in the document (issue #668).
+    let font_scope: Option<String> = chart_text_font_scope(chart);
+    if let Some(ref scope) = font_scope {
+        out.push_str("#[\n");
+        out.push_str(scope);
+    }
+    generate_chart_body(out, chart, frame, sheet_frame_origin_pt);
+    if font_scope.is_some() {
+        out.push_str("]\n");
+    }
+    if atomic {
+        out.push_str("]\n");
+    }
+}
+
+/// The `#set text(font: …)` a chart's declared face calls for, or `None` when
+/// it names none and the theme supplied nothing either.
+///
+/// The fallback chain is built from the chart's own strings, because they carry
+/// the scripts: a Korean category label needs the East Asian chain that a Latin
+/// family alone would not reach.
+fn chart_text_font_scope(chart: &Chart) -> Option<String> {
+    let family: &str = chart.text_font_family.as_deref()?;
+    let sample: String = chart.text_sample();
+    Some(format!(
+        "#set text(font: {})\n",
+        font_subst::font_for_mixed_script_text(family, &sample)
+    ))
+}
+
+/// Emit the chart's own markup, without the atomicity wrapper.
+fn generate_chart_body(
+    out: &mut String,
+    chart: &Chart,
+    frame: Option<(f64, f64)>,
+    sheet_frame_origin_pt: Option<(f64, f64)>,
+) {
+    match chart_variant(chart) {
+        ChartVariant::AxisPlot => {
+            return generate_chart_axis(out, chart, frame, sheet_frame_origin_pt);
+        }
+        ChartVariant::LinePlot => {
+            return generate_chart_line_plot(out, chart, frame, sheet_frame_origin_pt);
+        }
+        ChartVariant::PiePlot => {
+            return generate_chart_pie_plot(out, chart, frame);
+        }
+        ChartVariant::RadarPlot => {
+            return generate_chart_radar_plot(out, chart, frame, sheet_frame_origin_pt);
+        }
+        ChartVariant::FramedFallback => {}
+    }
+
+    // A framed chart's box is its frame; `width: 100%` would otherwise take
+    // the whole page and run under whatever sits beside it on the slide.
+    match frame {
+        Some((width, _)) => {
+            let _ = writeln!(
+                out,
+                "#block(stroke: 1pt + rgb(100, 100, 100), radius: 4pt, inset: 10pt, width: {}pt)[",
+                format_f64(width)
+            );
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "#block(stroke: 1pt + rgb(100, 100, 100), radius: 4pt, inset: 10pt, width: 100%)["
+            );
+        }
+    }
+
+    let type_label: &str = match &chart.chart_type {
+        ChartType::Bar => "Bar Chart",
+        ChartType::Column => "Column Chart",
+        ChartType::Line => "Line Chart",
+        ChartType::Pie => "Pie Chart",
+        ChartType::Doughnut => "Doughnut Chart",
+        ChartType::Area => "Area Chart",
+        ChartType::Scatter => "Scatter Chart",
+        ChartType::Other(label) => label.as_str(),
+    };
+
+    if let Some(title) = chart.title.as_ref() {
+        let escaped: String = escape_typst(title);
+        let _ = writeln!(
+            out,
+            "#align(center)[#text(size: 14pt, weight: \"bold\")[{escaped}]]\n"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "#align(center)[#text(fill: rgb(100, 100, 100))[_{type_label}_]]\n"
+    );
+
+    if chart.series.is_empty() {
+        out.push_str("]\n");
+        return;
+    }
+
+    match &chart.chart_type {
+        ChartType::Bar | ChartType::Column => generate_chart_bar(out, chart),
+        ChartType::Pie => generate_chart_pie(out, chart),
+        ChartType::Line => generate_chart_line(out, chart),
+        _ => generate_chart_table(out, chart),
+    }
+
+    out.push_str("]\n");
+}
+
+/// Fallback series palette — the Office 2013+ default accents.
+///
+/// Reached only when the file's own theme supplies no usable accent list;
+/// see [`automatic_color`]. A file built on another theme that lands here
+/// is recoloured, which is what issue #670 was.
+const CHART_SERIES_COLORS: [&str; 6] = [
+    "rgb(68, 114, 196)",
+    "rgb(237, 125, 49)",
+    "rgb(165, 165, 165)",
+    "rgb(255, 192, 0)",
+    "rgb(91, 155, 213)",
+    "rgb(112, 173, 71)",
+];
+
+/// Default marker size in points when `c:marker/c:size` is absent.
+/// A declared size overrides this in both the plot and its legend key (#1185).
+pub(super) const SERIES_MARKER_SIZE_PT: f64 = 5.0;
+
+/// The marker a legend key may carry, as a share of the legend's font size.
+///
+/// Excel draws the key's marker no larger than the row's text can hold, and
+/// that allowance follows the font size alone: Excel for Mac 16.112 exports
+/// of the #982 gift-budget workbook with the series declaring a 24pt marker
+/// print the key marker at 3, 4, 4, 5, 6, 6, 7, 8 and 10 whole chart points
+/// for legend sizes 6, 7, 8, 9, 10, 11, 12, 14 and 18 — `floor(0.6 x size)`
+/// at every one, and identically on a Verdana legend whose painted key
+/// rectangle (0.45 x the face's hhea box) is a different height. The 10pt
+/// row separates the two: its rectangle is 5.985pt, its marker 6pt. Declared
+/// sizes under the allowance pass through unchanged (issue #1617).
+pub(super) const LEGEND_MARKER_CAP_EM: f64 = 0.6;
+
+/// The largest marker a legend set at `legend_text_pt` draws on a line key.
+///
+/// Whole chart points, rounded down. The epsilon keeps a product that lands
+/// on a whole point (10pt x 0.6) from flooring to the point below it.
+pub(super) fn legend_marker_cap_pt(legend_text_pt: f64) -> f64 {
+    (legend_text_pt * LEGEND_MARKER_CAP_EM + 1e-9).floor()
+}
+
+/// The marker size `series` declares, else [`SERIES_MARKER_SIZE_PT`].
+fn series_marker_size_pt(series: &crate::ir::ChartSeries) -> f64 {
+    series.marker_style.size_pt.unwrap_or(SERIES_MARKER_SIZE_PT)
+}
+
+/// Weight a line series' polyline is stroked at when the file states none.
+///
+/// Shared with the legend key, which Excel draws as a sample of the line
+/// itself: a key drawn at some other weight stops standing for its series
+/// (#801).
+///
+/// A default only. A series' own `<a:ln w="…"/>` outranks it — see
+/// [`series_line_pt`] — because Excel prints the declared weight, and a
+/// constant close enough to look right on one workbook is wrong on the next:
+/// #1113 measured 2.24pt against this 2.0pt on the same page whose gridlines
+/// agreed to the point.
+pub(super) const SERIES_LINE_PT: f64 = 2.0;
+
+/// Weight to stroke `series`' polyline and its legend key at.
+///
+/// The declared width, else [`SERIES_LINE_PT`] (issue #1113).
+fn series_line_pt(series: &crate::ir::ChartSeries) -> f64 {
+    series.line_width_pt.unwrap_or(SERIES_LINE_PT)
+}
+
+/// Keep the plot and its legend sample on the same declared stroke geometry.
+fn series_stroke(series: &crate::ir::ChartSeries, color: &str) -> String {
+    let geometry = series.line_geometry;
+    let width = format_f64(series_line_pt(series));
+    if geometry.cap.is_none() && geometry.join.is_none() && geometry.miter_limit.is_none() {
+        return format!("{width}pt + {color}");
+    }
+    let mut stroke = format!("(paint: {color}, thickness: {width}pt");
+    if let Some(cap) = geometry.cap {
+        let cap = match cap {
+            crate::ir::LineCap::Flat => "butt",
+            crate::ir::LineCap::Round => "round",
+            crate::ir::LineCap::Square => "square",
+        };
+        let _ = write!(stroke, ", cap: \"{cap}\"");
+    }
+    if let Some(join) = geometry.join {
+        let join = match join {
+            crate::ir::LineJoin::Round => "round",
+            crate::ir::LineJoin::Bevel => "bevel",
+            crate::ir::LineJoin::Miter => "miter",
+        };
+        let _ = write!(stroke, ", join: \"{join}\"");
+    }
+    if let Some(limit) = geometry.miter_limit {
+        let _ = write!(stroke, ", miter-limit: {}", format_f64(limit));
+    }
+    stroke.push(')');
+    stroke
+}
+
+/// `baseline:` offset that sets the legend key against its label.
+///
+/// The native export puts the key line 2.64pt above its label's baseline, and
+/// -0.5 reproduces that. The previous flat bar sat 4.08pt high, three pixels
+/// out at the 150 DPI this is measured at.
+///
+/// Calibrated rather than derived: raising the box also grows the line's ascent
+/// and carries the baseline with it, so the offset is not a plain translation
+/// of the key. Measured on this fixture, the key rises 2.16pt at an offset of
+/// zero and 4.32pt at -2.
+pub(super) const LEGEND_KEY_BASELINE_PT: f64 = -0.5;
+
+/// Length of a legend key, whichever family the series plots as.
+///
+/// Read off two unrelated native Excel for Mac 16.112 exports as exactly
+/// 19.20pt: the `WithChart.xlsx` line keys span 412.910 to 432.110 on a
+/// 443.50pt chart frame, and the #1169 workbook's bar keys span the same
+/// 19.200pt on a 1015.98pt one. It does not move with the legend's size or
+/// face — ten one-factor exports of that workbook, five sizes and four faces,
+/// all report 19.2000pt — so one constant serves both families and every
+/// frame.
+///
+/// The 20.0 this replaced came from colour-masking the same `WithChart.xlsx`
+/// export at 150 DPI (#801), where one pixel is 0.48pt: it reported 20.16 and
+/// 20.64 for the two keys of a legend whose keys are identical, which is the
+/// signature of a measurement the render could not resolve.
+pub(super) const LEGEND_KEY_LEN_PT: f64 = 19.2;
+
+/// Explicit space between a legend key and its label.
+///
+/// Zero removes Typst's implicit document-sized word space while leaving the
+/// label glyph's own side bearing intact. The remaining bearing differs until
+/// chart text resolves its declared theme face (#668), so a compensating
+/// negative gap would overfit the current fallback (#804).
+const LEGEND_KEY_LABEL_GAP_PT: f64 = 0.0;
+
+/// The space Excel leaves between a legend key and its label.
+///
+/// Measured from the key's right edge to the label's first pen position, which
+/// is what `#h()` sets here. Constant across the ten one-factor exports of the
+/// #1169 workbook — every size and every face reports 2.0250pt — and 2.0247pt
+/// again in the unrelated `WithChart.xlsx` export.
+const EXCEL_LEGEND_KEY_LABEL_GAP_PT: f64 = 2.025;
+
+/// Fixed part of the clearance Excel leaves after every horizontal legend
+/// label.
+///
+/// Native Excel for Mac 16.112 exports of `Gift Budget and Tracker1.xlsx`,
+/// varied one factor at a time and guarded by a layout-identical re-zip
+/// control: all four series renamed to one string at twelve widths (9pt),
+/// five (6pt) and four (18pt), plus the unchanged four-name row at 6, 9 and
+/// 18pt. With the mean-label share below fixed, the intercept fits 24 of the
+/// 25 rows within 0.016pt; the 9pt `Budget` row alone sits 0.22pt under it
+/// (`assets/validation/issue-1616/`).
+const EXCEL_LEGEND_TRAILING_FIXED_PT: f64 = 6.617;
+
+/// Share of the row's mean label advance that Excel adds to that clearance.
+///
+/// The same clearance follows every entry of a row: the three column labels
+/// of the #1603 workbook differ by 9pt of width and all trail 16.74pt at 9pt,
+/// which is 0.16 of their 63.31pt mean. Renaming all four series to one string
+/// moves the clearance by 0.16 of that string's advance, 5.4pt to 79.8pt wide
+/// (slope 0.16007 free-fitted), and the earlier per-face "slopes" of 1.03 to
+/// 1.27pt per point of size were this share of each face's own mean label
+/// advance, as was the 0.16-per-em terminal-glyph effect of #1249.
+const EXCEL_LEGEND_TRAILING_MEAN_LABEL_SHARE: f64 = 0.16;
+
+/// Move a worksheet axis chart's bottom legend from the generic content centre
+/// to Excel's visible-row centre.
+///
+/// Across 25 unconstrained native exports — Segoe UI at every integer size
+/// from 3 through 16 plus 18, 20 and 22pt, and eight faces at 9pt — the row
+/// from the first key edge through the last label centres at 509.740..509.768pt
+/// in the fixture's 1015.978pt chart frame. The generic plot-plus-label content
+/// rectangle centres at 505.4284pt, leaving this stable 4.3235pt correction.
+const EXCEL_BOTTOM_LEGEND_CENTER_X_SHIFT_PT: f64 = 4.3235;
+
+/// The clearance Excel leaves after each label of a worksheet axis-chart
+/// legend row, shared by every entry of that row.
+///
+/// Excel chartsheets and PowerPoint use a separate square-key layout, while
+/// Word has no native calibration, and the line/radar/pie emitters have
+/// different content rectangles, so only a worksheet axis chart enters this
+/// measured regime. The clearance is [`EXCEL_LEGEND_TRAILING_FIXED_PT`] plus
+/// [`EXCEL_LEGEND_TRAILING_MEAN_LABEL_SHARE`] of the mean design advance of
+/// the labels that can be measured in the legend face; a row none of whose
+/// labels can be measured keeps the generic layout, since there is no width
+/// to derive the clearance from. At 24pt the #1249 row first runs out of chart
+/// width and Excel compresses it, so that constrained-row regime is
+/// deliberately not folded into these intrinsic per-entry widths.
+pub(super) fn excel_legend_trailing_gutter_pt(chart: &Chart, names: &[String]) -> Option<f64> {
+    if !matches!(chart.host, crate::ir::ChartHost::Spreadsheet)
+        || !matches!(chart_variant(chart), ChartVariant::AxisPlot)
+    {
+        return None;
+    }
+    let size_pt: f64 = chart_legend_text_pt(chart);
+    let is_bold: bool = chart_legend_text_is_bold(chart);
+    let family: &str = chart
+        .text_font_family
+        .as_deref()
+        .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_FAMILY);
+    let measured: Vec<f64> = names
+        .iter()
+        .filter_map(|name| chart_text_advance_em(family, is_bold, name))
+        .map(|advance| advance * size_pt)
+        .collect();
+    if measured.is_empty() {
+        return None;
+    }
+    let mean_label_pt: f64 = measured.iter().sum::<f64>() / measured.len() as f64;
+    Some(
+        (EXCEL_LEGEND_TRAILING_FIXED_PT + EXCEL_LEGEND_TRAILING_MEAN_LABEL_SHARE * mean_label_pt)
+            .max(GAP),
+    )
+}
+
+/// The share of the legend face's line box a filled legend key spends.
+///
+/// Excel's key is a flat bar, not a square: 5.39pt tall for the 9pt Segoe UI
+/// legend of the #1169 workbook against a 19.2pt width. The height is the only
+/// part of that key that moves, and it follows the face as well as the size —
+/// 4.9512pt in Calibri where Segoe UI gives 5.3902 at the same 9pt — which
+/// identifies it as a share of [`chart_face_line_metrics_em`]'s bare `hhea`
+/// box rather than of the size. Fitting all ten exports gives 0.4498 (Segoe UI
+/// 6/9/12/18/24pt, Calibri 9/18pt, Arial and Georgia at 9pt), inside the
+/// 0.0122pt the GT's own 0.82 print scale can resolve of a flat 0.45.
+///
+/// PowerPoint spends the same share on the *side* of its square key. Eleven
+/// native PowerPoint 16.112 exports of `bar-chart.pptx`, seven faces at 18pt
+/// through `scripts/probes/issue-1439-legend-key-face.json` and five Arial
+/// sizes through `scripts/probes/issue-1439-legend-key-arial-size.json`, put
+/// the ratio between 0.44995 and 0.45005 with no export further than 0.0017pt
+/// from a flat 0.45 (#1439).
+const LEGEND_KEY_LINE_BOX_SHARE: f64 = 0.45;
+
+/// The chart frame's origin in worksheet space, before printing applies the
+/// sheet scale. Legend samples use their independent placement.
+#[derive(Clone, Copy)]
+struct WorksheetMarkerPlacement {
+    frame_origin: (f64, f64),
+}
+
+impl WorksheetMarkerPlacement {
+    fn center(self, series: &crate::ir::ChartSeries, x: f64, y: f64) -> (f64, f64) {
+        let size: f64 = series_marker_size_pt(series);
+        // Native worksheet sprites use whole sheet-point positions. Explicit
+        // odd-width outlines (including the default 0.75pt) floor the point;
+        // even widths and unstroked automatic/suppressed outlines round it.
+        // Explicit zero width follows the floor path without outline padding.
+        let floor: bool = match series.marker_style.line {
+            crate::ir::ChartLine::Explicit { width_pt, .. } => {
+                let width: f64 = width_pt.unwrap_or(0.75);
+                width == 0.0 || width.round().max(1.0) % 2.0 == 1.0
+            }
+            crate::ir::ChartLine::Automatic | crate::ir::ChartLine::Suppressed => false,
+        };
+        let phase: f64 = (size % 2.0) / 2.0;
+        let position = |value: f64, origin: f64| {
+            let sheet: f64 = origin + value;
+            let snapped: f64 = if floor { sheet.floor() } else { sheet.round() };
+            snapped - phase - origin
+        };
+        (
+            position(x, self.frame_origin.0),
+            position(y, self.frame_origin.1),
+        )
+    }
+}
+
+/// Excel's clip around a worksheet chart's plotted data.
+///
+/// An anchored Excel chart lays its plot out in unscaled sheet points and wraps
+/// the data it plots there — the columns and the series polylines — in a clip
+/// whose every edge is the plot rectangle's own edge rounded to the nearest
+/// whole sheet point, before the sheet's print scale applies. Native Excel
+/// 16.112 exports of the public #982 workbook read it as x 380..1350,
+/// y 143..391 sheet points on the unscaled control, whose continuous plot is
+/// 380.109..1349.965 x 143.013..391.193, and as x 388..1358, y 154..402 on the
+/// 0.82 fitted export, whose plot is 388.109..1357.966 x 154.013..402.193 (page
+/// 318.16..1113.56 x 126.28..329.64). Rounding rather than truncation: the
+/// fitted right edge clips at 1358, not 1357.
+///
+/// The chrome stays outside it. Both axis rules, the gridlines and the marker
+/// sprites are traced under the chart *area*'s clip instead, so a series
+/// running along the category axis is cut at the plot's bottom edge and the
+/// axis beneath it stays visible: a 2.239pt line over a 0.737pt axis leaves
+/// 0.93pt of series above 0.56pt of axis rather than burying it (#1745).
+///
+/// The chart-area clip native Excel also pushes follows a different, truncating
+/// rule — a 344.987..1360.965 x 132.013..439.986 area clips at 344..1360 x
+/// 132..439 — and is not modelled here.
+#[derive(Clone, Copy)]
+struct WorksheetPlotClip {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+impl WorksheetPlotClip {
+    /// The clip for a plotting rectangle in the chart's own points, or `None`
+    /// where the chart has no sheet origin to round on.
+    ///
+    /// A horizontal bar plot passes `None`: #1633 establishes chart-local
+    /// clipping for value-axis overruns, but worksheet-point snapping of its
+    /// plot edges remains unmeasured. [`worksheet_column_span`] leaves a bar's
+    /// band continuous for the same reason.
+    fn snapped(
+        placement: Option<WorksheetMarkerPlacement>,
+        plot_x: f64,
+        plot_y: f64,
+        plot_w: f64,
+        plot_h: f64,
+    ) -> Option<Self> {
+        let (origin_x, origin_y) = placement?.frame_origin;
+        let snap = |local: f64, origin: f64| (origin + local).round() - origin;
+        let left: f64 = snap(plot_x, origin_x);
+        let top: f64 = snap(plot_y, origin_y);
+        let right: f64 = snap(plot_x + plot_w, origin_x);
+        let bottom: f64 = snap(plot_y + plot_h, origin_y);
+        Some(Self {
+            x: left,
+            y: top,
+            width: (right - left).max(0.0),
+            height: (bottom - top).max(0.0),
+        })
+    }
+}
+
+/// Write one `#place(…)` statement of plotted data, inside the plot clip where
+/// the chart has one.
+///
+/// `markup` keeps the chart's own coordinates, so the clip box carries an inner
+/// placement that puts its origin back on the chart's.
+fn write_plotted(out: &mut String, clip: Option<WorksheetPlotClip>, markup: &str) {
+    match clip {
+        Some(clip) => {
+            let _ = writeln!(
+                out,
+                "#place(top + left, dx: {}pt, dy: {}pt, box(width: {}pt, height: {}pt, clip: true)[#place(top + left, dx: {}pt, dy: {}pt)[{markup}]])",
+                format_f64(clip.x),
+                format_f64(clip.y),
+                format_f64(clip.width),
+                format_f64(clip.height),
+                format_f64(-clip.x),
+                format_f64(-clip.y),
+            );
+        }
+        None => {
+            let _ = writeln!(out, "{markup}");
+        }
+    }
+}
+
+/// Marker shape for the `index`-th series, when the file asks for a default
+/// marker rather than naming a `c:symbol`.
+///
+/// The sequence exists so adjacent series stay apart in monochrome; drawing one
+/// square for every series defeats it (issue #635).
+///
+/// The first two entries are confirmed against the native Excel export of
+/// `WithChart.xlsx`: at 150 DPI its first series carries a diamond and its
+/// second a square, both in the plot and on the legend key. LibreOffice cycles
+/// the same two the other way round on that file, so its render is not evidence
+/// about the order — only the native one is.
+///
+/// Entries beyond the second remain the order #635 states Excel uses, with
+/// nothing here checking them; that workbook has only two series.
+///
+/// The series' own `<c:marker><c:symbol>` names its symbol, and outranks
+/// the cycle entirely: the sequence only ever stood in for a symbol the file
+/// left automatic (issue #1107).
+fn write_series_marker(
+    out: &mut String,
+    series_index: usize,
+    series: &crate::ir::ChartSeries,
+    x: f64,
+    y: f64,
+    color: &str,
+    worksheet: Option<WorksheetMarkerPlacement>,
+) {
+    let (x, y) = worksheet.map_or((x, y), |placement| placement.center(series, x, y));
+    out.push_str(&series_marker_markup(
+        series_index,
+        series,
+        x,
+        y,
+        color,
+        series_marker_size_pt(series),
+    ));
+}
+
+/// The `#place`d markup for one series marker `size` points across centred on
+/// (`x`, `y`), and the empty string for a series that draws none.
+///
+/// Returned rather than written so the legend key can embed the same marker the
+/// plot draws, instead of restating the shape cycle (#801). The size is a
+/// parameter because the legend draws the plot's marker at the row's own
+/// allowance (#1617); the plot passes the series' declared size.
+fn series_marker_markup(
+    series_index: usize,
+    series: &crate::ir::ChartSeries,
+    x: f64,
+    y: f64,
+    color: &str,
+    size: f64,
+) -> String {
+    let fill: String = if series.marker_style.fill_mode == crate::ir::ChartFillMode::Suppressed {
+        "none".to_string()
+    } else {
+        marker_paint(
+            series.marker_style.fill,
+            series.marker_style.fill_alpha,
+            color,
+        )
+    };
+    let stroke: String = match series.marker_style.line {
+        crate::ir::ChartLine::Automatic | crate::ir::ChartLine::Suppressed => "none".to_string(),
+        crate::ir::ChartLine::Explicit {
+            width_pt,
+            color: outline,
+            alpha,
+        } => format!(
+            "{}pt + {}",
+            format_f64(width_pt.unwrap_or(0.75)),
+            marker_paint(outline, alpha, color)
+        ),
+    };
+    let half: f64 = size / 2.0;
+    let left: String = format_f64(x - half);
+    let top: String = format_f64(y - half);
+    let full: String = format_f64(size);
+    let mid: String = format_f64(half);
+
+    let circle =
+        || -> String { format!("circle(radius: {mid}pt, fill: {fill}, stroke: {stroke})") };
+    let diamond = || -> String {
+        format!(
+            "polygon(fill: {fill}, stroke: {stroke}, ({mid}pt, 0pt), ({full}pt, {mid}pt), ({mid}pt, {full}pt), (0pt, {mid}pt))"
+        )
+    };
+    let square = || -> String {
+        format!("rect(width: {full}pt, height: {full}pt, fill: {fill}, stroke: {stroke})")
+    };
+    let triangle = || -> String {
+        format!(
+            "polygon(fill: {fill}, stroke: {stroke}, ({mid}pt, 0pt), ({full}pt, {full}pt), (0pt, {full}pt))"
+        )
+    };
+    // A filled X.
+    let cross = || -> String {
+        let thin: String = format_f64(size / 3.0);
+        let thick: String = format_f64(size * 2.0 / 3.0);
+        format!(
+            "polygon(fill: {fill}, stroke: {stroke}, ({thin}pt, 0pt), ({thick}pt, 0pt), ({thick}pt, {thin}pt), ({full}pt, {thin}pt), ({full}pt, {thick}pt), ({thick}pt, {thick}pt), ({thick}pt, {full}pt), ({thin}pt, {full}pt), ({thin}pt, {thick}pt), (0pt, {thick}pt), (0pt, {thin}pt), ({thin}pt, {thin}pt))"
+        )
+    };
+
+    let shape: String = match series.marker_symbol {
+        Some(MarkerSymbol::Off) => return String::new(),
+        Some(MarkerSymbol::Circle) => circle(),
+        Some(MarkerSymbol::Diamond) => diamond(),
+        Some(MarkerSymbol::Square) => square(),
+        Some(MarkerSymbol::Triangle) => triangle(),
+        Some(MarkerSymbol::Cross) => cross(),
+        None => match series_index % 4 {
+            0 => diamond(),
+            1 => square(),
+            2 => triangle(),
+            _ => cross(),
+        },
+    };
+    format!("#place(top + left, dx: {left}pt, dy: {top}pt, {shape})\n")
+}
+
+/// Explicit marker paint overrides the series colour, including opacity.
+fn marker_paint(color: Option<Color>, alpha: Option<f64>, fallback: &str) -> String {
+    let paint = color
+        .as_ref()
+        .map(rgb)
+        .unwrap_or_else(|| fallback.to_string());
+    match alpha {
+        Some(alpha) => format!(
+            "{paint}.transparentize({}%)",
+            format_f64((1.0 - alpha.clamp(0.0, 1.0)) * 100.0)
+        ),
+        None => paint,
+    }
+}
+
+/// Whether this plot draws `series` as a line laid over the columns rather
+/// than as a column of its own.
+///
+/// Only a chart the bar family governs has columns to lay a line over; the
+/// polyline, pie and radar plots already draw every series their own way. A
+/// combo plot area is what puts a `<c:lineChart>` series into a bar chart in
+/// the first place (issue #1067).
+fn plots_as_line(chart: &Chart, series: &crate::ir::ChartSeries) -> bool {
+    matches!(chart.chart_type, ChartType::Bar | ChartType::Column)
+        && matches!(
+            chart.plot_type_of(series),
+            ChartType::Line | ChartType::Area
+        )
+}
+
+/// The legend key for a series drawn as a line: a sample of the plotted stroke
+/// carrying the same marker the series draws on each of its points (#801).
+///
+/// The whole series, not just its symbol, because the sample has to match the
+/// weight the line is plotted at as well (issue #1113).
+///
+/// The marker is the plot's, no larger than the legend's own allowance
+/// ([`legend_marker_cap_pt`] of `legend_text_pt`): a 6pt legend prints a 5pt
+/// series marker at 3pt. The sample box shrinks with that allowance too — a
+/// 5pt box outgrows a 6pt line box and pushed the line series' label a point
+/// below the column labels it shares a row with — but never grows past the
+/// [`SERIES_MARKER_SIZE_PT`] the key's baseline offset is calibrated against,
+/// so ordinary-size legends keep their seat whatever the series declares
+/// (issue #1617).
+fn line_legend_key(
+    series_index: usize,
+    series: &crate::ir::ChartSeries,
+    color: &str,
+    legend_text_pt: f64,
+) -> String {
+    let marker_cap: f64 = legend_marker_cap_pt(legend_text_pt);
+    let marker_size: f64 = series_marker_size_pt(series).min(marker_cap);
+    let box_height: f64 = SERIES_MARKER_SIZE_PT.min(marker_cap);
+    let key_mid: f64 = box_height / 2.0;
+    format!(
+        "#box(width: {}pt, height: {}pt, baseline: {}pt)[\
+         #place(top + left, dx: 0pt, dy: {}pt, line(end: ({}pt, 0pt), stroke: {}))\
+         {}]",
+        format_f64(LEGEND_KEY_LEN_PT),
+        format_f64(box_height),
+        format_f64(LEGEND_KEY_BASELINE_PT),
+        format_f64(key_mid),
+        format_f64(LEGEND_KEY_LEN_PT),
+        series_stroke(series, color),
+        series_marker_markup(
+            series_index,
+            series,
+            LEGEND_KEY_LEN_PT / 2.0,
+            key_mid,
+            color,
+            marker_size,
+        )
+        .trim_end()
+    )
+}
+
+/// The automatic colour for the `index`-th slot, from the file's own theme.
+///
+/// A chart that states no fill takes `accent1`..`accent6` of the theme its
+/// package declares. Only when the package supplies no usable accent list does
+/// the built-in palette stand in — that palette is the Office 2013+ one, so
+/// using it on a file built from another theme recolours the chart (#670).
+fn automatic_color(theme_accents: &[Color], index: usize, fallback: &[&str]) -> String {
+    if theme_accents.is_empty() {
+        return fallback[index % fallback.len()].to_string();
+    }
+    rgb(&theme_accents[index % theme_accents.len()])
+}
+
+/// The Typst colour for one plotted point.
+///
+/// A point's own `<c:dPt>` fill outranks its series' `<c:spPr>` fill, and an
+/// automatic colour is the fallback for charts that declare neither — not a
+/// replacement for what the file states (issue #535).
+fn series_color(
+    series: &crate::ir::ChartSeries,
+    series_index: usize,
+    point_index: usize,
+    theme_accents: &[Color],
+) -> String {
+    match series.fill_for_point(point_index) {
+        Some(color) => rgb(&color),
+        None => automatic_color(theme_accents, series_index, &CHART_SERIES_COLORS),
+    }
+}
+
+/// Fill for plots that colour by data point rather than by series, so the
+/// accent advances with the point. Suppression leaves the slice slot intact.
+fn category_color(
+    series: &crate::ir::ChartSeries,
+    point_index: usize,
+    palette: &[&str],
+    theme_accents: &[Color],
+) -> String {
+    if !series.paints_fill_for_point(point_index) {
+        return "none".to_string();
+    }
+    match series.fill_for_point(point_index) {
+        Some(color) => rgb(&color),
+        None => automatic_color(theme_accents, point_index, palette),
+    }
+}
+
+/// A filled mark can be transparent while the same series still has a line
+/// or marker colour. Keep suppressed segments in the layout and stack.
+fn series_fill(
+    series: &crate::ir::ChartSeries,
+    series_index: usize,
+    point_index: usize,
+    theme_accents: &[Color],
+) -> String {
+    if series.paints_fill_for_point(point_index) {
+        series_color(series, series_index, point_index, theme_accents)
+    } else {
+        "none".to_string()
+    }
+}
+
+/// Category palette used by the bar-plot and pie-table fallbacks.
+///
+/// Like [`CHART_SERIES_COLORS`], this now sits behind the file's own theme
+/// accents and is reached only when those are absent.
+///
+/// Intentionally distinct from [`CHART_SERIES_COLORS`]; unifying them would
+/// change rendered output and needs visual verification.
+const CHART_CATEGORY_COLORS: [&str; 6] = [
+    "rgb(66, 133, 244)",
+    "rgb(219, 68, 55)",
+    "rgb(244, 180, 0)",
+    "rgb(15, 157, 88)",
+    "rgb(171, 71, 188)",
+    "rgb(0, 172, 193)",
+];
+
+/// A chart value rendered through the number format its data declares, or
+/// through [`chart_value_label`] when it declares none.
+///
+/// A chart stores a ratio as a fraction and says `0.00%` beside it in
+/// `<c:numCache><c:formatCode>`, so a value axis and its data labels printed
+/// `0.2` and `0.024` where the source, and every other renderer, show `20%`
+/// and `2.4%` (issue #865). The formatter is the one the XLSX path already
+/// uses, so a code means the same thing in both.
+pub(super) fn chart_value_label_formatted(value: f64, number_format: Option<&str>) -> String {
+    match number_format {
+        Some(format_code) => umya_spreadsheet::helper::number_format::to_formatted_string(
+            value.to_string(),
+            format_code,
+        ),
+        None => chart_value_label(value),
+    }
+}
+
+/// Format only the axis label: the original category still identifies data
+/// labels, legends, and plotted slots. Empty number-format sections suppress
+/// ink without deleting the axis or changing its layout band (#1267).
+fn formatted_category_axis_label(chart: &Chart, category: &str) -> String {
+    match chart.category_axis_number_format.as_deref() {
+        Some(format) => {
+            if let Ok(value) = category.parse::<f64>()
+                && let Some(literal) =
+                    crate::parser::xlsx::literal_number_format_text(format, value)
+            {
+                return literal;
+            }
+            umya_spreadsheet::helper::number_format::to_formatted_string(category, format)
+        }
+        None => category.to_string(),
+    }
+}
+
+/// The number format a chart's primary value axis and data labels take: the
+/// axis' own, else the first one any of its series declares. The series of one
+/// axis share its scale, and Office writes the same code into each of their
+/// caches — but a secondary-axis series' cache says nothing about the primary
+/// axis, which is how a 0..7 ratio axis came to print as 0%..700% (#1374).
+pub(super) fn chart_value_number_format(chart: &Chart) -> Option<&str> {
+    value_axis_number_format(chart, crate::ir::ChartValueAxisRole::Primary)
+}
+
+/// The number format the value axis `role` names prints its ticks in: the
+/// axis' own `<c:numFmt>`, else the cache format of the first series read
+/// against it.
+fn value_axis_number_format(chart: &Chart, role: crate::ir::ChartValueAxisRole) -> Option<&str> {
+    let stated: Option<&str> = match role {
+        crate::ir::ChartValueAxisRole::Primary => chart.value_axis_number_format.as_deref(),
+        crate::ir::ChartValueAxisRole::Secondary => chart
+            .secondary_value_axis
+            .as_ref()
+            .and_then(|axis| axis.number_format.as_deref()),
+    };
+    stated.or_else(|| axis_series(chart, role).find_map(|series| series.number_format.as_deref()))
+}
+
+/// The series read against the value axis `role` names (issue #1374).
+fn axis_series(
+    chart: &Chart,
+    role: crate::ir::ChartValueAxisRole,
+) -> impl Iterator<Item = &crate::ir::ChartSeries> {
+    chart
+        .series
+        .iter()
+        .filter(move |series| series.value_axis == role)
+}
+
+/// The secondary value axis, when the chart declares one and some series is
+/// read against it. A declared axis nothing reads against is not drawn, and
+/// a series pointed at an axis the part never declared reads against the
+/// primary one (issue #1374).
+fn chart_secondary_axis(chart: &Chart) -> Option<&crate::ir::ChartSecondaryValueAxis> {
+    let axis: &crate::ir::ChartSecondaryValueAxis = chart.secondary_value_axis.as_ref()?;
+    axis_series(chart, crate::ir::ChartValueAxisRole::Secondary)
+        .next()
+        .map(|_| axis)
+}
+
+/// The scale a series' values are read against: the secondary axis' where the
+/// series is on it, else the primary's.
+fn series_value_scale(
+    series: &crate::ir::ChartSeries,
+    primary: ValueScale,
+    secondary: Option<ValueScale>,
+) -> ValueScale {
+    match (series.value_axis, secondary) {
+        (crate::ir::ChartValueAxisRole::Secondary, Some(scale)) => scale,
+        _ => primary,
+    }
+}
+
+/// The number format one series' data labels take: the label's own, else the
+/// series' cache format, which is the source cell's.
+pub(super) fn series_label_number_format(series: &crate::ir::ChartSeries) -> Option<&str> {
+    series
+        .data_labels
+        .number_format
+        .as_deref()
+        .or(series.number_format.as_deref())
+}
+
+/// Format a chart value without floating-point noise (e.g. 8.2000001 → 8.2).
+pub(super) fn chart_value_label(value: f64) -> String {
+    if value.fract().abs() < 1e-9 {
+        return format!("{}", value.round() as i64);
+    }
+    // Round to at most 4 significant fractional digits, then trim zeros.
+    let rounded: f64 = (value * 10_000.0).round() / 10_000.0;
+    let mut text: String = format!("{rounded}");
+    if text.contains('.') {
+        while text.ends_with('0') {
+            text.pop();
+        }
+        if text.ends_with('.') {
+            text.pop();
+        }
+    }
+    text
+}
+
+/// Apply `<c:majorUnit>` to an axis the auto-scale has already sized.
+///
+/// The stated unit sets the interval; the maximum is then the fewest whole
+/// units that still cover the data, so a declared 0.2 on a 0.689 maximum gives
+/// ticks at 0, 0.2, 0.4, 0.6, 0.8 rather than the automatic tenths (#882).
+fn axis_with_stated_unit(axis: (f64, f64), stated: Option<f64>) -> (f64, f64) {
+    let (nice_max, step) = axis;
+    let Some(unit) = stated.filter(|unit| unit.is_finite() && *unit > 0.0) else {
+        return (nice_max, step);
+    };
+    let covered: f64 = (nice_max / unit - 1e-9).ceil().max(1.0) * unit;
+    (covered, unit)
+}
+
+/// Choose Excel's automatic axis maximum and major unit covering `[0, max]`
+/// (e.g. max 8.2 → (9, 1), giving ticks 0,1,…,9).
+fn nice_axis(max_value: f64) -> (f64, f64) {
+    if max_value <= 0.0 {
+        return (1.0, 1.0);
+    }
+    // Excel clears the data by a twentieth of the range *before* rounding, so
+    // the tallest bar stops short of the top. Rounding the bare maximum put a
+    // 17 maximum under an axis of 18 only by accident of the step, and a
+    // maximum of 100 flush against a 100 axis (#634).
+    let cleared: f64 = max_value + max_value / AXIS_HEADROOM_DIVISOR;
+    let magnitude: f64 = 10f64.powf(cleared.log10().floor());
+    let mantissa: f64 = cleared / magnitude;
+    let step: f64 = MAJOR_UNIT_FRACTIONS
+        .iter()
+        .find(|(upper, _)| mantissa < *upper)
+        .map_or(1.0, |(_, fraction)| *fraction)
+        * magnitude;
+    // The step, not the maximum, carries the rounding: the axis is the fewest
+    // whole steps that cover the cleared data. Rounding the maximum to the
+    // ladder itself put 23,334 against 50,000 (#553).
+    let nice_max: f64 = (cleared / step - 1e-9).ceil() * step;
+    (nice_max, step)
+}
+
+/// Choose PowerPoint's automatic scale for a horizontal value axis.
+///
+/// PowerPoint applies the same 5% headroom as Excel, but limits how many
+/// horizontal intervals it will label according to both text size and plot
+/// width. Native PowerPoint 16.112 exports of `bar-chart.pptx` put its 18pt,
+/// 311.37pt-wide plot into at most five intervals: 8.2 therefore clears to
+/// 8.61 and takes the first 1/2/5-ladder step that covers it in five intervals,
+/// 2, for a 0..10 axis (#824).
+///
+/// The text limits are bracketed by native transitions at 11.93/11.94pt,
+/// 20.12/20.13pt, and 41.49/41.50pt. Combined text/plot probes put the first
+/// two width cutoffs between 358/368pt and 265/296pt. Holding the text at 18pt
+/// and narrowing the frame independently brackets five-to-two intervals
+/// between 231/311pt and two-to-one between 60/71pt. The cutoffs below stay
+/// consistent with those measured gaps rather than pretending the probes
+/// reveal an undocumented exact PowerPoint constant.
+fn powerpoint_nice_axis(max_value: f64, text_pt: f64, plot_w: f64) -> (f64, f64) {
+    if max_value <= 0.0 {
+        return (1.0, 1.0);
+    }
+    let text_interval_limit: f64 = if text_pt < 11.94 {
+        10.0
+    } else if text_pt < 20.13 {
+        5.0
+    } else if text_pt < 41.50 {
+        2.0
+    } else {
+        1.0
+    };
+    let width_interval_limit: f64 = if plot_w >= 363.0 {
+        10.0
+    } else if plot_w >= 270.0 {
+        5.0
+    } else if plot_w >= 65.0 {
+        2.0
+    } else {
+        1.0
+    };
+    let interval_limit: f64 = text_interval_limit.min(width_interval_limit);
+    let cleared: f64 = max_value + max_value / AXIS_HEADROOM_DIVISOR;
+    let magnitude: f64 = 10f64.powf(cleared.log10().floor());
+    let mut step: f64 = magnitude / 10.0;
+    for fraction in [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0] {
+        let candidate: f64 = magnitude * fraction;
+        if (cleared / candidate - 1e-9).ceil() <= interval_limit {
+            step = candidate;
+            break;
+        }
+    }
+    ((cleared / step - 1e-9).ceil() * step, step)
+}
+
+/// Resolve the host-specific automatic value axis for one chart family.
+///
+/// The PowerPoint calibration is horizontal: it applies to bar charts. A
+/// vertical value axis keeps the established Excel rule until a native
+/// PowerPoint column/line calibration proves its separate density rule.
+fn chart_auto_axis(chart: &Chart, horizontal: bool, plot_w: f64, max_value: f64) -> (f64, f64) {
+    if horizontal && matches!(chart.host, crate::ir::ChartHost::Presentation) {
+        powerpoint_nice_axis(
+            max_value,
+            chart_axis_text_pt(chart, chart.value_axis_text_style),
+            plot_w,
+        )
+    } else {
+        nice_axis(max_value)
+    }
+}
+
+/// Share of the plotted range an auto-scaled axis clears the data by before it
+/// rounds up to a whole number of major units.
+///
+/// Excel's documented rule puts the axis maximum at the first major unit above
+/// `Ymax + (Ymax - Ymin)/20`, so the tallest bar never touches the top. Only
+/// the divisor is documented; the major unit itself is not, hence
+/// [`MAJOR_UNIT_FRACTIONS`].
+const AXIS_HEADROOM_DIVISOR: f64 = 20.0;
+
+/// Major unit an auto-scaled axis takes, as a fraction of the power of ten
+/// below the cleared maximum, keyed by the exclusive upper bound of that
+/// maximum's mantissa.
+///
+/// Excel does not document how it picks the unit. Measured across rescalings of
+/// one auto-scaled chart, the unit is a step function of the mantissa: 1.78 and
+/// 2.45 give 0.2 and 0.5 in Excel's own exports (issues #634 and #553), and
+/// every mantissa from 1.0 to 9.9 agrees with these three bands in
+/// LibreOffice's renderings of the same files.
+///
+/// The interval count is therefore not constant — it runs from 4 to 10 across a
+/// decade, and aiming for a fixed five instead is what put a 17 maximum under a
+/// 20 axis in five steps rather than Excel's 18 in nine (#634).
+const MAJOR_UNIT_FRACTIONS: [(f64, f64); 3] = [(2.0, 0.2), (5.0, 0.5), (10.0, 1.0)];
+
+/// The stroke PowerPoint draws for an automatic major gridline and for an
+/// automatic axis line: 0.75pt (9525 EMU) in `#868686`.
+///
+/// A `c:majorGridlines` carrying no `c:spPr` leaves the renderer to supply its
+/// own default. Ours was 0.6pt `#C8C8C8`, which puts roughly a quarter of the
+/// ink on each line and left the grid barely visible against a white plot area.
+/// The axis line ran a milder version of the same drift at 0.8pt `#787878`
+/// (issue #673).
+pub(super) const CHART_AUTOMATIC_LINE: &str = "0.75pt + rgb(134, 134, 134)";
+
+/// The stroke to draw one piece of chart chrome with, or `None` when the part
+/// suppresses its line or omits an optional gridline element.
+///
+/// A stated line falls back to [`CHART_AUTOMATIC_LINE`] for whichever half it
+/// leaves out, so a `<a:ln>` naming only a width keeps the automatic colour.
+fn chart_chrome_stroke(declared: crate::ir::ChartLine) -> Option<String> {
+    match declared {
+        crate::ir::ChartLine::Automatic => Some(CHART_AUTOMATIC_LINE.to_string()),
+        crate::ir::ChartLine::Suppressed => None,
+        crate::ir::ChartLine::Explicit {
+            width_pt,
+            color,
+            alpha,
+        } => Some(format!(
+            "{}pt + {}",
+            format_f64(width_pt.unwrap_or(CHART_AUTOMATIC_LINE_PT)),
+            match alpha {
+                Some(alpha) => rgb_with_alpha(
+                    &color.unwrap_or(CHART_AUTOMATIC_LINE_COLOR),
+                    (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+                ),
+                None => rgb(&color.unwrap_or(CHART_AUTOMATIC_LINE_COLOR)),
+            }
+        )),
+    }
+}
+
+/// Outline **Excel** draws around the whole chart area — plot, axis labels and
+/// legend alike — when the file states no `c:chartSpace/c:spPr/a:ln`.
+///
+/// Not Office's in general: PowerPoint draws none in the same case, so which
+/// hosts reach this is [`automatic_chart_area_stroke`]'s decision, not this
+/// constant's (issue #823).
+///
+/// It is the same stroke as the gridlines: the native Excel export of
+/// `WithChart.xlsx` draws the border as a single grey pixel at 150 DPI. In the
+/// committed `assets/bugfixes/issue-637/gt.jpg`, pixel (104, 300) — on the
+/// border's left edge — samples RGB(133,133,133), against the RGB(134,134,134)
+/// of [`CHART_AUTOMATIC_LINE`]; the one-level gap is the JPEG. Without the
+/// outline a chart has no boundary against the sheet behind it (#637).
+pub(super) const CHART_AREA_OUTLINE: &str = CHART_AUTOMATIC_LINE;
+
+/// What "the automatic chart-area outline" is for the application whose package
+/// the chart came out of.
+///
+/// Excel draws one and PowerPoint draws none. [`CHART_AREA_OUTLINE`] was
+/// calibrated against an Excel export, and applying it everywhere put a border
+/// around every chart on a slide that the deck never asks for: on
+/// `bar-chart.pptx` a 480.00 x 301.00pt rectangle at 0.75pt, where a pixel scan
+/// of the native export finds no straight run longer than the axis line
+/// (issue #823).
+///
+/// Word's automatic outline is unmeasured, so it keeps Excel's — which is what
+/// every chart took before this.
+fn automatic_chart_area_stroke(host: crate::ir::ChartHost) -> &'static str {
+    match host {
+        crate::ir::ChartHost::Presentation => "none",
+        crate::ir::ChartHost::Spreadsheet
+        | crate::ir::ChartHost::SpreadsheetChartsheet
+        | crate::ir::ChartHost::WordProcessing => CHART_AREA_OUTLINE,
+    }
+}
+
+/// The Typst `stroke:` argument for a chart's own area outline.
+///
+/// The default is *not* unconditional: chart parts across the corpus declare
+/// `<a:ln><a:noFill/></a:ln>` to suppress the outline, and others declare a line
+/// of their own, so drawing [`CHART_AREA_OUTLINE`] regardless would put a border
+/// on charts that ask for none and the wrong border on charts that ask for
+/// theirs. See [`ChartAreaOutline`] for the fixtures covering each case (#637).
+///
+/// Nor is the automatic case itself one answer: `host` decides it, because
+/// Excel and PowerPoint disagree about what an automatic outline is. See
+/// [`automatic_chart_area_stroke`] (#823).
+fn chart_area_stroke(outline: &ChartAreaOutline, host: crate::ir::ChartHost) -> String {
+    match outline {
+        ChartAreaOutline::Default => automatic_chart_area_stroke(host).to_string(),
+        ChartAreaOutline::Suppressed => "none".to_string(),
+        // A width or colour the file left out, or one the host theme cannot
+        // resolve, falls back to the automatic one rather than to nothing:
+        // the file did ask for *a* line.
+        ChartAreaOutline::Explicit { width_pt, color } => format!(
+            "{}pt + {}",
+            format_f64(width_pt.unwrap_or(CHART_AUTOMATIC_LINE_PT)),
+            rgb(&color.unwrap_or(CHART_AUTOMATIC_LINE_COLOR))
+        ),
+    }
+}
+
+/// The Typst `fill:` argument for the outermost chart-area box.
+///
+/// A stated solid fill belongs to the full chart space, including its title.
+/// Both an absent fill and explicit `noFill` preserve today's transparent
+/// output, while remaining distinct in the IR for host defaults (#1217).
+fn chart_area_fill(fill: &ChartAreaFill) -> String {
+    match fill {
+        ChartAreaFill::Unspecified | ChartAreaFill::Transparent => "none".to_string(),
+        ChartAreaFill::Solid(color) => format!("rgb({}, {}, {})", color.r, color.g, color.b),
+    }
+}
+
+/// The width and colour [`CHART_AUTOMATIC_LINE`] is built from, for an explicit
+/// line that names only one of them.
+const CHART_AUTOMATIC_LINE_PT: f64 = 0.75;
+const CHART_AUTOMATIC_LINE_COLOR: Color = Color {
+    r: 134,
+    g: 134,
+    b: 134,
+};
+
+/// Share of the tick-label font's ascent one major tick mark is long.
+///
+/// Office sizes a tick against the face labelling the axis rather than at a
+/// fixed length. Measured on its own exports: Calibri at 10/12/18/36pt gives
+/// 3.17/3.81/5.71/11.42pt and Arial at 10/18pt gives 3.02/5.43pt, each within
+/// 0.006pt of `size * usWinAscent / unitsPerEm / 3` for that face (issue #672).
+const CHART_TICK_ASCENT_FRACTION: f64 = 1.0 / 3.0;
+
+/// Ascent of Calibri over its em — the face Office labels chart axes with.
+///
+/// The tick labels' own faces are not resolved here, so every axis is measured
+/// against the default one.
+const CHART_LABEL_ASCENT_RATIO: f64 = 1950.0 / 2048.0;
+
+/// Size every chart label prints at when the file declares no text properties.
+///
+/// Office's chart default is 10pt, and it is one size for the whole chart: the
+/// value tick labels, the category labels and the legend entries all take it.
+/// Three separate constants — 8pt for the value labels, 9pt for the bar plot's
+/// categories, 8pt for the line plot's — put the labels at a size no file asked
+/// for and left the two axes of one chart disagreeing with each other (#800).
+///
+/// Both references that can be measured against `WithChart.xlsx`, whose
+/// `chart1.xml` carries no `c:txPr`, agree on 10pt: the native Excel export's
+/// tick labels have a 6.24pt cap height, which is 10pt Calibri, and LibreOffice
+/// writes a 10.0pt text matrix for every run on the page.
+///
+/// A chart declaring `c:txPr/a:defRPr@sz` overrides this — see
+/// [`chart_text_pt`] — so it applies only where the file states nothing.
+pub(super) const CHART_DEFAULT_TEXT_PT: f64 = 10.0;
+
+/// The size every string the chart draws takes, from
+/// `c:chartSpace/c:txPr/a:p/a:pPr/a:defRPr@sz`.
+///
+/// The 10pt default stands only for a chart that declares nothing; a chart
+/// asking for 18pt used to render at 10, a little over half the size the file
+/// requested (issue #669).
+pub(super) fn chart_text_pt(chart: &Chart) -> f64 {
+    chart.text_style.size_pt.unwrap_or(CHART_DEFAULT_TEXT_PT)
+}
+
+/// The size of every legend entry, resolving the legend's own `c:txPr` over
+/// the chart space before falling back to the renderer default (issue #1236).
+fn chart_legend_text_pt(chart: &Chart) -> f64 {
+    chart
+        .text_style
+        .resolved_size_pt(chart.legend_text_style)
+        .unwrap_or(CHART_DEFAULT_TEXT_PT)
+}
+
+fn chart_legend_text_is_bold(chart: &Chart) -> bool {
+    chart
+        .text_style
+        .resolved_bold(chart.legend_text_style)
+        .unwrap_or(false)
+}
+
+/// The size one axis' own labels take, honouring the `c:catAx`/`c:valAx`
+/// `c:txPr` that overrides the chart space's.
+pub(super) fn chart_axis_text_pt(chart: &Chart, axis: crate::ir::ChartTextStyle) -> f64 {
+    chart
+        .text_style
+        .resolved_size_pt(axis)
+        .unwrap_or(CHART_DEFAULT_TEXT_PT)
+}
+
+/// The `weight:` argument one axis' labels take, as a leading `, weight: …`
+/// fragment or the empty string.
+///
+/// `a:defRPr@b` on a `c:catAx` was dropped entirely, so bold category labels
+/// rendered regular while the data labels beside them — which carry their own
+/// weight — kept theirs (issue #669).
+pub(super) fn chart_axis_text_weight(
+    chart: &Chart,
+    axis: crate::ir::ChartTextStyle,
+) -> &'static str {
+    if chart.text_style.resolved_bold(axis).unwrap_or(false) {
+        ", weight: \"bold\""
+    } else {
+        ""
+    }
+}
+
+/// The declared text colour for an axis' labels, as a Typst `text` argument.
+///
+/// Empty where the chart declares nothing, so a chart that says nothing keeps
+/// the colour it has always been drawn in rather than being forced to a
+/// default this crate invented (issue #916).
+pub(super) fn chart_axis_text_fill(chart: &Chart, axis: crate::ir::ChartTextStyle) -> String {
+    match chart.text_style.resolved_fill(axis) {
+        (Some(color), alpha) => format!(", fill: {}", chart_text_paint(&color, alpha)),
+        (None, _) => String::new(),
+    }
+}
+
+/// A chart text colour as a Typst paint, composited at the opacity its
+/// `<a:alpha>` declared.
+///
+/// Without this the 70%-opaque axis labels of the deck in #1220 printed at
+/// their colour's own full strength, which reads as a heavier and darker axis
+/// than either PowerPoint or LibreOffice draws (issue #1677). This is the same
+/// treatment #1274 gave a chart line and #1180 gave a shape run.
+fn chart_text_paint(color: &Color, alpha: Option<f64>) -> String {
+    match alpha {
+        Some(alpha) => fmt::rgb_with_alpha(color, (alpha.clamp(0.0, 1.0) * 255.0).round() as u8),
+        None => fmt::rgb(color),
+    }
+}
+
+/// Character spacing one axis' labels declare, as Typst text arguments.
+///
+/// DrawingML adds `spc` between glyphs and disables normal pair adjustment.
+/// Keeping ligatures or kerning enabled would swallow or distort part of that
+/// declared spacing, as it does for ordinary PowerPoint text (issue #1011).
+pub(super) fn chart_axis_text_tracking(chart: &Chart, axis: crate::ir::ChartTextStyle) -> String {
+    match chart.text_style.resolved_letter_spacing(axis) {
+        Some(spacing) if spacing != 0.0 => format!(
+            ", tracking: {}pt, ligatures: false, kerning: false",
+            format_f64(spacing)
+        ),
+        _ => String::new(),
+    }
+}
+
+/// Colour a data label is set in.
+///
+/// Unlike an axis label this has always had a colour — a hardcoded white,
+/// chosen because a bar-end label sits on the bar. A chart that declares one
+/// overrides it; a chart that declares nothing keeps the white it had, so no
+/// existing output moves (issue #916).
+pub(super) fn chart_data_label_fill(chart: &Chart) -> String {
+    match chart.text_style.color {
+        Some(color) => chart_text_paint(&color, chart.text_style.alpha),
+        None => "white".to_string(),
+    }
+}
+
+/// Every `text` argument an axis label carries beyond its size: weight,
+/// colour, then character spacing. One slot so a label's format string does
+/// not grow a hole per property (issues #916 and #1011).
+pub(super) fn chart_axis_text_attrs(chart: &Chart, axis: crate::ir::ChartTextStyle) -> String {
+    format!(
+        "{}{}{}",
+        chart_axis_text_weight(chart, axis),
+        chart_axis_text_fill(chart, axis),
+        chart_axis_text_tracking(chart, axis)
+    )
+}
+
+/// Add an explicit axis face with the chart's script fallback chain.
+fn chart_axis_font_attrs(
+    chart: &Chart,
+    axis: crate::ir::ChartTextStyle,
+    family: Option<&str>,
+) -> String {
+    let mut attrs: String = chart_axis_text_attrs(chart, axis);
+    if let Some(family) = family {
+        let _ = write!(
+            attrs,
+            ", font: {}",
+            font_subst::font_for_mixed_script_text(family, &chart.text_sample())
+        );
+    }
+    attrs
+}
+
+fn chart_category_text_attrs(chart: &Chart) -> String {
+    chart_axis_font_attrs(
+        chart,
+        chart.category_axis_text_style,
+        chart.category_axis_text_font_family.as_deref(),
+    )
+}
+
+fn chart_value_text_attrs(chart: &Chart) -> String {
+    chart_axis_font_attrs(
+        chart,
+        chart.value_axis_text_style,
+        chart.value_axis_text_font_family.as_deref(),
+    )
+}
+
+/// Every Typst text argument a legend entry inherits beyond its resolved size.
+fn chart_legend_text_attrs(chart: &Chart) -> String {
+    chart_axis_text_attrs(chart, chart.legend_text_style)
+}
+
+/// Height of the box that vertically centres one value tick label on its
+/// gridline, as a multiple of the text size.
+///
+/// The box was a flat 10pt around 8pt text; keeping that 1.25x relationship
+/// means the larger text still centres on the gridline instead of the box
+/// clipping it or the label drifting off the tick.
+const CHART_LABEL_BOX_RATIO: f64 = 1.25;
+
+/// Top-edge placement of a PowerPoint horizontal value-axis label box.
+///
+/// The old flat 4pt placement ignores the resolved label size. A fixed plus
+/// text-scaled model fitted to native PowerPoint 16.112 exports at 10, 12, 18,
+/// 24, and 36pt, translated through Typst's size-scaled ink overhang, keeps the
+/// native 18pt #841 glyph top aligned and the other measured sizes within
+/// 0.35pt.
+const PPTX_HORIZONTAL_VALUE_LABEL_GAP_PT: f64 = 3.8602445;
+const PPTX_HORIZONTAL_VALUE_LABEL_GAP_EM: f64 = 0.738435;
+
+/// Top-edge placement of an embedded Excel worksheet bar chart's horizontal
+/// value-axis label box, measured from the inner plot's bottom edge.
+///
+/// The #1266 flat 7.65pt (a single 10pt measurement, no size term) undershoots
+/// a fresh native Excel for Mac 16.112 export of the same `issue_1181_fit_to_
+/// height.xlsx` income/expense bar charts (#1622) by ~0.6-0.8pt printed at the
+/// sheet's 0.78 fit scale, i.e. ~1pt in the chart's own unscaled sheet points.
+/// Isolating the value-axis font size with `assets/validation/issue-1622/`
+/// (one-factor `office` backend probes patching only `c:valAx/c:txPr` on the
+/// income chart) gives two clean, uncontaminated native measurements — 8pt and
+/// 10pt; 12pt and 14pt make native re-layout the plot itself and cannot
+/// isolate this term. Subtracting the same Typst box's own top-to-baseline
+/// offset (measured via `typst compile` with the chart's real Trebuchet MS
+/// font stack: 0.7373047pt per declared point, confirmed linear at 8/10/14pt)
+/// from each native measurement leaves a required gap of 8.131547pt at 8pt
+/// and 8.656938pt at 10pt — not flat, so (like the PowerPoint sibling above)
+/// it needs a size term. Two points fit a line exactly, so the slope below is
+/// that two-point fit, not an independently confirmed linear model; no third
+/// clean point was available to check it.
+///
+/// This value is Trebuchet MS's own box-top-to-baseline offset folded in. A
+/// value-axis face whose box metric differs from Trebuchet MS's — including
+/// the built-in fallback the `office2pdf` lib test harness's font search
+/// silently substitutes when it cannot find a real Trebuchet MS — carries a
+/// proportional residual against this constant.
+const EXCEL_WORKSHEET_HORIZONTAL_VALUE_LABEL_GAP_PT: f64 = 6.029984;
+const EXCEL_WORKSHEET_HORIZONTAL_VALUE_LABEL_GAP_EM: f64 = 0.262695;
+
+/// Height of the box holding one value tick label set at `text_pt`.
+fn chart_label_box_h(text_pt: f64) -> f64 {
+    text_pt * CHART_LABEL_BOX_RATIO
+}
+
+fn horizontal_value_label_gap(chart: &Chart) -> f64 {
+    if matches!(chart.host, crate::ir::ChartHost::Presentation)
+        && matches!(chart.chart_type, ChartType::Bar)
+    {
+        PPTX_HORIZONTAL_VALUE_LABEL_GAP_PT
+            + PPTX_HORIZONTAL_VALUE_LABEL_GAP_EM
+                * chart_axis_text_pt(chart, chart.value_axis_text_style)
+    } else if matches!(chart.host, crate::ir::ChartHost::Spreadsheet)
+        && matches!(chart.chart_type, ChartType::Bar)
+    {
+        EXCEL_WORKSHEET_HORIZONTAL_VALUE_LABEL_GAP_PT
+            + EXCEL_WORKSHEET_HORIZONTAL_VALUE_LABEL_GAP_EM
+                * chart_axis_text_pt(chart, chart.value_axis_text_style)
+    } else {
+        4.0
+    }
+}
+
+/// The value every major unit of an axis reaching `nice_max` in `step`s sits
+/// on, from zero to the maximum inclusive.
+///
+/// The gridlines, the tick labels, and the tick marks all have to land on the
+/// same units, and stepping a float accumulates error, so they walk one list
+/// rather than each repeating the accumulation.
+fn major_units(nice_max: f64, step: f64) -> Vec<f64> {
+    let mut units: Vec<f64> = Vec::new();
+    let mut unit: f64 = 0.0;
+    // The accumulated error can leave the last unit a hair over `nice_max`,
+    // which would drop the axis' top gridline and label.
+    while unit <= nice_max + step * 1e-6 {
+        units.push(unit);
+        unit += step;
+    }
+    units
+}
+
+/// Length of a major tick mark on an axis labelled at `label_size_pt`.
+fn chart_major_tick_length(label_size_pt: f64) -> f64 {
+    label_size_pt * CHART_LABEL_ASCENT_RATIO * CHART_TICK_ASCENT_FRACTION
+}
+
+/// How far an axis' major ticks reach away from the plot and back into it, or
+/// `None` when the axis asks for no ticks at all.
+///
+/// `in` and `out` are the same length on opposite sides of the axis line, and
+/// `cross` is both at once rather than that length split between them: on
+/// PowerPoint's export of `tests/fixtures/pptx/bar-chart.pptx` the axis sits at
+/// y=390.10 and the ticks run 390.10..395.81 for `out`, 384.39..390.10 for `in`,
+/// and 384.39..395.81 for `cross` — 5.71pt each way, so a crossing tick is twice
+/// as long overall (issue #672).
+fn tick_reach(mark: AxisTickMark, label_size_pt: f64) -> Option<(f64, f64)> {
+    let length: f64 = chart_major_tick_length(label_size_pt);
+    match mark {
+        AxisTickMark::None => None,
+        AxisTickMark::Inside => Some((0.0, length)),
+        AxisTickMark::Outside => Some((length, 0.0)),
+        AxisTickMark::Cross => Some((length, length)),
+    }
+}
+
+/// Stroke the axis line down the plot's left edge.
+///
+/// The bar family used to stroke exactly one of its two edges: the left one
+/// when the bars ran horizontally and the bottom one when they ran vertically.
+/// Both of those are the category axis, so the value axis went unstroked in
+/// either orientation (issue #672).
+fn write_left_axis_line(out: &mut String, plot_x: f64, plot_y: f64, plot_h: f64, stroke: &str) {
+    let _ = writeln!(
+        out,
+        "#place(top + left, dx: {}pt, dy: {}pt, line(end: (0pt, {}pt), stroke: {}))",
+        format_f64(plot_x),
+        format_f64(plot_y),
+        format_f64(plot_h),
+        stroke
+    );
+}
+
+/// Stroke the axis line along the plot's bottom edge, at `axis_y`.
+fn write_bottom_axis_line(out: &mut String, plot_x: f64, axis_y: f64, plot_w: f64, stroke: &str) {
+    let _ = writeln!(
+        out,
+        "#place(top + left, dx: {}pt, dy: {}pt, line(end: ({}pt, 0pt), stroke: {}))",
+        format_f64(plot_x),
+        format_f64(axis_y),
+        format_f64(plot_w),
+        stroke
+    );
+}
+
+/// Stroke one major tick across the axis line running under the plot, at `x`:
+/// `outward` reaches below the axis and `inward` back up into the plot.
+fn write_tick_under_plot(
+    out: &mut String,
+    x: f64,
+    axis_y: f64,
+    (outward, inward): (f64, f64),
+    stroke: &str,
+) {
+    let _ = writeln!(
+        out,
+        "#place(top + left, dx: {}pt, dy: {}pt, line(end: (0pt, {}pt), stroke: {}))",
+        format_f64(x),
+        format_f64(axis_y - inward),
+        format_f64(outward + inward),
+        stroke
+    );
+}
+
+/// Stroke one major tick across the axis line running down the plot's left
+/// edge, at `y`: `outward` reaches left of the axis and `inward` back into the
+/// plot.
+/// Where a secondary value axis' furniture goes: the plot it runs beside and
+/// the band its tick labels print in, right of the plot.
+#[derive(Clone, Copy)]
+struct SecondaryAxisPlacement {
+    plot_x: f64,
+    plot_y: f64,
+    plot_w: f64,
+    plot_h: f64,
+    /// Clearance between the plot's right edge and the label band.
+    label_gap: f64,
+    /// Width of the label band.
+    label_w: f64,
+}
+
+/// Draw a secondary value axis down the plot's right edge: one tick label per
+/// major unit, left-aligned in the band beyond the plot, then the axis line
+/// and the tick marks it declares (issue #1374).
+///
+/// The native exports of the #1220 deck print the right-hand labels
+/// left-aligned with their first glyph a few points clear of the plot, the
+/// mirror of the primary axis' right-aligned labels on the left.
+///
+/// TODO(axPos): a secondary axis declaring `<c:axPos val="l"/>` is drawn on
+/// the right as well; a primary axis on the right is not modelled either.
+fn write_secondary_value_axis(
+    out: &mut String,
+    chart: &Chart,
+    axis: &crate::ir::ChartSecondaryValueAxis,
+    scale: ValueScale,
+    placement: SecondaryAxisPlacement,
+) {
+    let SecondaryAxisPlacement {
+        plot_x,
+        plot_y,
+        plot_w,
+        plot_h,
+        label_gap,
+        label_w,
+    } = placement;
+    let text_pt: f64 = chart_axis_text_pt(chart, axis.text_style);
+    let label_box_h: f64 = chart_label_box_h(text_pt);
+    let text_attrs: String =
+        chart_axis_font_attrs(chart, axis.text_style, axis.text_font_family.as_deref());
+    let number_format: Option<&str> =
+        value_axis_number_format(chart, crate::ir::ChartValueAxisRole::Secondary);
+    let axis_x: f64 = plot_x + plot_w;
+    let ticks: Vec<f64> = scale.ticks();
+    for tick in &ticks {
+        let y: f64 = plot_y + (1.0 - scale.fraction(*tick)) * plot_h;
+        let _ = writeln!(
+            out,
+            "#place(top + left, dx: {}pt, dy: {}pt, box(width: {}pt, height: {}pt)[#align(left + horizon)[#text(size: {}pt{})[{}]]])",
+            format_f64(axis_x + label_gap),
+            format_f64(y - label_box_h / 2.0),
+            format_f64(label_w),
+            format_f64(label_box_h),
+            format_f64(text_pt),
+            text_attrs,
+            escape_typst(&chart_value_label_formatted(*tick, number_format))
+        );
+    }
+    let Some(stroke) = chart_chrome_stroke(axis.line) else {
+        return;
+    };
+    let _ = writeln!(
+        out,
+        "#place(top + left, dx: {}pt, dy: {}pt, line(end: (0pt, {}pt), stroke: {}))",
+        format_f64(axis_x),
+        format_f64(plot_y),
+        format_f64(plot_h),
+        stroke
+    );
+    if let Some((outward, inward)) = tick_reach(axis.major_tick_mark, text_pt) {
+        // Outward is away from the plot, which on this edge is to the right.
+        for tick in &ticks {
+            let y: f64 = plot_y + (1.0 - scale.fraction(*tick)) * plot_h;
+            let _ = writeln!(
+                out,
+                "#place(top + left, dx: {}pt, dy: {}pt, line(end: ({}pt, 0pt), stroke: {}))",
+                format_f64(axis_x - inward),
+                format_f64(y),
+                format_f64(outward + inward),
+                stroke
+            );
+        }
+    }
+}
+
+fn write_tick_left_of_plot(
+    out: &mut String,
+    axis_x: f64,
+    y: f64,
+    (outward, inward): (f64, f64),
+    stroke: &str,
+) {
+    let _ = writeln!(
+        out,
+        "#place(top + left, dx: {}pt, dy: {}pt, line(end: ({}pt, 0pt), stroke: {}))",
+        format_f64(axis_x - outward),
+        format_f64(y),
+        format_f64(outward + inward),
+        stroke
+    );
+}
+
+const PLOT_MAIN: f64 = 300.0; // value-axis length in points
+pub(super) const ROW: f64 = 34.0; // per-category thickness
+pub(super) const LABEL_W: f64 = 62.0; // category label gutter
+pub(super) const TICK_GAP: f64 = 22.0; // value tick label gutter
+pub(super) const GAP: f64 = 6.0;
+const LEGEND_ROW_H: f64 = 14.0; // per-entry height when the legend stacks
+/// PowerPoint's three-entry column legend on page 8 of the #1407 fixture uses
+/// a 19.2pt baseline pitch for its declared 11.97pt face. Keep the calibrated
+/// 1.6em relationship on that host/chart-family/edge only: horizontal bar legends
+/// use a separately measured automatic-layout regime (#1434).
+const PPTX_COLUMN_RIGHT_LEGEND_ROW_EM: f64 = 1.6;
+/// Floor for one entry's width in a legend that runs across the chart outside
+/// the measured Excel regime, and the flat width a legend down the side
+/// reserves for its gutter.
+///
+/// It was the horizontal pitch itself until #827: every entry advanced by it,
+/// so a name wider than 78pt ran under its neighbour. A horizontal entry now
+/// takes the greater of this and what its own text measures — see
+/// [`legend_entry_widths`] — which leaves a legend of short names exactly where
+/// it was. An Excel worksheet axis chart whose labels can be measured takes no
+/// floor at all: native Excel advances a 6pt or a four-letter entry by its own
+/// text, and this floor held such rows 12pt left of the export (#1616).
+pub(super) const LEGEND_ENTRY_W: f64 = 78.0;
+
+/// PowerPoint's automatic chart layout combines a fixed edge clearance with a
+/// text-scaled one: 6.505pt plus 0.927 times the resolved size. These
+/// coefficients come from native PowerPoint 16.112 exports of
+/// `bar-chart.pptx` at 10, 12, 18, 24, and 36pt chart-space text. They size the
+/// plot chrome only; [`powerpoint_nice_axis`] separately scales the horizontal
+/// PowerPoint value axis. A vertical PowerPoint value axis still picks its own
+/// maximum and step; only the rectangle it runs down is measured, by
+/// [`PPTX_TITLE_BAND_PT`] and [`CHART_TICK_BAND_BASE_PT`] (issue #1437).
+const CHART_LABEL_EDGE_PAD_PT: f64 = 6.505;
+const CHART_LABEL_EDGE_PAD_EM: f64 = 0.927;
+///
+/// `CHART_LEGEND_BASE_PAD_PT` survives #1663's column measurements unchanged —
+/// the native band beside a column plot is the widest legend label plus
+/// 23.009pt plus twice the key's own side — while `CHART_LEGEND_PAD_EM` turns
+/// out to be a bar-family stand-in for that key term, which is a share of the
+/// *face's* line box rather than of the size. See
+/// [`powerpoint_column_legend_key_band_pt`].
+const CHART_LEGEND_BASE_PAD_PT: f64 = 23.008;
+const CHART_LEGEND_PAD_EM: f64 = 1.605;
+
+/// The side PowerPoint gives a square legend key where the legend face cannot
+/// be measured, as a multiple of chart text.
+///
+/// It is [`LEGEND_KEY_LINE_BOX_SHARE`] of Calibri's own line box, which is what
+/// the five native PowerPoint 16.112 exports of `bar-chart.pptx` at 10, 12, 18,
+/// 24 and 36pt chart text measured before the face term was separated out
+/// (#804): the theme's minor font supplies Calibri to all five. A
+/// font-search-free build (notably wasm) resolves no metrics for an arbitrary
+/// family, and sizing the key from the deck's declared size alone is closer
+/// than sizing it from whatever substitute the runner happens to hold.
+pub(super) const PPTX_LEGEND_KEY_EM: f64 =
+    LEGEND_KEY_LINE_BOX_SHARE * (CALIBRI_CHART_LINE_METRICS_EM.0 + CALIBRI_CHART_LINE_METRICS_EM.1);
+
+/// The visible space PowerPoint leaves between a legend key and its label:
+/// half the key's own side, less a fixed 0.375pt.
+///
+/// Measured from the key's right edge to the label's first pen position, which
+/// is what `#h()` sets. The seven-face sweep of
+/// `scripts/probes/issue-1439-legend-key-face.json` holds this pair to
+/// 0.0006pt at 18pt chart text — 4.1104pt in Times New Roman against 4.5694pt
+/// in Calibri, each exactly half its own key — and Excel's chartsheet export
+/// agrees independently: a 4.9433pt key at 9pt is followed by 2.0967pt
+/// (#1315, #1439).
+pub(super) const PPTX_LEGEND_KEY_LABEL_GAP_PT: f64 = -0.375;
+pub(super) const PPTX_LEGEND_KEY_LABEL_GAP_KEY_SHARE: f64 = 0.5;
+const PPTX_LEGEND_RIGHT_EDGE_PAD_PT: f64 = 10.127;
+
+/// Vertical correction for a PowerPoint right-side legend centred beside a
+/// horizontal axis plot. The generic side stack also sees the bottom tick
+/// label band and therefore lands progressively lower as chart text grows.
+///
+/// A fixed plus text-scaled correction fitted to native PowerPoint 16.112
+/// exports at 10, 12, 18, 24, and 36pt keeps every key top within 0.002pt.
+pub(super) const PPTX_RIGHT_LEGEND_Y_SHIFT_PT: f64 = 1.579;
+pub(super) const PPTX_RIGHT_LEGEND_Y_SHIFT_EM: f64 = -0.357249;
+
+/// The same correction for a *column* plot, whose content box ends in the
+/// category label band rather than the value tick band and so centres the
+/// generic side stack lower still.
+///
+/// PowerPoint puts the right legend at one page position per chart size,
+/// whichever way the bars run: repackaging `tests/fixtures/pptx/bar-chart.pptx`
+/// as a column chart through
+/// `scripts/probes/issue-1435-column-legend-center.json` moves its 18pt legend
+/// key nowhere at all — native `y[282.7380, 292.6268]` for both families. The
+/// two corrections differ only because our own content box does, so this pair
+/// is fitted separately against the same native exports at 10, 12, 18 and
+/// 24pt, where it holds every key top to 0.002pt (#1435).
+///
+/// The 36pt export is deliberately outside the fit. There PowerPoint wraps the
+/// category labels onto a second line and labels only `0`, `5` and `10` on the
+/// plot that leaves it. We wrap them the same way since #1675, but still label
+/// every unit, so our plot rectangle, not the legend rule, carries what is left
+/// of the residual, and that is tracked by #1873.
+///
+/// The pair is fitted against the content box as #1435 measured it, so
+/// [`powerpoint_right_legend_y_shift`] gives back half of whatever #1437's
+/// measured band later moved that box's top by. Refitting the pair instead
+/// cannot work: it is a function of the legend's size, while the band moves
+/// with the title's and the value axis', and page 8 of the #1220 deck sizes
+/// those differently.
+const PPTX_COLUMN_RIGHT_LEGEND_Y_SHIFT_PT: f64 = -7.920088;
+const PPTX_COLUMN_RIGHT_LEGEND_Y_SHIFT_EM: f64 = 0.139188;
+/// Downward correction after a PowerPoint column's title takes its measured
+/// title band. The corrected key bounds match the native exports from the
+/// #1435 chart-space and #1437 title-size sweeps; PDF hashes and measurements
+/// are recorded in `tests/visual_audits/issue-1678/legend-key-measurements.json`.
+const PPTX_COLUMN_TITLE_LEGEND_Y_SHIFT_PT: f64 = 5.422;
+
+/// Band a chart-area title takes when the chart space states a size and the
+/// title does not, *plus* the top inset a bar plot keeps on its own account.
+///
+/// [`axis_plot_insets`] reserves nothing for the bar family, so the two are
+/// fitted together here. A column plot on a slide reserves an inset of its
+/// own and therefore cannot use this band — it would count the bar's a second
+/// time — and takes [`PPTX_TITLE_BAND_PT`] instead (issue #1437).
+const CHART_PLOT_TOP_PAD_PT: f64 = 19.84;
+const CHART_PLOT_TOP_PAD_EM: f64 = 1.465;
+
+/// Fixed part of the band PowerPoint reserves under a plot for the one flat
+/// line of labels that sits there, whichever axis owns them.
+///
+/// Fitted on the #706 bar exports, where the labels are the value ticks.
+/// Re-measuring the *category* band on the #1437 column exports of the same
+/// deck — 25.052, 28.767, 39.902 and 51.028pt at 10, 12, 18 and 24pt — gives
+/// `6.5009 + 1.8554 em`, which reproduces this pair to 0.08pt, so both
+/// families read it (issue #1437).
+///
+/// #1674 identified what that shared line is: `6.5pt` plus the label's own
+/// line and one clearance, both of them shares of the face. A column plot on
+/// a slide reads [`ChartFaceLineBox::category_band_pt`] instead wherever its
+/// face resolves, and this pair is what a build resolving none falls back to.
+/// The bar family and the spreadsheet hosts keep it outright: no face sweep
+/// covers either (issue #1674).
+const CHART_TICK_BAND_BASE_PT: f64 = 6.58;
+const CHART_TICK_BAND_EM: f64 = 1.855;
+
+/// Left gutter of a column plot whose value labels run down that edge, where
+/// the labels themselves cannot be measured.
+///
+/// Native PowerPoint exports of the #841 column chart reserve 40.805pt at
+/// 10pt, 47.064pt at 12pt, and 84.633pt at 24pt. (The 18pt export switches to
+/// another automatic layout regime, so it is deliberately not fitted here.)
+/// Unlike a bar plot's bottom band this is a text-width relationship, so it
+/// needs its own calibration.
+///
+/// #1663 identified what this pair was standing in for: the gutter is
+/// [`EXCEL_VALUE_LABEL_EDGE_PAD_PT`] plus the widest label's own advance plus a
+/// face clearance, and the #841 chart's three-glyph `80%` labels declare
+/// `spc="100"`, so its 6.5pt frame pad plus 3 x 1pt of tracking is exactly
+/// this 9.5. A PowerPoint column chart whose labels and face resolve now uses
+/// [`powerpoint_column_value_gutter`]; the fit stays for the Word host, which
+/// no probe covers, and for a build that can measure no face at all.
+const CHART_COLUMN_VALUE_GUTTER_PT: f64 = 9.5;
+const CHART_COLUMN_VALUE_GUTTER_EM: f64 = 3.13;
+
+/// Insets PowerPoint keeps at the top and right of a framed column plot.
+///
+/// Across the native #841 exports the right edge remains 11pt inside the chart
+/// frame, while the top edge follows `5pt + 0.607em`. Excel worksheet charts
+/// use the separate native model below; the shared right inset already agrees
+/// with the audited Excel frame.
+///
+/// The right inset is the *legend-free* case, which
+/// `scripts/probes/issue-1663-column-legend-absent.json` measures at exactly
+/// 11.000pt. Where a legend runs down the right edge it spends the whole band
+/// instead — see [`powerpoint_column_legend_key_band_pt`] (issue #1663).
+///
+/// The top inset's `0.607em` is half of Calibri's own line box, which is the
+/// only face the #841 exports carry. It is [`ChartFaceLineBox::plot_top_inset_pt`]
+/// wherever a face resolves, and stays here as that path's fallback and as the
+/// box [`powerpoint_right_legend_y_shift`]'s pair was fitted against
+/// (issue #1674).
+const CHART_COLUMN_RIGHT_PAD_PT: f64 = 11.0;
+const CHART_COLUMN_TOP_PAD_PT: f64 = 5.0;
+const CHART_COLUMN_TOP_PAD_EM: f64 = 0.607;
+
+/// Vertical chrome around an automatic Excel worksheet column plot.
+///
+/// Re-zip-controlled native Excel for Mac 16.112 exports of the #1250 workbook
+/// isolate four factors. The top inset stays at 11pt through a 9pt value
+/// axis, then grows by two thirds of a point per additional text point. With
+/// category and legend text at 9pt, suppressing their bands extends the plot by
+/// 13.943pt and 23.850pt respectively; the remaining 11pt is Excel's fixed
+/// bottom edge pad, the same flat inset it keeps at the top and right. Size
+/// sweeps make those two bands grow by 2.05pt and 79/60pt per text point. A
+/// frame-height sweep moves the bottom edge 1:1, so none of these quantities
+/// is a share of the frame.
+///
+/// Both edge insets are measured in sheet points from the frame Excel paints.
+/// The #1250 fit read 10.146pt and 11.853pt because the converter then seated
+/// the plot on its physical page origin, 0.854 sheet points below that frame
+/// at the 0.82 fit scale; the unscaled control of #1607, where the two origins
+/// coincide, and the 0.78 export of #1272 both read a whole 11pt.
+const EXCEL_COLUMN_TOP_INSET_AT_NINE_PT: f64 = 11.0;
+const EXCEL_COLUMN_TOP_INSET_GROWTH_EM: f64 = 2.0 / 3.0;
+const EXCEL_COLUMN_BOTTOM_EDGE_PAD_PT: f64 = 11.0;
+const EXCEL_COLUMN_CATEGORY_BAND_AT_NINE_PT: f64 = 13.943;
+const EXCEL_COLUMN_CATEGORY_BAND_GROWTH_EM: f64 = 2.05;
+const EXCEL_BOTTOM_LEGEND_BAND_AT_NINE_PT: f64 = 23.850;
+const EXCEL_BOTTOM_LEGEND_BAND_GROWTH_EM: f64 = 79.0 / 60.0;
+
+/// Chart-local correction for a 9pt category-label band under a worksheet-
+/// hosted Excel plot after its native bottom chrome is reserved.
+///
+/// A native Excel for Mac 16.112.2 export of `Gift Budget and Tracker1.xlsx`
+/// puts the label box at 257.536pt in the chart-local frame. Once #1250 gives
+/// the plot its native 259.180pt bottom edge, that is a -3.644pt correction
+/// from the generic 2pt gap. Four one-factor size probes establish the integer
+/// chart-grid response around that 9pt anchor.
+const EXCEL_CATEGORY_LABEL_BASE_Y_SHIFT_PT: f64 = -3.644;
+
+/// Chart-local correction for a 9pt bottom legend after its native 23.850pt
+/// band is reserved. The band moves the generic row origin 3.850pt upward, so
+/// the old -5.141pt correction became -1.291pt without moving the text. The
+/// legend row is seated from the frame's bottom edge, so once the chart
+/// content shares the frame's fitted origin, 0.853 sheet points above the
+/// physical one that correction was taken on, the same native baseline needs
+/// -0.438pt (#1607).
+const EXCEL_BOTTOM_LEGEND_BASE_Y_SHIFT_PT: f64 = -0.438;
+const EXCEL_BOTTOM_LEGEND_Y_SHIFT_GROWTH_EM: f64 = 37.0 / 60.0;
+
+/// Clearance under the longest 45deg category label in a framed column plot.
+///
+/// On the native #841 export, the longest label's rotated advance consumes
+/// 147.86pt and the chart leaves another 3.23pt before the frame edge.
+const CHART_ROTATED_LABEL_EDGE_PAD_PT: f64 = 3.225;
+
+/// Vertical seat correction for a rotated PowerPoint category-label box.
+///
+/// Typst rotates the box around its top-right content edge, while PowerPoint
+/// seats the text on a baseline before applying the same 45-degree transform.
+/// On slide 14 of the #841 deck the resulting four glyph baselines are all
+/// 8.12..8.98pt low at 11.97pt. Advancing the rotated pivot by 0.74em restores
+/// their common native top edge without changing the plot or horizontal
+/// anchors (#1014; the horizontal anchor gained its own inset later, #1022).
+/// This sign follows the post-rotation PDF transform: a larger
+/// Typst `dy` moves these -45-degree glyph baselines upward in PDF coordinates.
+const PPTX_ROTATED_CATEGORY_LABEL_Y_SHIFT_EM: f64 = 0.74;
+
+/// Horizontal inset PowerPoint keeps between a band's centre and the rotated
+/// label's trailing end.
+///
+/// With the vertical seat corrected (#1014), all four rotated label runs on
+/// slide 14 of the #841 deck still land 3.32–3.35pt right of the fresh native
+/// export at 11.97pt while their baselines agree to ±0.13pt — a uniform
+/// horizontal displacement of the pivot itself, not a slant-axis offset,
+/// which would move the baselines with it (#1022).
+const PPTX_ROTATED_CATEGORY_LABEL_X_INSET_EM: f64 = 0.279;
+
+/// Native Office-face advances used by the PowerPoint chart calibrations.
+///
+/// Plot chrome is part of the source document's layout, so it must not move
+/// with the substitute a runner happens to have installed. These are the
+/// regular-face `hmtx` advances, in the fonts' shared 2048-unit em, for Basic
+/// Latin U+0020..=U+007E. They were extracted with
+/// `uv run --with fonttools scripts/extract_font_advances.py FONT`:
+///
+/// - Calibri Regular `Version 6.20;O365`, PowerPoint 16.112's bundled
+///   `/Applications/Microsoft PowerPoint.app/Contents/Resources/DFonts/Calibri.ttf`,
+///   SHA-256
+///   `ea801e1f869b55464339058b1d4263d07cc074a18e20aa3ee1d07901423dee53`;
+/// - Avenir Next LT Pro Regular `Version 3.04;O365`, the Office cloud face
+///   resolved by the #841 deck at
+///   `$HOME/Library/Group Containers/UBF8T346G9.Office/FontCache/4/CloudFonts/Avenir Next LT Pro/26301410506.ttf`,
+///   SHA-256
+///   `0924698340c40827289297ad9b9c5d36d3f91d2e7a7e75e76ae4b8d82c46616a`.
+///
+/// The arrays below are the command's `advances` output. Segoe UI is recorded
+/// separately below; the renderer measures uncalibrated families normally.
+const CALIBRI_CHART_ADVANCE: [u16; 95] = [
+    463, 667, 821, 1020, 1038, 1464, 1397, 452, 621, 621, 1020, 1020, 511, 627, 517, 791, 1038,
+    1038, 1038, 1038, 1038, 1038, 1038, 1038, 1038, 1038, 548, 548, 1020, 1020, 1020, 949, 1831,
+    1185, 1114, 1092, 1260, 1000, 941, 1292, 1276, 516, 653, 1064, 861, 1751, 1322, 1356, 1058,
+    1378, 1112, 941, 998, 1314, 1162, 1822, 1063, 998, 959, 628, 791, 628, 1020, 1020, 596, 981,
+    1076, 866, 1076, 1019, 625, 964, 1076, 470, 490, 931, 470, 1636, 1076, 1080, 1076, 1076, 714,
+    801, 686, 1076, 925, 1464, 887, 927, 809, 644, 943, 644, 1020,
+];
+
+const AVENIR_NEXT_LT_PRO_CHART_ADVANCE: [u16; 95] = [
+    512, 672, 829, 1139, 1188, 1706, 1442, 532, 614, 614, 909, 1364, 532, 655, 532, 758, 1188,
+    1188, 1188, 1188, 1188, 1188, 1188, 1188, 1188, 1188, 614, 614, 1364, 1364, 1364, 987, 1638,
+    1434, 1303, 1475, 1550, 1212, 1151, 1595, 1470, 532, 1008, 1286, 1044, 1815, 1565, 1741, 1188,
+    1726, 1227, 1155, 1167, 1454, 1276, 1991, 1329, 1233, 1171, 614, 758, 614, 1364, 1024, 492,
+    1094, 1305, 1024, 1305, 1171, 604, 1294, 1194, 512, 514, 1044, 516, 1808, 1190, 1251, 1300,
+    1300, 737, 909, 649, 1190, 999, 1528, 991, 999, 905, 614, 455, 614, 1364,
+];
+
+/// Segoe UI Regular and Bold, Version 5.67;O365. Source hashes and extraction
+/// commands are recorded in `assets/validation/issue-1603/font-provenance.json`.
+/// These advances keep chart geometry independent of whether Office's cloud
+/// font or the bundled Selawik substitute is available (#1603).
+const SEGOE_UI_CHART_ADVANCE: [u16; 95] = [
+    561, 582, 803, 1210, 1104, 1676, 1639, 471, 618, 618, 854, 1401, 444, 819, 444, 798, 1104,
+    1104, 1104, 1104, 1104, 1104, 1104, 1104, 1104, 1104, 444, 444, 1401, 1401, 1401, 918, 1956,
+    1321, 1174, 1268, 1436, 1036, 1000, 1405, 1454, 545, 731, 1188, 964, 1839, 1532, 1544, 1147,
+    1544, 1225, 1088, 1073, 1407, 1272, 1913, 1208, 1132, 1168, 618, 776, 618, 1401, 850, 549,
+    1042, 1204, 946, 1206, 1071, 641, 1206, 1159, 496, 496, 1018, 496, 1764, 1159, 1200, 1204,
+    1206, 712, 869, 694, 1159, 981, 1480, 940, 991, 926, 618, 490, 618, 1401,
+];
+
+const SEGOE_UI_BOLD_CHART_ADVANCE: [u16; 95] = [
+    565, 670, 1010, 1213, 1178, 1776, 1740, 600, 756, 756, 932, 1448, 555, 828, 555, 908, 1178,
+    1178, 1178, 1178, 1178, 1178, 1178, 1178, 1178, 1178, 555, 555, 1448, 1448, 1448, 897, 1954,
+    1440, 1313, 1278, 1510, 1090, 1065, 1456, 1569, 649, 912, 1329, 1047, 1960, 1618, 1553, 1258,
+    1553, 1337, 1148, 1200, 1481, 1366, 2058, 1342, 1243, 1243, 756, 893, 756, 1448, 850, 643,
+    1102, 1270, 983, 1268, 1108, 785, 1268, 1233, 582, 582, 1145, 582, 1876, 1239, 1252, 1270,
+    1268, 815, 901, 797, 1239, 1110, 1633, 1131, 1102, 981, 756, 668, 756, 1448,
+];
+
+/// The `hhea` ascent and descent of the calibrated faces, in their shared
+/// 2048-unit em, as `(ascent, descent)` with the descent positive.
+///
+/// Read out of the very font files the advance tables above were extracted
+/// from: Calibri 1950/-550 and Avenir Next LT Pro 1972/-512, both with a zero
+/// line gap. [`excel_column_value_gutter_pt`] spends this on the clearance
+/// Excel leaves between a value label and the plot, so a runner without the
+/// face would otherwise size that clearance from whatever substitute it
+/// resolved and move the plot with it.
+const CALIBRI_CHART_LINE_METRICS_EM: (f64, f64) = (1950.0 / 2048.0, 550.0 / 2048.0);
+const AVENIR_NEXT_LT_PRO_CHART_LINE_METRICS_EM: (f64, f64) = (1972.0 / 2048.0, 512.0 / 2048.0);
+
+/// Both Segoe UI faces above have this bare line box and zero line gap.
+const SEGOE_UI_CHART_LINE_METRICS_EM: (f64, f64) = (2210.0 / 2048.0, 514.0 / 2048.0);
+
+/// The `hhea` ascent and descent of `family`, in em units and with the descent
+/// positive, in the source Office face where one is part of the calibration.
+///
+/// The line gap is deliberately left out: it is what separates two lines, not
+/// part of the box one line occupies, and the seven faces this was measured
+/// across only agree once it is excluded (Arial is the one of them that
+/// declares a non-zero gap).
+///
+/// A chart-area title's own band is the one quantity that does include it —
+/// see [`ChartFaceLineBox::leaded_em`]. The two are not in conflict: a title
+/// band is a whole line of text with its leading, while a legend key and a
+/// label clearance are shares of the ink box (issue #1674).
+pub(super) fn chart_face_line_metrics_em(family: &str, bold: bool) -> Option<(f64, f64)> {
+    if let Some((ascent, descent, _)) = calibrated_chart_line_metrics_em(family, bold) {
+        return Some((ascent, descent));
+    }
+    let ascent_em: f64 = crate::render::pdf::font_hhea_ascender_em(family)?;
+    let (_, descent_em, _) = crate::render::pdf::font_line_metrics_em(family)?;
+    Some((ascent_em, descent_em))
+}
+
+/// The line boxes a framed PowerPoint column plot's automatic vertical bands
+/// measure one face by, in em units.
+///
+/// Two boxes, because the three bands do not agree on one. The window box is
+/// OS/2's `usWin*` pair, which is what PowerPoint sizes a chart's line by;
+/// the leaded box adds `hhea`'s line gap, and is the greater of the two.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ChartFaceLineBox {
+    /// OS/2 `usWinAscent`.
+    pub(super) window_ascent_em: f64,
+    /// OS/2 `usWinDescent`, positive.
+    pub(super) window_descent_em: f64,
+    /// The greater of the window box and `hhea`'s ascent + descent + line gap.
+    pub(super) leaded_em: f64,
+}
+
+impl ChartFaceLineBox {
+    /// Assemble the pair from one face's own metrics.
+    pub(super) fn from_face_metrics_em(
+        window_ascent_em: f64,
+        window_descent_em: f64,
+        hhea_leaded_em: f64,
+    ) -> Self {
+        Self {
+            window_ascent_em,
+            window_descent_em,
+            leaded_em: (window_ascent_em + window_descent_em).max(hhea_leaded_em),
+        }
+    }
+
+    /// The whole window box.
+    fn window_em(self) -> f64 {
+        self.window_ascent_em + self.window_descent_em
+    }
+
+    /// The band a chart-area title takes above a framed column plot, in points.
+    ///
+    /// One whole leaded line of the title's own face, over
+    /// [`PPTX_COLUMN_TITLE_BAND_PT`].
+    pub(super) fn title_band_pt(self, title_pt: f64) -> f64 {
+        PPTX_COLUMN_TITLE_BAND_PT + self.leaded_em * title_pt
+    }
+
+    /// The inset the plot keeps above its own top edge, in points.
+    ///
+    /// Half a line of the value axis' face over [`CHART_COLUMN_TOP_PAD_PT`] —
+    /// the half of the topmost tick label's box that sits above the gridline
+    /// it is centred on.
+    pub(super) fn plot_top_inset_pt(self, value_axis_pt: f64) -> f64 {
+        CHART_COLUMN_TOP_PAD_PT
+            + PPTX_COLUMN_PLOT_TOP_INSET_SHARE * self.window_em() * value_axis_pt
+    }
+
+    /// The band the flat category labels take under the plot, in points.
+    ///
+    /// Twice the clearance #1651 measured for a line plot's labels, over
+    /// [`PPTX_COLUMN_CATEGORY_BAND_PT`]: the label's own line plus the same
+    /// clearance again between it and the plot.
+    pub(super) fn category_band_pt(self, category_axis_pt: f64) -> f64 {
+        PPTX_COLUMN_CATEGORY_BAND_PT
+            + (PPTX_COLUMN_CATEGORY_ASCENT_SHARE * self.window_ascent_em + self.window_descent_em)
+                * category_axis_pt
+    }
+
+    /// The band flat category labels take when each is wrapped over `lines`
+    /// lines, in points.
+    ///
+    /// Every line past the first costs one whole leaded line of the label's own
+    /// face, and nothing else: the one-line band already holds the clearance on
+    /// both sides of the block, and the block grows downwards from the first
+    /// baseline, which stays where a single line would have put it.
+    ///
+    /// Twelve native PowerPoint 16.113.1 exports settle both halves
+    /// (`scripts/probes/issue-1675-column-label-wrap.json`,
+    /// `issue-1675-column-label-lines.json`, `issue-1675-column-label-floor.json`,
+    /// `issue-1675-column-label-share.json` and `issue-1675-column-wrap-face.json`),
+    /// over four faces, seven sizes and one to four lines, with no residual past
+    /// 0.011pt. The leaded box is the discriminating half and `Calibri` cannot
+    /// see it — its two boxes are the same 2500/2048em — so `Arial` and
+    /// `Goudy Old Style`, whose boxes differ by a line gap and by 180 units,
+    /// are what say the extra line is leaded rather than the window box the
+    /// one-line band is built from (issue #1675).
+    pub(super) fn wrapped_category_band_pt(self, category_axis_pt: f64, lines: usize) -> f64 {
+        self.category_band_pt(category_axis_pt)
+            + lines.saturating_sub(1) as f64 * self.leaded_em * category_axis_pt
+    }
+}
+
+/// Fixed part of the band a chart-area title takes above a framed PowerPoint
+/// column plot.
+///
+/// Eight title faces at a stated 18pt
+/// (`scripts/probes/issue-1674-column-title-face.json`) each put this at
+/// 9.000pt within 0.003, once the title's own leaded line and
+/// [`ChartFaceLineBox::plot_top_inset_pt`] are taken off. #1437 fitted
+/// `9.0253 + 1.22242 em` across its two Calibri series instead, which is the
+/// same line to 0.03pt in Calibri and nowhere else (issue #1674).
+const PPTX_COLUMN_TITLE_BAND_PT: f64 = 9.0;
+
+/// The share of the value axis' line box a framed column plot keeps above its
+/// own top edge, over [`CHART_COLUMN_TOP_PAD_PT`].
+///
+/// Eight value-axis faces at a stated 18pt
+/// (`scripts/probes/issue-1674-column-value-axis-face.json`) put it between
+/// 0.4990 and 0.5015, with the one outlier the face whose box is nearest
+/// Calibri's and therefore has almost no lever. It is half a line because the
+/// topmost tick label is centred on the plot's top gridline (issue #1674).
+const PPTX_COLUMN_PLOT_TOP_INSET_SHARE: f64 = 0.5;
+
+/// Fixed part of the band a framed PowerPoint column plot reserves under
+/// itself for one flat row of category labels.
+///
+/// This is [`EXCEL_VALUE_LABEL_EDGE_PAD_PT`]'s 6.5pt frame inset, which the
+/// line family's own gutter starts its labels at (#1651), and thirteen faces
+/// land on it within 0.006pt. The #1437 pair `6.5009 + 1.8554 em` is this
+/// model evaluated in Calibri: `5/3 x 1950/2048 + 550/2048` is 1.85546
+/// (issue #1674).
+const PPTX_COLUMN_CATEGORY_BAND_PT: f64 = 6.5;
+
+/// The share of the category face's ascent that band spends, alongside one
+/// whole descent.
+///
+/// The band is twice the `5/6 ascent + 1/2 descent` clearance #1651 measured
+/// between a line plot's value labels and its plot: the label's own line, and
+/// the same clearance again above it. Fitting ascent and descent freely across
+/// the thirteen faces gives 1.66566 and 0.99963 with no face further than
+/// 0.005pt out, which is `5/3` and `1` (issue #1674).
+const PPTX_COLUMN_CATEGORY_ASCENT_SHARE: f64 = 5.0 / 3.0;
+
+/// The line boxes the face `family` resolves to measures a column plot's bands
+/// by, or `None` where no face resolves at all.
+///
+/// The calibrated faces answer from [`calibrated_chart_face_line_box_em`]
+/// first: neither `Calibri` nor `Arial` is installed on every runner, and a
+/// substitute's box is not the box the native exports measured.
+pub(super) fn chart_face_line_box_em(family: &str) -> Option<ChartFaceLineBox> {
+    if let Some(metrics) = calibrated_chart_face_line_box_em(family) {
+        return Some(metrics);
+    }
+    let (window_ascent_em, window_descent_em, hhea_leaded_em) =
+        crate::render::pdf::font_chart_band_metrics_em(family)?;
+    Some(ChartFaceLineBox::from_face_metrics_em(
+        window_ascent_em,
+        window_descent_em,
+        hhea_leaded_em,
+    ))
+}
+
+/// `(usWinAscent, usWinDescent, hhea ascent + descent + line gap)` per 2048em
+/// for the faces this calibration itself rests on.
+///
+/// `Calibri` is the face every probe fixture's theme states and `Arial` is
+/// page 8 of the #1220 deck's, so a build resolving either to a substitute
+/// would be scoring the model against a face it was never measured on. Both
+/// weights are listed once because neither face's `usWin` pair nor its `hhea`
+/// line gap differs between regular and bold, and the sweep — whose title is
+/// bold and whose axes are not — cannot separate them anywhere.
+fn calibrated_chart_face_line_box_em(family: &str) -> Option<ChartFaceLineBox> {
+    let normalized: String = family
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    let (window_ascent, window_descent, leaded) = match normalized.as_str() {
+        "calibri" => (1950.0, 550.0, 2500.0),
+        "arial" => (1854.0, 434.0, 2355.0),
+        _ => return None,
+    };
+    let upem: f64 = 2048.0;
+    Some(ChartFaceLineBox::from_face_metrics_em(
+        window_ascent / upem,
+        window_descent / upem,
+        leaded / upem,
+    ))
+}
+
+/// Keep all three metrics on the calibrated source face; a substitute's gap
+/// cannot be combined with the source face's ascent/descent (#1568).
+fn calibrated_chart_line_metrics_em(family: &str, bold: bool) -> Option<(f64, f64, f64)> {
+    let normalized: String = family
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    if normalized == "segoeui" {
+        let (ascent, descent) = SEGOE_UI_CHART_LINE_METRICS_EM;
+        return Some((ascent, descent, 0.0));
+    }
+    if bold {
+        return None;
+    }
+    let (ascent, descent) = match normalized.as_str() {
+        "calibri" => CALIBRI_CHART_LINE_METRICS_EM,
+        "avenirnextltpro" => AVENIR_NEXT_LT_PRO_CHART_LINE_METRICS_EM,
+        _ => return None,
+    };
+    Some((ascent, descent, 0.0))
+}
+
+/// Advance one chart string in the source Office face where a native metric is
+/// part of the calibration, otherwise in the face rendering resolves locally.
+pub(super) fn chart_text_advance_em(family: &str, bold: bool, text: &str) -> Option<f64> {
+    let normalized: String = family
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    let native: Option<&[u16; 95]> = match (normalized.as_str(), bold) {
+        ("calibri", false) => Some(&CALIBRI_CHART_ADVANCE),
+        ("avenirnextltpro", false) => Some(&AVENIR_NEXT_LT_PRO_CHART_ADVANCE),
+        ("segoeui", false) => Some(&SEGOE_UI_CHART_ADVANCE),
+        ("segoeui", true) => Some(&SEGOE_UI_BOLD_CHART_ADVANCE),
+        _ => None,
+    };
+    if let Some(advances) = native {
+        let units: Option<u32> = text.chars().try_fold(0_u32, |sum, character| {
+            let index: usize = (character as u32).checked_sub(0x20)?.try_into().ok()?;
+            advances.get(index).map(|advance| sum + u32::from(*advance))
+        });
+        if let Some(units) = units {
+            return Some(f64::from(units) / 2048.0);
+        }
+    }
+    crate::render::pdf::text_advance_em(family, bold, text)
+}
+
+/// Space a legend reserves around the plot, and the direction its entries run.
+///
+/// A legend on an edge runs along that edge, so a bottom or top one lays its
+/// entries out left to right and leaves the plot the full frame width — which
+/// is the difference `<c:legendPos val="b"/>` asks for (#546).
+struct LegendBox {
+    left: f64,
+    right: f64,
+    top: f64,
+    bottom: f64,
+    horizontal: bool,
+}
+
+struct LegendEntryLayout<'a> {
+    row_h: f64,
+    widths: &'a [f64],
+    right_inset: Option<(f64, f64)>,
+    side_y_shift: f64,
+    horizontal_end_trim: f64,
+    horizontal_x_shift: f64,
+}
+
+impl LegendBox {
+    /// Reserve nothing, for a chart that declares no legend: the plot then
+    /// gets the whole frame instead of a gutter nothing is drawn in
+    /// (issue #762).
+    fn hidden() -> Self {
+        LegendBox {
+            left: 0.0,
+            right: 0.0,
+            top: 0.0,
+            bottom: 0.0,
+            horizontal: false,
+        }
+    }
+
+    /// Reserve space at `position`, given one stacked entry's height and one
+    /// across-the-edge entry's width. A vertical legend is one column wide and
+    /// a horizontal one is one row tall whatever the entry count, so the count
+    /// only matters when laying the entries out.
+    fn new(position: LegendPosition, row_h: f64, entry_w: f64) -> Self {
+        let horizontal: bool = position.is_horizontal();
+        let side_w: f64 = entry_w + GAP;
+        let edge_h: f64 = row_h + GAP;
+        let mut placement = LegendBox {
+            left: 0.0,
+            right: 0.0,
+            top: 0.0,
+            bottom: 0.0,
+            horizontal,
+        };
+        match position {
+            LegendPosition::Left => placement.left = side_w,
+            LegendPosition::Right | LegendPosition::TopRight => placement.right = side_w,
+            LegendPosition::Top => placement.top = edge_h,
+            LegendPosition::Bottom => placement.bottom = edge_h,
+        }
+        placement
+    }
+
+    /// Top-left of the `index`-th entry.
+    ///
+    /// `content` is the plot *plus* its axis-label gutters, not the bare
+    /// plotting rectangle: a legend under a column chart has to clear the
+    /// category labels, or the two land in the same band.
+    fn entry_origin(
+        &self,
+        position: LegendPosition,
+        index: usize,
+        entries: usize,
+        content: (f64, f64, f64, f64),
+        layout: LegendEntryLayout<'_>,
+    ) -> (f64, f64) {
+        let (content_x, content_y, content_w, content_h) = content;
+        if self.horizontal {
+            // Centre the row of entries under (or over) the content. Each entry
+            // advances by its own width, not by a flat pitch: a name wider than
+            // the pitch used to run under the entry beside it and the two
+            // overprinted into unreadable text (issue #827).
+            let row_w: f64 =
+                (layout.widths.iter().sum::<f64>() - layout.horizontal_end_trim).max(0.0);
+            let start_x: f64 =
+                content_x + (content_w - row_w).max(0.0) / 2.0 + layout.horizontal_x_shift;
+            let y: f64 = match position {
+                LegendPosition::Top => (content_y - self.top).max(0.0),
+                _ => content_y + content_h + GAP,
+            };
+            let offset: f64 = layout.widths.iter().take(index).sum();
+            (start_x + offset, y)
+        } else {
+            let stack_h: f64 = entries as f64 * layout.row_h;
+            let x: f64 = match (position, layout.right_inset) {
+                // `clearance` is measured from the content box's own right
+                // edge, so a plot that reserves space inside the chart area
+                // reports a smaller one — see `powerpoint_right_legend_inset`.
+                (LegendPosition::Right | LegendPosition::TopRight, Some((entry_w, clearance))) => {
+                    (content_x + content_w + self.right - clearance - entry_w)
+                        .max(content_x + content_w)
+                }
+                (LegendPosition::Left, _) => (content_x - self.left).max(0.0),
+                _ => content_x + content_w + GAP,
+            };
+            let y: f64 = match position {
+                // PowerPoint pins a top-right legend to the top edge rather
+                // than centring it.
+                LegendPosition::TopRight => content_y,
+                _ => content_y + (content_h - stack_h).max(0.0) / 2.0,
+            };
+            (x, y + layout.side_y_shift + index as f64 * layout.row_h)
+        }
+    }
+}
+
+/// The text one data label prints, or `None` when the series prints none.
+///
+/// Office joins the enabled parts with the series' separator in the order
+/// series, category, value, percent. Excel prints the audited workbook's pie
+/// labels as `커밋 픽스처 수; DOCX; 115; 33%`, which fixes that order.
+///
+/// `percent_base` is what `showPercent` measures the point against: the
+/// category total for a stacked bar, where the label answers "how much of this
+/// column", and the series total for a pie, where it answers "how much of the
+/// whole". Measuring a pie against its category would call every slice 100%,
+/// since a pie has one series.
+fn data_label_text(
+    chart: &Chart,
+    series: &crate::ir::ChartSeries,
+    category_index: usize,
+    percent_base: f64,
+) -> Option<String> {
+    let labels = &series.data_labels;
+    if labels.is_empty() {
+        return None;
+    }
+    let value: f64 = series.value_at_point(category_index)?;
+    let mut parts: Vec<String> = Vec::new();
+    if labels.show_series
+        && let Some(name) = series.name.as_deref()
+    {
+        parts.push(name.to_string());
+    }
+    if labels.show_category
+        && let Some(category) = chart.categories.get(category_index)
+    {
+        parts.push(category.clone());
+    }
+    if labels.show_value {
+        parts.push(chart_value_label_formatted(
+            value,
+            series_label_number_format(series),
+        ));
+    }
+    if labels.show_percent {
+        let percent: f64 = if percent_base == 0.0 {
+            0.0
+        } else {
+            value / percent_base * 100.0
+        };
+        parts.push(format!("{}%", chart_value_label(percent.round())));
+    }
+    (!parts.is_empty()).then(|| parts.join(&labels.separator))
+}
+
+/// Sum of the given series' values in one category — the length of its stacked
+/// bar.
+///
+/// Takes an iterator rather than a slice because a combo plot area stacks only
+/// the bar-family series: the line laid over them is read against the same axis
+/// but is no part of the stack (issue #1067).
+fn category_total<'a>(
+    series: impl IntoIterator<Item = &'a crate::ir::ChartSeries>,
+    category_index: usize,
+) -> f64 {
+    series
+        .into_iter()
+        .filter_map(|s| s.value_at_point(category_index))
+        .sum()
+}
+
+/// Outer size of the axis plot box, in points.
+///
+/// A bar chart grows along the category axis, so its height rises with the
+/// category count; a column chart's height is fixed. Shared with
+/// [`chart_fits_on_one_page`] so the atomicity decision uses the same geometry
+/// the box is actually drawn with.
+fn chart_axis_extent(chart: &Chart) -> (f64, f64) {
+    let (plot_w, plot_h) = axis_plot_size(chart, None, 0.0);
+    let legend: LegendBox = axis_legend_box(chart);
+    let (label_gutter_w, label_gutter_h) = axis_label_gutters(chart, None);
+    (
+        label_gutter_w + plot_w + legend.left + legend.right,
+        plot_h + label_gutter_h + legend.top + legend.bottom,
+    )
+}
+
+/// The bottom band a bar plot's value tick labels need.
+///
+/// [`TICK_GAP`] preserves the legacy geometry for charts that declare no size.
+/// For explicit text, native PowerPoint 16.112 exports measure this band as a
+/// fixed 6.58pt plus 1.855 times the resolved value-axis text size (#706).
+/// This does not choose the tick values or axis maximum; the horizontal
+/// PowerPoint auto-scale is resolved separately by [`powerpoint_nice_axis`].
+pub(super) fn chart_tick_band_pt(chart: &Chart) -> f64 {
+    if chart.text_style.size_pt.is_some() || chart.value_axis_text_style.size_pt.is_some() {
+        CHART_TICK_BAND_BASE_PT
+            + CHART_TICK_BAND_EM * chart_axis_text_pt(chart, chart.value_axis_text_style)
+    } else {
+        TICK_GAP
+    }
+}
+
+/// Excel's automatic column-plot layout, in three measured parts.
+///
+/// Native Excel for Mac 16.112 exports of the #1166 workbook, re-exported once
+/// per varied factor — seven faces, five value-axis sizes and four number
+/// formats, 21 exports in all — put the widest value tick label's first glyph
+/// exactly [`EXCEL_VALUE_LABEL_EDGE_PAD_PT`] inside the chart frame in every
+/// one of them, whatever the size, the face or how wide the label is. The plot
+/// then starts the label's own advance plus a clearance later.
+///
+/// That clearance is not a plain multiple of the size: at 9pt it measures
+/// 9.22pt in Segoe UI against 8.34pt in Calibri. It is a multiple of the
+/// *face's* line box, and splitting the box into its ascent and descent
+/// identifies it — a least-squares fit over the seven faces lands on 0.8334 and
+/// 0.4981, which are 5/6 and 1/2 within the exports' own scatter. Every one of
+/// the 21 exports then sits within 0.015pt of the model.
+///
+/// PowerPoint measures the same composition. #1651 found it on the line
+/// family and #1663 on the column family: fifteen native exports of
+/// `tests/fixtures/pptx/bar-chart.pptx` repackaged as a column chart put the
+/// widest label's first glyph on this same 6.500pt and the plot one clearance
+/// past its end, matching the line family's gutters to the last emitted digit.
+/// The #841 deck reads 46.98pt where a first pass predicted 31.49 only because
+/// its `80%` labels carry a `%` and `spc="100"` that the pass left out.
+const EXCEL_VALUE_LABEL_EDGE_PAD_PT: f64 = 6.5;
+const EXCEL_VALUE_LABEL_ASCENT_FRACTION: f64 = 5.0 / 6.0;
+const EXCEL_VALUE_LABEL_DESCENT_FRACTION: f64 = 0.5;
+
+/// The interval a value axis spans, and the interval between its ticks.
+///
+/// Every plotted position is a share of this interval rather than of the data,
+/// which is what lets zero sit inside the plot: a `<c:valAx><c:scaling>` fixing
+/// the axis to -400..400 puts zero halfway across, and a value below it draws
+/// on the far side rather than collapsing onto the plot's edge (issue #1184).
+#[derive(Clone, Copy, Debug)]
+struct ValueScale {
+    /// The value the axis starts at — the plot's floor for a vertical axis and
+    /// its left edge for a horizontal one.
+    min: f64,
+    /// The value the axis ends at.
+    max: f64,
+    /// The interval between two major ticks.
+    step: f64,
+}
+
+impl ValueScale {
+    /// Where `value` sits along the axis: 0 at [`Self::min`] and 1 at
+    /// [`Self::max`]. Clamped, so a point outside a stated interval draws on
+    /// the plot's edge rather than outside the plot.
+    fn fraction(&self, value: f64) -> f64 {
+        let span: f64 = self.max - self.min;
+        if !span.is_finite() || span <= 0.0 {
+            return 0.0;
+        }
+        ((value - self.min) / span).clamp(0.0, 1.0)
+    }
+
+    /// Like [`Self::fraction`], but not truncated to `0..1`: a value past the
+    /// stated maximum or minimum lands past the plot's edge instead of on it.
+    /// A bar segment's own painted rectangle uses this — Office draws such a
+    /// segment at its true length and lets the plot rectangle's clip hide the
+    /// overrun, so ours must paint the same length for the clip to hide the
+    /// same amount (issue #1633).
+    fn raw_fraction(&self, value: f64) -> f64 {
+        let span: f64 = self.max - self.min;
+        if !span.is_finite() || span <= 0.0 {
+            return 0.0;
+        }
+        (value - self.min) / span
+    }
+
+    /// Where the value-zero line lands: the baseline every bar grows from, and
+    /// the line the category axis stands on.
+    fn zero_fraction(&self) -> f64 {
+        self.fraction(0.0)
+    }
+
+    /// The values the gridlines, the tick marks and the tick labels all land
+    /// on, from the axis minimum up.
+    ///
+    /// Indexed rather than accumulated: stepping a float drifts, and a tick a
+    /// hair off zero would print as `-0` beside the axis standing on it.
+    fn ticks(&self) -> Vec<f64> {
+        if !self.step.is_finite() || self.step <= 0.0 || self.max <= self.min {
+            return Vec::new();
+        }
+        // A part is free to state a unit far finer than its own interval, so
+        // the count is bounded rather than trusted.
+        let count: usize = (((self.max - self.min) / self.step + 1e-6).floor())
+            .clamp(0.0, MAX_AXIS_TICKS as f64) as usize;
+        (0..=count)
+            .map(|index| {
+                let tick: f64 = self.min + index as f64 * self.step;
+                if tick.abs() < self.step * 1e-9 {
+                    0.0
+                } else {
+                    tick
+                }
+            })
+            .collect()
+    }
+}
+
+/// Ceiling on how many major ticks one axis draws, so a `<c:majorUnit>` far
+/// finer than the interval it divides cannot generate an unbounded axis.
+const MAX_AXIS_TICKS: usize = 1000;
+
+/// Resolve the interval and tick spacing the value axis is drawn on.
+///
+/// `auto_axis` is the `(maximum, step)` the host's automatic scale chose. What
+/// the part states outranks it: `<c:majorUnit>` sets the interval (issue #882),
+/// and `<c:scaling><c:min>`/`<c:max>` fix either end of the axis (issue #1184).
+/// An end the part leaves out keeps the automatic one.
+fn chart_value_scale(chart: &Chart, auto_axis: (f64, f64)) -> ValueScale {
+    value_scale_for_axis(chart, crate::ir::ChartValueAxisRole::Primary, auto_axis)
+}
+
+/// The bounds and tick interval the value axis `role` names states.
+///
+/// `(min, max, major_unit)` — every one `None` where the part leaves that end
+/// to the automatic scale.
+fn stated_value_axis_scaling(
+    chart: &Chart,
+    role: crate::ir::ChartValueAxisRole,
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    match role {
+        crate::ir::ChartValueAxisRole::Primary => (
+            chart.value_axis_min,
+            chart.value_axis_max,
+            chart.value_axis_major_unit,
+        ),
+        crate::ir::ChartValueAxisRole::Secondary => chart
+            .secondary_value_axis
+            .as_ref()
+            .map_or((None, None, None), |axis| {
+                (axis.min, axis.max, axis.major_unit)
+            }),
+    }
+}
+
+/// [`chart_value_scale`] for either value axis: the interval is counted out
+/// of the series read against that axis alone, and the bounds are the ones
+/// that axis states (issue #1374).
+fn value_scale_for_axis(
+    chart: &Chart,
+    role: crate::ir::ChartValueAxisRole,
+    auto_axis: (f64, f64),
+) -> ValueScale {
+    let (value_axis_min, value_axis_max, value_axis_major_unit) =
+        stated_value_axis_scaling(chart, role);
+    let data_min: f64 = chart_auto_min_value(chart, role);
+    // An axis reaching below zero has to count out its whole span rather than
+    // the positive half of it: a chart whose data is entirely negative has an
+    // automatic maximum of zero, and a step chosen from that would tick the
+    // axis once per unit.
+    let auto_axis: (f64, f64) = if data_min < 0.0 {
+        let top: f64 = if chart_auto_max_value(chart, role) > 0.0 {
+            auto_axis.0
+        } else {
+            0.0
+        };
+        let step: f64 = nice_axis(top - data_min).1;
+        // Both ends of an axis crossing zero land on a whole unit, so the
+        // maximum the positive half of the data chose is raised to one.
+        ((top / step - 1e-9).ceil().max(0.0) * step, step)
+    } else {
+        auto_axis
+    };
+    let (auto_max, auto_step) = axis_with_stated_unit(auto_axis, value_axis_major_unit);
+
+    let stated = |bound: Option<f64>| bound.filter(|value| value.is_finite());
+    let stated_unit: Option<f64> =
+        value_axis_major_unit.filter(|unit| unit.is_finite() && *unit > 0.0);
+    let (stated_min, stated_max) = (stated(value_axis_min), stated(value_axis_max));
+    let min: f64 = stated_min.unwrap_or_else(|| automatic_axis_minimum(data_min, auto_step));
+    let max: f64 = stated_max.unwrap_or(auto_max);
+
+    // A stated interval carries its own automatic unit: Excel counts out the
+    // interval, not the data behind it. `chart3.xml` of the #1123 workbook
+    // fixes its axis to 0..0.5 over a 0.408 maximum and the export ticks every
+    // 10%; taking the unit from the data gives 5% and twice the ticks (#1184).
+    let step: f64 = match (stated_unit, stated_min.or(stated_max)) {
+        (Some(unit), _) => unit,
+        (None, Some(_)) => nice_axis(max - min).1,
+        (None, None) => auto_step,
+    };
+    // Re-seated on the final unit so an automatic minimum still lands on one.
+    let min: f64 = stated_min.unwrap_or_else(|| automatic_axis_minimum(data_min, step));
+    if max > min {
+        return ValueScale { min, max, step };
+    }
+    // A part stating a maximum at or below its minimum describes no interval
+    // at all, so the automatic scale is the only thing left to draw against.
+    ValueScale {
+        min: automatic_axis_minimum(data_min, auto_step),
+        max: auto_max,
+        step: auto_step,
+    }
+}
+
+/// The automatic axis minimum for data reaching down to `data_min`.
+///
+/// Zero unless the data goes below it, so every chart with no negative value
+/// keeps the plot-floor baseline it has always had. Below zero it mirrors
+/// [`nice_axis`]: the data is cleared by [`AXIS_HEADROOM_DIVISOR`] so the
+/// deepest bar stops short of the plot's edge, then rounded outwards to a whole
+/// major unit so the ticks stay on the unit the axis counts in (issue #1184).
+fn automatic_axis_minimum(data_min: f64, step: f64) -> f64 {
+    if !data_min.is_finite() || data_min >= 0.0 || !step.is_finite() || step <= 0.0 {
+        return 0.0;
+    }
+    let cleared: f64 = data_min + data_min / AXIS_HEADROOM_DIVISOR;
+    (cleared / step + 1e-9).floor() * step
+}
+
+/// The most negative value the value axis `role` names has to reach down to.
+///
+/// The mirror of [`chart_auto_max_value`]: a stacked category's negative
+/// segments hang from zero as a stack of their own, so the axis has to clear
+/// their sum rather than the deepest single one. A line laid over the columns
+/// reads against the same axis and takes no part in any stack. Only the series
+/// read against this axis count: a secondary-axis series has its own scale to
+/// reach (issue #1374).
+fn chart_auto_min_value(chart: &Chart, role: crate::ir::ChartValueAxisRole) -> f64 {
+    let overlaid: Vec<bool> = axis_series(chart, role)
+        .map(|series| plots_as_line(chart, series))
+        .collect();
+    let overlay_min: f64 = axis_series(chart, role)
+        .zip(&overlaid)
+        .filter(|(_, is_line)| **is_line)
+        .flat_map(|(series, _)| series.present_values())
+        .fold(0.0_f64, f64::min);
+    match chart.grouping {
+        // Every stack is rescaled to fill the axis, so the scale is the
+        // percentage itself and has no negative end.
+        ChartGrouping::PercentStacked => 0.0,
+        ChartGrouping::Stacked => (0..chart.categories.len())
+            .map(|index| {
+                axis_series(chart, role)
+                    .zip(&overlaid)
+                    .filter(|(_, is_line)| !**is_line)
+                    .filter_map(|(series, _)| series.value_at_point(index))
+                    .filter(|value| *value < 0.0)
+                    .sum::<f64>()
+            })
+            .fold(overlay_min, f64::min),
+        ChartGrouping::Clustered => axis_series(chart, role)
+            .flat_map(|series| series.present_values())
+            .fold(0.0_f64, f64::min),
+    }
+}
+
+/// The largest value the value axis `role` names has to reach, before it is
+/// rounded up to a whole number of major units.
+///
+/// A line laid over the columns reads against the same axis, so the axis has to
+/// reach it too — but it is no part of any stack. A stacked bar is read against
+/// its category's total, so the axis must cover the tallest stack rather than
+/// the largest single segment. Only the series read against this axis count
+/// (issue #1374).
+fn chart_auto_max_value(chart: &Chart, role: crate::ir::ChartValueAxisRole) -> f64 {
+    let overlaid: Vec<bool> = axis_series(chart, role)
+        .map(|series| plots_as_line(chart, series))
+        .collect();
+    let overlay_max: f64 = axis_series(chart, role)
+        .zip(&overlaid)
+        .filter(|(_, is_line)| **is_line)
+        .flat_map(|(series, _)| series.present_values())
+        .fold(0.0_f64, f64::max);
+    let bar_series = || {
+        axis_series(chart, role)
+            .zip(&overlaid)
+            .filter(|(_, is_line)| !**is_line)
+            .map(|(series, _)| series)
+    };
+    match chart.grouping {
+        ChartGrouping::PercentStacked => 100.0,
+        ChartGrouping::Stacked => (0..chart.categories.len())
+            .map(|index| category_total(bar_series(), index))
+            .fold(overlay_max, f64::max),
+        ChartGrouping::Clustered => axis_series(chart, role)
+            .flat_map(|series| series.present_values())
+            .fold(0.0_f64, f64::max),
+    }
+}
+
+/// The tick labels a column plot's value axis prints, from the axis minimum
+/// up — which is zero only until a `<c:scaling><c:min>` or negative data puts
+/// it lower (issue #1184).
+///
+/// Safe to ask before the plot exists, which is what lets the gutter be sized
+/// from the labels: a column chart's value axis runs *vertically*, and
+/// [`chart_auto_axis`] only consults the plot width for a horizontal
+/// PowerPoint axis. Its scale therefore depends on the data and on what the
+/// part states, never on the plot's own size.
+fn chart_value_axis_labels(chart: &Chart) -> Vec<String> {
+    let auto_axis: (f64, f64) = if matches!(chart.grouping, ChartGrouping::PercentStacked) {
+        (100.0, 20.0)
+    } else {
+        nice_axis(chart_auto_max_value(
+            chart,
+            crate::ir::ChartValueAxisRole::Primary,
+        ))
+    };
+    let number_format: Option<&str> = chart_value_number_format(chart);
+    chart_value_scale(chart, auto_axis)
+        .ticks()
+        .into_iter()
+        .map(|tick| chart_value_label_formatted(tick, number_format))
+        .collect()
+}
+
+/// Width of the widest value tick label, set in the value axis' own face and
+/// size, or `None` where that face cannot be measured.
+fn chart_column_value_label_widest_pt(chart: &Chart) -> Option<f64> {
+    let bold: bool = chart
+        .text_style
+        .resolved_bold(chart.value_axis_text_style)
+        .unwrap_or(false);
+    let family: &str = chart
+        .value_axis_font_family()
+        .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_FAMILY);
+    let widest_em: f64 = chart_value_axis_labels(chart)
+        .iter()
+        .filter_map(|label| chart_text_advance_em(family, bold, label))
+        .fold(0.0_f64, f64::max);
+    (widest_em > 0.0).then(|| widest_em * chart_axis_text_pt(chart, chart.value_axis_text_style))
+}
+
+/// Clearance Excel leaves between a value tick label and the plot's left edge.
+fn excel_value_label_plot_gap_pt(chart: &Chart) -> Option<f64> {
+    let bold: bool = chart
+        .text_style
+        .resolved_bold(chart.value_axis_text_style)
+        .unwrap_or(false);
+    let family: &str = chart
+        .value_axis_font_family()
+        .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_FAMILY);
+    chart_label_clearance_pt(
+        family,
+        bold,
+        chart_axis_text_pt(chart, chart.value_axis_text_style),
+    )
+}
+
+/// The left gutter Excel gives a column plot whose value labels run down that
+/// edge, or `None` where the labels or the face cannot be measured.
+fn excel_column_value_gutter_pt(chart: &Chart) -> Option<f64> {
+    Some(
+        EXCEL_VALUE_LABEL_EDGE_PAD_PT
+            + chart_column_value_label_widest_pt(chart)?
+            + excel_value_label_plot_gap_pt(chart)?,
+    )
+}
+
+/// The left band a column plot's value tick labels need.
+fn chart_column_value_gutter_pt(chart: &Chart) -> f64 {
+    if chart.text_style.size_pt.is_none() && chart.value_axis_text_style.size_pt.is_none() {
+        return TICK_GAP + GAP;
+    }
+    if matches!(
+        chart.host,
+        crate::ir::ChartHost::Spreadsheet | crate::ir::ChartHost::SpreadsheetChartsheet
+    ) && let Some(gutter) = excel_column_value_gutter_pt(chart)
+    {
+        return gutter;
+    }
+    if let Some(gutter) = powerpoint_column_value_gutter(chart) {
+        return gutter.total();
+    }
+    CHART_COLUMN_VALUE_GUTTER_PT
+        + CHART_COLUMN_VALUE_GUTTER_EM * chart_axis_text_pt(chart, chart.value_axis_text_style)
+}
+
+/// The box one vertical value tick label is right-aligned in, as
+/// `(left edge, width)` inside the chart frame.
+///
+/// Excel ends that box where the clearance before the plot begins, so the
+/// widest label starts on the frame inset the exports measure. Sizing it from
+/// [`chart_tick_band_pt`] instead left the #1166 labels 2.63pt short of the
+/// export's, and would leave a short-labelled plot overlapping them once the
+/// gutter itself follows the labels.
+fn chart_column_value_label_box(chart: &Chart) -> (f64, f64) {
+    // PowerPoint seats the widest label on the frame pad and ends its box on
+    // the label's own advance, so the box moves with the gutter that measures
+    // it rather than with the flat band the pre-#1663 layout reserved.
+    if let Some(gutter) = powerpoint_column_value_gutter(chart) {
+        return (gutter.label_x, gutter.label_w);
+    }
+    let left: f64 = chart_column_value_label_x(chart);
+    if matches!(
+        chart.host,
+        crate::ir::ChartHost::Spreadsheet | crate::ir::ChartHost::SpreadsheetChartsheet
+    ) && let Some(gutter) = excel_column_value_gutter_pt(chart)
+        && let Some(gap) = excel_value_label_plot_gap_pt(chart)
+    {
+        return (left, (gutter - gap - left).max(0.0));
+    }
+    (left, chart_tick_band_pt(chart))
+}
+
+/// Left edge of a vertical value-axis tick-label box.
+///
+/// The legacy column gutter is `TICK_GAP + GAP`, with a `TICK_GAP`-wide label
+/// box at x=0, so an undeclared-size chart already leaves [`GAP`] before the
+/// plot. A PowerPoint chart with explicit text sizing uses the independently
+/// calibrated [`chart_column_value_gutter_pt`] instead; its label box still
+/// needs that 6pt inset. Without it every tick label on slide 14 of the #841
+/// deck sits 6.087pt left of the native export while the plot differs by only
+/// 0.011pt (#1015).
+///
+/// This is now the fallback for a PowerPoint column chart whose face resolves
+/// to nothing measurable — notably a font-search-free wasm build. Where the
+/// labels can be measured, [`chart_column_value_label_box`] seats them on the
+/// 6.500pt every #1663 export puts them on instead.
+fn chart_column_value_label_x(chart: &Chart) -> f64 {
+    let has_declared_size: bool =
+        chart.text_style.size_pt.is_some() || chart.value_axis_text_style.size_pt.is_some();
+    if chart.host == crate::ir::ChartHost::Presentation && has_declared_size {
+        GAP
+    } else {
+        0.0
+    }
+}
+
+/// The band one category takes across the category axis, at the declared size.
+pub(super) fn chart_category_band_pt(chart: &Chart) -> f64 {
+    ROW / CHART_DEFAULT_TEXT_PT * chart_axis_text_pt(chart, chart.category_axis_text_style)
+}
+
+/// Width the category labels take down the left of a bar plot.
+///
+/// Measured from the widest label in the face it is set in, rather than scaled
+/// from [`LABEL_W`]: this is a width holding text, not a height, so it grows
+/// with what the labels say as well as with their size. `bar-chart.pptx`'s
+/// labels are as short as `4th Qtr`, and scaling the constant by the same 1.8
+/// the band takes would have reserved far more than they need — the plot is
+/// 16.32pt wider than PowerPoint's before this and 10.08pt after, so the gutter
+/// had room to grow but not by the constant's full ratio.
+///
+/// Falls back to the flat constant where the face cannot be measured — wasm has
+/// no font search — so the gutter is never narrower than it was.
+pub(super) fn chart_category_gutter_pt(chart: &Chart) -> f64 {
+    let size_pt: f64 = chart_axis_text_pt(chart, chart.category_axis_text_style);
+    let bold: bool = chart
+        .text_style
+        .resolved_bold(chart.category_axis_text_style)
+        .unwrap_or(false);
+    let family: &str = chart
+        .category_axis_font_family()
+        .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_FAMILY);
+    let widest_em: f64 = chart
+        .categories
+        .iter()
+        .filter_map(|category| chart_text_advance_em(family, bold, category))
+        .fold(0.0_f64, f64::max);
+    if widest_em <= 0.0 {
+        return LABEL_W + GAP;
+    }
+    // PowerPoint's automatic layout adds a fixed 6.505pt plus 0.927 times the
+    // resolved size after the widest label. Measuring the whole reserved band
+    // avoids counting the axis tick a second time: it lives inside that edge
+    // clearance in the native export.
+    let measured =
+        widest_em * size_pt + CHART_LABEL_EDGE_PAD_PT + CHART_LABEL_EDGE_PAD_EM * size_pt;
+    if chart.text_style.size_pt.is_none() && chart.category_axis_text_style.size_pt.is_none() {
+        // Before #706 the flat label gutter and [`GAP`] were separate. Keep
+        // their combined width for charts with no declared size.
+        measured.max(LABEL_W) + GAP
+    } else {
+        measured
+    }
+}
+
+/// Width the horizontal category-label text box occupies inside its gutter.
+///
+/// The gutter includes clearance between the glyphs and the plot. PowerPoint's
+/// explicit-size layout scales that clearance with the category-axis text when
+/// the font can be measured. Charts that declare no size, and environments
+/// without font metrics, keep the legacy [`GAP`] instead. Keeping the clearance
+/// outside this right-aligned box preserves the plot rectangle while stopping
+/// the label itself short of the axis (#998).
+fn chart_category_label_box_w(chart: &Chart) -> f64 {
+    let gutter: f64 = chart_category_gutter_pt(chart);
+    let has_declared_size: bool =
+        chart.text_style.size_pt.is_some() || chart.category_axis_text_style.size_pt.is_some();
+    let clearance: f64 = if has_declared_size && chart_category_label_widest_pt(chart).is_some() {
+        CHART_LABEL_EDGE_PAD_EM * chart_axis_text_pt(chart, chart.category_axis_text_style)
+    } else {
+        GAP
+    };
+    (gutter - clearance).max(0.0)
+}
+
+/// Angle Office slants crowded category labels by.
+///
+/// A constant, not a function of how badly they crowd: all four labels in the
+/// reference export of the deck in #841 carry the same text matrix,
+/// `8.493095 8.4635 -8.4634 8.492994`, whose `atan2` is 44.90deg, and each
+/// one's horizontal and vertical extents are equal to within 0.6pt — the
+/// signature of exactly 45 (issue #884).
+const CATEGORY_LABEL_ROTATION_DEG: f64 = 45.0;
+
+/// Face a category label is set in: family, weight and size.
+fn chart_category_label_face(chart: &Chart) -> (&str, bool, f64) {
+    let family: &str = chart
+        .category_axis_font_family()
+        .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_FAMILY);
+    let bold: bool = chart
+        .text_style
+        .resolved_bold(chart.category_axis_text_style)
+        .unwrap_or(false);
+    (
+        family,
+        bold,
+        chart_axis_text_pt(chart, chart.category_axis_text_style),
+    )
+}
+
+/// Widest category label's advance, in points, or `None` where the face cannot
+/// be measured — wasm has no font search, and a chart that cannot measure its
+/// labels must not guess that they crowd.
+fn chart_category_label_widest_pt(chart: &Chart) -> Option<f64> {
+    let (family, bold, size_pt) = chart_category_label_face(chart);
+    let widest_em: f64 = chart
+        .categories
+        .iter()
+        .filter_map(|category| chart_text_advance_em(family, bold, category))
+        .fold(0.0_f64, f64::max);
+    (widest_em > 0.0).then_some(widest_em * size_pt)
+}
+
+/// Advance of one category label after DrawingML tracking is applied.
+///
+/// The source face table covers Basic Latin. PowerPoint emits U+2026 at one
+/// em in the #841 native export, so account for that final glyph separately
+/// while retaining the source-face advances for the visible prefix.
+fn chart_category_label_advance_pt(chart: &Chart, label: &str) -> Option<f64> {
+    let (family, bold, size_pt) = chart_category_label_face(chart);
+    let prefix = label.strip_suffix('…').unwrap_or(label);
+    let ellipsis_pt = if prefix.len() != label.len() {
+        size_pt
+    } else {
+        0.0
+    };
+    let glyphs = prefix.chars().count() + usize::from(ellipsis_pt > 0.0);
+    let tracking_pt = chart
+        .text_style
+        .resolved_letter_spacing(chart.category_axis_text_style)
+        .unwrap_or(0.0)
+        * glyphs.saturating_sub(1) as f64;
+    chart_text_advance_em(family, bold, prefix)
+        .map(|advance_em| advance_em * size_pt + ellipsis_pt + tracking_pt)
+}
+
+/// Category labels are standalone text blocks, so even one boundary space
+/// contributes to their aligned width. Literal markup drops that space (#1567).
+fn escape_category_axis_label(label: &str) -> String {
+    let mut escaped: String = escape_typst(label);
+    if escaped.starts_with(' ') {
+        escaped.replace_range(..1, r#"#" ";"#);
+    }
+    if escaped.ends_with(' ') {
+        escaped.pop();
+        escaped.push_str(r#"#" ";"#);
+    }
+    escaped
+}
+
+/// Typst content for a rotated category label, aligned as the native export
+/// aligns it.
+///
+/// An untruncated label right-aligns whole. An ellipsized one right-aligns only
+/// the text it retained; everything the truncation swallowed hangs past the
+/// trailing-end anchor. On the #841 deck's native export the retained
+/// `Konverteringsfrekvens for` ends on the same anchor the three untruncated
+/// labels share, the swallowed inter-word space paints one tracking step past
+/// it, and the `…` — taking the place of the first character it replaced —
+/// starts at that same origin.
+///
+/// So the swallowed space is painted in flow, keeping it in the label's own
+/// text run as the export does, and then pulled straight back out of the
+/// aligned width by its advance plus the tracking step before it; without that
+/// pull-back the whole label sat 3.99pt short along the slant (issue #1076,
+/// the residual #1035 left by aligning the space too). The zero-width box
+/// needs its own `align(left)`, or it inherits the line's right alignment and
+/// overflows leftwards across the retained text.
+fn rotated_category_label_content(chart: &Chart, category: &str, label: &str) -> String {
+    let Some(stem) = label.strip_suffix('…').filter(|_| label != category) else {
+        return escape_category_axis_label(label);
+    };
+    let (family, bold, size_pt) = chart_category_label_face(chart);
+    let tracking_pt: f64 = chart
+        .text_style
+        .resolved_letter_spacing(chart.category_axis_text_style)
+        .unwrap_or(0.0);
+    let swallowed_space: String = if category
+        .strip_prefix(stem)
+        .is_some_and(|rest| rest.starts_with(' '))
+    {
+        let space_pt: f64 = chart_text_advance_em(family, bold, " ").unwrap_or(0.0) * size_pt;
+        format!("#\" \";#h(-{}pt);", format_f64(tracking_pt + space_pt))
+    } else {
+        String::new()
+    };
+    format!(
+        "{}{}#box(width: 0pt)[#align(left)[#move(dx: {}pt)[…]]]",
+        escape_category_axis_label(stem),
+        swallowed_space,
+        format_f64(tracking_pt)
+    )
+}
+
+/// Apply `vertOverflow="ellipsis"` to a crowded rotated category label.
+///
+/// PowerPoint lays out slide 14 of #841 with a box as wide as the source-face
+/// advance before tracking. Tracking then makes only the longest label exceed
+/// that box. Its native PDF keeps complete words and paints
+/// `Konverteringsfrekvens for…`; it does not split `kundeemne`. Preserve that
+/// word-boundary behavior, falling back to characters only when the first word
+/// alone cannot fit (issue #1012).
+fn chart_category_label_text(chart: &Chart, label: &str, box_w: f64) -> String {
+    if !chart.category_axis_text_style.ellipsis_overflow
+        || chart_category_label_advance_pt(chart, label).is_none_or(|width| width <= box_w)
+    {
+        return label.to_string();
+    }
+
+    let mut best = String::new();
+    let mut prefix = String::new();
+    for word in label.split_whitespace() {
+        if !prefix.is_empty() {
+            prefix.push(' ');
+        }
+        prefix.push_str(word);
+        let candidate = format!("{prefix}…");
+        if chart_category_label_advance_pt(chart, &candidate).is_some_and(|width| width <= box_w) {
+            best = candidate;
+        } else {
+            break;
+        }
+    }
+    if !best.is_empty() {
+        return best;
+    }
+
+    let mut prefix = String::new();
+    for character in label.chars() {
+        prefix.push(character);
+        let candidate = format!("{prefix}…");
+        if chart_category_label_advance_pt(chart, &candidate).is_some_and(|width| width <= box_w) {
+            best = candidate;
+        } else {
+            break;
+        }
+    }
+    if best.is_empty() {
+        "…".to_string()
+    } else {
+        best
+    }
+}
+
+/// How a category axis lays its labels out under the plot it owns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CategoryLabelLayout {
+    /// Flat, each label wrapped over this many lines — at least one.
+    Flat { lines: usize },
+    /// Slanted by [`CATEGORY_LABEL_ROTATION_DEG`], one line each.
+    Rotated,
+}
+
+/// The width one category label has to fit into: its own band across the axis.
+///
+/// The plot's *width* depends only on the left gutter, which neither wrapping
+/// nor rotating a category label moves, so asking this question inside
+/// [`axis_label_gutters`] is not circular. The gutter is the one the column
+/// family actually reserves, so this is the same band the render divides the
+/// plot into — a label wrapped to fit here fits the box it is drawn in.
+fn chart_category_label_band_pt(chart: &Chart, frame: Option<(f64, f64)>) -> f64 {
+    let categories: usize = chart.categories.len();
+    match frame {
+        Some((frame_w, _)) if categories > 0 => {
+            let legend: LegendBox = axis_legend_box(chart);
+            let (title_left, _) = axis_title_gutters(chart);
+            let gutter_w: f64 = chart_column_value_gutter_pt(chart) + title_left;
+            (frame_w - gutter_w - legend.left - legend.right).max(MIN_PLOT_PT) / categories as f64
+        }
+        _ => chart_category_band_pt(chart),
+    }
+}
+
+/// Break one category label into the lines PowerPoint breaks it into.
+///
+/// Greedy at the spaces, never inside a word: `None` says one word is wider
+/// than the band, which is the case PowerPoint answers by slanting the whole
+/// axis instead. A label carrying no measurable text keeps its single line
+/// rather than claiming to overflow.
+fn wrap_category_label(chart: &Chart, label: &str, band_pt: f64) -> Option<Vec<String>> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut line: String = String::new();
+    for word in label.split_whitespace() {
+        if chart_category_label_advance_pt(chart, word)? > band_pt {
+            return None;
+        }
+        let candidate: String = if line.is_empty() {
+            word.to_string()
+        } else {
+            format!("{line} {word}")
+        };
+        if chart_category_label_advance_pt(chart, &candidate)? <= band_pt {
+            line = candidate;
+        } else {
+            lines.push(std::mem::take(&mut line));
+            line = word.to_string();
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        lines.push(label.to_string());
+    }
+    Some(lines)
+}
+
+/// Share of the frame left under the title that a wrapped category band may
+/// take before PowerPoint abandons the wrap.
+///
+/// Past it the labels go back to one flat line each and simply overlap, which
+/// is what `1st Qtr Net` does natively at 32pt and above on the #1675 frame —
+/// not a slant, which PowerPoint keeps for a label no wrapping could fit.
+///
+/// Bracketed, not derived: `scripts/probes/issue-1675-column-label-share.json`
+/// sweeps that label's size and flips the native export between 30pt, whose
+/// three-line band takes 0.507 of the title-reduced frame after #1678, and
+/// 32pt, whose would have taken 0.545. This is the midpoint of that gap. Every
+/// accepted band the probes measured sits below it and both refused ones
+/// above. A plot-height floor near a third of the whole frame fits the same
+/// exports equally well; the probes do not separate the two forms, so this is
+/// the simpler of the two rather than the proven one.
+const PPTX_COLUMN_WRAPPED_CATEGORY_BAND_SHARE: f64 = 0.526;
+
+/// How the category labels have to sit to fit the bands they own.
+///
+/// Only a column plot asks: a bar chart's categories run down the left edge,
+/// where a label's length costs width and is already measured by
+/// [`chart_category_gutter_pt`].
+///
+/// A label wider than its band wraps at its spaces where PowerPoint wraps it,
+/// and slants only where one word alone cannot fit (issue #1675). Every other
+/// host keeps the slant it has had since #884: no native Excel or Word export
+/// has measured a wrapped band there, and reserving one on a guess would move
+/// every crowded worksheet chart's plot floor.
+fn chart_category_label_layout(chart: &Chart, frame: Option<(f64, f64)>) -> CategoryLabelLayout {
+    const ONE_LINE: CategoryLabelLayout = CategoryLabelLayout::Flat { lines: 1 };
+    if matches!(chart.chart_type, ChartType::Bar) || chart.category_axis_deleted {
+        return ONE_LINE;
+    }
+    if chart.categories.is_empty() {
+        return ONE_LINE;
+    }
+    // A face that cannot be measured — wasm has no font search — must not guess
+    // that its labels crowd.
+    let Some(widest_pt) = chart_category_label_widest_pt(chart) else {
+        return ONE_LINE;
+    };
+    let band_pt: f64 = chart_category_label_band_pt(chart, frame);
+    if widest_pt <= band_pt {
+        return ONE_LINE;
+    }
+    powerpoint_wrapped_category_layout(chart, frame, band_pt)
+        .unwrap_or(CategoryLabelLayout::Rotated)
+}
+
+/// The wrapped layout a framed PowerPoint column axis takes, or `None` where
+/// this chart is outside the regime those exports measured.
+fn powerpoint_wrapped_category_layout(
+    chart: &Chart,
+    frame: Option<(f64, f64)>,
+    band_pt: f64,
+) -> Option<CategoryLabelLayout> {
+    if !powerpoint_column_chrome(chart) {
+        return None;
+    }
+    // The same guard the measured band itself carries: an undeclared size keeps
+    // the legacy chrome, and the growth term has nothing to grow.
+    if chart.text_style.size_pt.is_none() && chart.category_axis_text_style.size_pt.is_none() {
+        return None;
+    }
+    // `<a:bodyPr vertOverflow="ellipsis">` asks for a truncated label instead of
+    // a wrapped one, and every package behind the wrap law writes a bare
+    // `<a:bodyPr/>`, so no native export says which policy PowerPoint applies
+    // when the two meet. Such an axis keeps the slant and the ellipsis of #884.
+    if chart.category_axis_text_style.ellipsis_overflow {
+        return None;
+    }
+    let (_, frame_h) = frame?;
+    let metrics: ChartFaceLineBox = chart
+        .category_axis_font_family()
+        .and_then(chart_face_line_box_em)?;
+    let mut lines: usize = 1;
+    for category in &chart.categories {
+        // The raw label, which is what the flat branch paints: reserving the
+        // band for a truncated form the render never writes would leave the
+        // break and the reserve disagreeing.
+        let wrapped: Vec<String> = wrap_category_label(chart, category, band_pt)?;
+        lines = lines.max(wrapped.len());
+    }
+    let size_pt: f64 = chart_axis_text_pt(chart, chart.category_axis_text_style);
+    let band_h: f64 = metrics.wrapped_category_band_pt(size_pt, lines);
+    Some(CategoryLabelLayout::Flat {
+        lines: if band_h > frame_h * PPTX_COLUMN_WRAPPED_CATEGORY_BAND_SHARE {
+            1
+        } else {
+            lines
+        },
+    })
+}
+
+/// Whether the category labels have to slant to fit the bands they own.
+fn chart_category_labels_rotated(chart: &Chart, frame: Option<(f64, f64)>) -> bool {
+    chart_category_label_layout(chart, frame) == CategoryLabelLayout::Rotated
+}
+
+/// How many lines each flat category label takes.
+fn chart_category_label_line_count(chart: &Chart, frame: Option<(f64, f64)>) -> usize {
+    match chart_category_label_layout(chart, frame) {
+        CategoryLabelLayout::Flat { lines } => lines,
+        CategoryLabelLayout::Rotated => 1,
+    }
+}
+
+/// Advance between two lines of one wrapped flat category label, in points.
+///
+/// One whole leaded line of the label's own face; zero where that face cannot
+/// be measured, which is also where nothing wraps.
+fn category_label_line_pitch_pt(chart: &Chart) -> f64 {
+    chart
+        .category_axis_font_family()
+        .and_then(chart_face_line_box_em)
+        .map_or(0.0, |metrics| {
+            metrics.leaded_em * chart_axis_text_pt(chart, chart.category_axis_text_style)
+        })
+}
+
+/// Height slanted category labels reserve below the axis.
+///
+/// A label rotated 45deg drops by its own advance times sin 45. A fresh native
+/// PowerPoint 16.112 export of slide 14 in #841 then leaves 3.23pt between that
+/// rotated advance and the chart-frame edge (#706, #884).
+fn chart_category_rotated_gutter_pt(chart: &Chart) -> f64 {
+    let widest_pt: f64 = chart_category_label_widest_pt(chart).unwrap_or(0.0);
+    let drop: f64 = widest_pt * CATEGORY_LABEL_ROTATION_DEG.to_radians().sin();
+    drop + CHART_ROTATED_LABEL_EDGE_PAD_PT
+}
+
+/// Top coordinate of a rotated category-label box.
+pub(super) fn chart_category_rotated_label_y(chart: &Chart, axis_y: f64) -> f64 {
+    if chart.host == crate::ir::ChartHost::Presentation {
+        axis_y
+            + 2.0
+            + PPTX_ROTATED_CATEGORY_LABEL_Y_SHIFT_EM
+                * chart_axis_text_pt(chart, chart.category_axis_text_style)
+    } else {
+        axis_y + 2.0
+    }
+}
+
+/// Vertical correction for a flat category-label band in an Excel worksheet
+/// chart.
+///
+/// Re-exporting the #1240 workbook with only the category size changed to 7,
+/// 9, 11, 14 and 18pt gives native baseline deltas of 0, 0, -1, -2 and -3pt
+/// in chart-local coordinates. The pre-fix Typst seats move by -1.35pt per
+/// text point over the same series. Anchoring the correction at the reported
+/// 9pt face and restoring Excel's integer chart-grid steps reproduces all five
+/// seats without changing the plot rectangle, which belongs to #1250.
+///
+/// An undeclared size keeps the legacy seat: no native probe establishes that
+/// its implicit text follows this explicit-size regime. PowerPoint, Word and
+/// Excel chartsheets also keep their own host layouts. `ChartHost` does not
+/// distinguish drawing-anchored worksheet charts from orphaned worksheet chart
+/// parts, so both worksheet paths intentionally share this Excel text regime.
+fn excel_category_label_y_shift_pt(chart: &Chart) -> f64 {
+    if chart.host != crate::ir::ChartHost::Spreadsheet
+        || (chart.category_axis_text_style.size_pt.is_none() && chart.text_style.size_pt.is_none())
+    {
+        return 0.0;
+    }
+    let size_pt: f64 = chart_axis_text_pt(chart, chart.category_axis_text_style);
+    let native_grid_steps: f64 = ((size_pt - 8.0) / 4.0).round();
+    EXCEL_CATEGORY_LABEL_BASE_Y_SHIFT_PT - native_grid_steps
+}
+
+/// Horizontal correction for a bar chart's right-aligned category-label box
+/// in an Excel worksheet chart.
+///
+/// [`chart_category_label_box_w`] right-aligns the label inside a box whose
+/// clearance from the plot is [`CHART_LABEL_EDGE_PAD_EM`], calibrated from
+/// PowerPoint's own export of `bar-chart.pptx` (#998). Excel keeps a
+/// narrower clearance. This function's result is added to `plot.dx`, which
+/// `write_placed_sheet_anchor` emits inside the fitted sheet's own
+/// `#scale(print_scale)` wrapper — every point added here is a sheet point,
+/// not a printed one, matching how `sheet_frame_origin_pt` is itself divided
+/// by that same scale before this function ever sees it.
+///
+/// Re-exporting `tests/fixtures/xlsx/issue_1181_fit_to_height.xlsx` (#1620,
+/// printed at this sheet's own 0.78 fit scale) with only the bar
+/// category-axis size patched to 8, 10, 14 and 18pt gave a native label
+/// origin 0.2083, 0.2610, 0.3677 and 0.4733 **printed** points right of the
+/// shared box at each size. Dividing each by the sheet's 0.78 print scale
+/// before comparing to the *declared* (unscaled) size gives 0.0334, 0.0335,
+/// 0.0337 and 0.0337em — a fixed fraction of the text size in the same
+/// sheet-space this function operates in, not a flat point offset. This
+/// crate's own bar-rect x0 already matches native exactly at every size
+/// probed, so only the label's own box moves.
+///
+/// An undeclared size keeps the shared box: no native probe establishes that
+/// implicit text follows this regime, mirroring
+/// [`excel_category_label_y_shift_pt`].
+pub(super) const EXCEL_BAR_CATEGORY_LABEL_X_SHIFT_EM: f64 = 0.0336;
+
+fn excel_bar_category_label_x_shift_pt(chart: &Chart) -> f64 {
+    if chart.host != crate::ir::ChartHost::Spreadsheet
+        || (chart.category_axis_text_style.size_pt.is_none() && chart.text_style.size_pt.is_none())
+    {
+        return 0.0;
+    }
+    EXCEL_BAR_CATEGORY_LABEL_X_SHIFT_EM * chart_axis_text_pt(chart, chart.category_axis_text_style)
+}
+
+/// Vertical correction for a bottom legend in an Excel worksheet chart.
+///
+/// With only the legend size changed to 7, 9, 11, 14 and 18pt, Excel moves the
+/// baseline by +1, 0, -1, -2 and -3 chart-local points. Typst's baseline moves
+/// down by 0.7pt per text point inside the unchanged automatic legend band.
+/// Cancelling that response and restoring Excel's three-point grid cadence
+/// reproduces the native seats while leaving the plot and category band alone.
+fn excel_bottom_legend_y_shift_pt(chart: &Chart) -> f64 {
+    if chart.host != crate::ir::ChartHost::Spreadsheet
+        || chart.legend_position != LegendPosition::Bottom
+        || (chart.legend_text_style.size_pt.is_none() && chart.text_style.size_pt.is_none())
+    {
+        return 0.0;
+    }
+    let from_nine_pt: f64 = chart_legend_text_pt(chart) - 9.0;
+    EXCEL_BOTTOM_LEGEND_BASE_Y_SHIFT_PT + EXCEL_BOTTOM_LEGEND_Y_SHIFT_GROWTH_EM * from_nine_pt
+        - (from_nine_pt / 3.0).round()
+}
+
+/// Left coordinate of a rotated category-label box whose trailing end pins to
+/// its band's centre — less the horizontal inset a PowerPoint chart keeps
+/// between the centre and the trailing end (#1022).
+pub(super) fn chart_category_rotated_label_x(chart: &Chart, centre: f64, label_box_w: f64) -> f64 {
+    let inset: f64 = if chart.host == crate::ir::ChartHost::Presentation {
+        PPTX_ROTATED_CATEGORY_LABEL_X_INSET_EM
+            * chart_axis_text_pt(chart, chart.category_axis_text_style)
+    } else {
+        0.0
+    };
+    centre - label_box_w - inset
+}
+
+/// Gutters the category labels and the value tick labels take inside the box,
+/// alongside whatever the legend and the axis titles reserve.
+fn axis_label_gutters(chart: &Chart, frame: Option<(f64, f64)>) -> (f64, f64) {
+    let (title_left, title_bottom) = axis_title_gutters(chart);
+    if matches!(chart.chart_type, ChartType::Bar) {
+        (
+            chart_category_gutter_pt(chart) + title_left,
+            chart_tick_band_pt(chart) + title_bottom,
+        )
+    } else {
+        let category_band: f64 = if chart_category_labels_rotated(chart, frame) {
+            chart_category_rotated_gutter_pt(chart)
+        } else if chart.host == crate::ir::ChartHost::Spreadsheet
+            && (chart.text_style.size_pt.is_some()
+                || chart.category_axis_text_style.size_pt.is_some())
+        {
+            let size_pt: f64 = chart_axis_text_pt(chart, chart.category_axis_text_style);
+            EXCEL_COLUMN_BOTTOM_EDGE_PAD_PT
+                + EXCEL_COLUMN_CATEGORY_BAND_AT_NINE_PT
+                + EXCEL_COLUMN_CATEGORY_BAND_GROWTH_EM * (size_pt - 9.0)
+        } else if powerpoint_column_chrome(chart)
+            && (chart.text_style.size_pt.is_some()
+                || chart.category_axis_text_style.size_pt.is_some())
+        {
+            // PowerPoint reserves one band under a plot for the flat labels
+            // that sit there, whichever axis owns them. Re-measuring the
+            // category band on the #1437 column exports of `bar-chart.pptx`
+            // gives 25.052, 28.767, 39.902 and 51.028pt at 10, 12, 18 and 24pt,
+            // whose least-squares line `6.5009 + 1.8554 em` reproduces the bar
+            // family's own value tick band to 0.08pt — so the two share the
+            // constants rather than carrying a near-duplicate pair. Five title
+            // sizes over the same 18pt category axis leave the band on 39.902pt
+            // throughout, which is what says it belongs to the labels.
+            //
+            // [`chart_category_band_pt`] is the band one category takes *across*
+            // the axis, not under it; using it here reserved 3.4em and put the
+            // page-8 plot floor 13.6pt high (issue #1437).
+            //
+            // The label's face sets the band, not its size alone: thirteen
+            // faces through `scripts/probes/issue-1674-column-plot-face.json`
+            // put it on `6.5pt + 5/3 ascent + 1 descent` of the category
+            // face's window box within 0.006pt, and the #1437 line above is
+            // that model evaluated in Calibri (issue #1674).
+            //
+            // A label wider than its band wraps instead of slanting, and every
+            // line past the first adds one leaded line of its own face to the
+            // band (issue #1675).
+            let size_pt: f64 = chart_axis_text_pt(chart, chart.category_axis_text_style);
+            let lines: usize = chart_category_label_line_count(chart, frame);
+            chart
+                .category_axis_font_family()
+                .and_then(chart_face_line_box_em)
+                .map_or(
+                    CHART_TICK_BAND_BASE_PT + CHART_TICK_BAND_EM * size_pt,
+                    |metrics| metrics.wrapped_category_band_pt(size_pt, lines),
+                )
+        } else {
+            chart_category_band_pt(chart)
+        };
+        (
+            chart_column_value_gutter_pt(chart) + title_left,
+            category_band + title_bottom,
+        )
+    }
+}
+
+/// Space the axis titles reserve, as `(left, bottom)` in points.
+///
+/// The value-axis title runs a quarter turn anticlockwise down the left edge,
+/// so it costs width; the category-axis title sits flat under the tick labels
+/// and costs height (issue #552).
+fn axis_title_gutters(chart: &Chart) -> (f64, f64) {
+    (
+        if chart.value_axis_title.is_some() {
+            AXIS_TITLE_H
+        } else {
+            0.0
+        },
+        if chart.category_axis_title.is_some() {
+            AXIS_TITLE_H
+        } else {
+            0.0
+        },
+    )
+}
+
+/// Thickness of an axis-title band: a 9pt line plus breathing room.
+const AXIS_TITLE_H: f64 = 15.0;
+
+/// Height of one data-label line: the span to centre across when the label
+/// sits on its segment, and the box to offset by when it sits at the
+/// segment's end instead (issue #901).
+///
+/// The 10pt this was fixed at is `chart_label_box_h(8.0)`, the box for the 8pt
+/// the labels were hardcoded to; sizing it from the resolved size keeps that
+/// 1.25x relationship at every size (issue #970).
+fn data_label_line_h(chart: &Chart, labels: &crate::ir::DataLabels) -> f64 {
+    chart_label_box_h(data_label_text_pt(chart, labels))
+}
+
+/// Upward seat correction for a PowerPoint column data label.
+///
+/// With the axis, plot, and tick seats already calibrated, the four column
+/// data labels on slide 14 of the #841 deck still sit 1.32–1.43pt below the
+/// fresh native export's baselines while their x agrees to 0.01pt and the
+/// value ticks agree to 0.23pt — the deviation is the label's own seat, a
+/// uniform 0.114em at the label size (#1025).
+pub(super) fn pptx_column_data_label_seat_pt(chart: &Chart, labels: &crate::ir::DataLabels) -> f64 {
+    if chart.host == crate::ir::ChartHost::Presentation {
+        PPTX_COLUMN_DATA_LABEL_SEAT_EM * data_label_text_pt(chart, labels)
+    } else {
+        0.0
+    }
+}
+
+/// See [`pptx_column_data_label_seat_pt`]: mean measured offset 1.365pt at
+/// 11.97pt.
+const PPTX_COLUMN_DATA_LABEL_SEAT_EM: f64 = 0.114;
+
+/// The size a data label is set at: its own `<c:dLbls><c:txPr>`, then the
+/// chart space's `c:txPr`, then [`CHART_DATA_LABEL_DEFAULT_PT`].
+///
+/// The labels used to be written at a literal 8pt whatever the file said, so a
+/// chart declaring anything else — the deck of #841 declares `sz="1197"` on its
+/// `c:dLbls`, its two axes and its chart space alike — drew its labels smaller
+/// than its own axis (issue #970).
+pub(super) fn data_label_text_pt(chart: &Chart, labels: &crate::ir::DataLabels) -> f64 {
+    labels
+        .text_style
+        .size_pt
+        .or(chart.text_style.size_pt)
+        .unwrap_or(CHART_DATA_LABEL_DEFAULT_PT)
+}
+
+/// The size a data label takes when neither it nor the chart space states one.
+///
+/// Deliberately not [`CHART_DEFAULT_TEXT_PT`], which was measured for tick
+/// labels (#800). Nothing measured this one; it is the literal the labels were
+/// pinned at before #970, kept so that reading a declared size does not also
+/// resize every chart that declares none. Changing it wants its own reference.
+const CHART_DATA_LABEL_DEFAULT_PT: f64 = 8.0;
+
+/// Width of the box a label gets when it sits at the end of a horizontal bar
+/// rather than across it. The centred case spans the bar, which is the wrong
+/// span once the label is beside it (issue #901).
+const LABEL_OUTSIDE_W: f64 = 40.0;
+
+/// Clearance between a bar's end and an `outEnd` label, so the text does not
+/// sit flush against it (issue #907).
+///
+/// Measured on `002.CONTOSO.pptx` (#841) through LibreOffice 24.2 with the
+/// deck's label size rewritten, to tell an absolute gap from one that scales:
+/// 8pt labels clear the bar by a mean 2.66pt, 11.97pt by 2.99pt and 18pt by
+/// 2.73pt. Across a 2.25x range in size the gap moves by 0.33pt while the
+/// ratio to the size swings from 0.33 to 0.15, so it is a constant. This is
+/// the offset added to the placement; the glyphs already sit about 0.44pt
+/// inside their line box, which brings the drawn clearance to about 2.8pt.
+const LABEL_OUTSIDE_GAP: f64 = 2.4;
+
+/// Size of the plotting rectangle itself.
+///
+/// Given a frame, the plot takes whatever is left of it after the label gutters
+/// and the legend, so the chart fills its `<p:graphicFrame>` the way PowerPoint
+/// lays it out. Without one it keeps the intrinsic size: `PLOT_MAIN` along the
+/// value axis, one `ROW` per category across it.
+fn axis_plot_size(chart: &Chart, frame: Option<(f64, f64)>, title_h: f64) -> (f64, f64) {
+    let plot_cross: f64 = chart.categories.len() as f64 * chart_category_band_pt(chart);
+    let (intrinsic_w, intrinsic_h) = if matches!(chart.chart_type, ChartType::Bar) {
+        (PLOT_MAIN, plot_cross)
+    } else {
+        (plot_cross, PLOT_MAIN)
+    };
+    let Some((frame_w, frame_h)) = frame else {
+        return (intrinsic_w, intrinsic_h);
+    };
+    let legend: LegendBox = axis_legend_box(chart);
+    let (gutter_w, gutter_h) = axis_label_gutters(chart, frame);
+    let (inset_top, inset_right) = axis_plot_insets(chart, frame, title_h);
+    let secondary_band: f64 = column_secondary_value_band_pt(chart);
+    // A frame too small for the chrome would give a negative plot, so the
+    // intrinsic size is the floor rather than a source of inverted geometry.
+    (
+        (frame_w - gutter_w - legend.left - legend.right - inset_right - secondary_band)
+            .max(MIN_PLOT_PT),
+        (frame_h - gutter_h - legend.top - legend.bottom - inset_top).max(MIN_PLOT_PT),
+    )
+}
+
+/// Extra top/right breathing room inside a framed column chart.
+/// The right-hand band a column plot gives a drawn secondary value axis' tick
+/// labels: the primary labels' own box width beyond a clearance, mirroring
+/// the left gutter (issue #1374). Zero for a bar chart, whose secondary axis
+/// runs along the top, and for a switched-off axis, whose band Office
+/// reclaims.
+///
+/// TODO(measurement): no native export of a column-and-line combo with a
+/// secondary axis is in the corpus, so this band is the left gutter's mirror
+/// rather than a measured one.
+fn column_secondary_value_band_pt(chart: &Chart) -> f64 {
+    if matches!(chart.chart_type, ChartType::Bar) {
+        return 0.0;
+    }
+    match chart_secondary_axis(chart) {
+        Some(axis) if !axis.deleted => GAP + chart_column_value_label_box(chart).1,
+        _ => 0.0,
+    }
+}
+
+/// `title_h` is the band the title block takes above the plot box, and zero
+/// when no title is drawn. A framed PowerPoint column plot's top edge is
+/// measured against the chart area itself rather than against that box, so the
+/// inset it keeps is whatever the measured band has left over — see
+/// [`powerpoint_column_top_band_pt`].
+fn axis_plot_insets(chart: &Chart, frame: Option<(f64, f64)>, title_h: f64) -> (f64, f64) {
+    if frame.is_some() && matches!(chart.chart_type, ChartType::Column) {
+        let has_declared_value_size: bool =
+            chart.text_style.size_pt.is_some() || chart.value_axis_text_style.size_pt.is_some();
+        let top: f64 = if chart.host == crate::ir::ChartHost::Spreadsheet && has_declared_value_size
+        {
+            let size_pt: f64 = chart_axis_text_pt(chart, chart.value_axis_text_style);
+            EXCEL_COLUMN_TOP_INSET_AT_NINE_PT
+                + EXCEL_COLUMN_TOP_INSET_GROWTH_EM * (size_pt - 9.0).max(0.0)
+        } else {
+            column_plot_own_top_inset_pt(chart)
+        };
+        let top: f64 = match powerpoint_column_top_band_pt(chart, title_h) {
+            // The band is measured from the chart area's own top edge, so the
+            // title block drawn above the plot box has already spent part of
+            // it and the inset is the remainder. That remainder goes negative
+            // where the title block is taller than PowerPoint's whole band —
+            // a 36pt title over an 18pt chart space spends 71.24pt of a
+            // 68.96pt band — and the plot then starts inside the block rather
+            // than 2.28pt below where PowerPoint starts it. The plot's bottom
+            // edge does not move with this, so only the top edge is placed by
+            // it. Its seat and band are #1678.
+            Some(band) => band - title_h,
+            None => top,
+        };
+        // A right legend already spends the whole band beside the plot — the
+        // native legend-free export leaves exactly 11.000pt there, and the
+        // legend sweeps leave none of it over — so the flat inset is the
+        // no-legend case rather than something added on top (issue #1663).
+        let right: f64 = if powerpoint_column_right_legend_band(chart) {
+            0.0
+        } else {
+            CHART_COLUMN_RIGHT_PAD_PT
+        };
+        (top, right)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
+/// The whole distance a framed PowerPoint column plot keeps between the chart
+/// area's top edge and its own, in points.
+///
+/// [`ChartFaceLineBox::title_band_pt`] holds the face sweeps this comes from
+/// and [`PPTX_TITLE_BAND_PT`] the Calibri ones they generalise. A chart
+/// drawing no title spends only the plot's own inset, which is what the #841
+/// exports measured; one that declares no size at all keeps the pre-#1437
+/// geometry, since no sweep covers it.
+fn powerpoint_column_top_band_pt(chart: &Chart, title_h: f64) -> Option<f64> {
+    let band: f64 = powerpoint_column_title_band_pt(chart)?;
+    let inset: f64 = column_plot_own_top_inset_pt(chart);
+    if title_h <= 0.0 {
+        return Some(inset);
+    }
+    Some(band + inset)
+}
+
+/// The title band a framed PowerPoint column plot reserves above its content.
+///
+/// A title stating no size of its own inherits the chart space's scaled size.
+/// The same band sizes the title block and the plot's top edge, so the two do
+/// not drift apart when PowerPoint and Excel use different text-scaled terms
+/// (issue #1678).
+fn powerpoint_column_title_band_pt(chart: &Chart) -> Option<f64> {
+    if !powerpoint_column_chrome(chart)
+        || (chart.title_text_style.size_pt.is_none() && chart.text_style.size_pt.is_none())
+    {
+        return None;
+    }
+    let title_pt: f64 = chart_area_title_pt(chart);
+    // A build that resolves no face keeps the Calibri fit measured by #1437.
+    Some(chart_title_face_line_box(chart).map_or(
+        PPTX_TITLE_BAND_PT + PPTX_TITLE_BAND_EM * title_pt,
+        |metrics| metrics.title_band_pt(title_pt),
+    ))
+}
+
+/// The line boxes the chart-area title's face measures its band by.
+///
+/// The title has no face of its own in the tree: a `c:title/c:txPr` states
+/// only a size here, so it inherits the chart space's.
+fn chart_title_face_line_box(chart: &Chart) -> Option<ChartFaceLineBox> {
+    chart_face_line_box_em(chart.text_font_family.as_deref()?)
+}
+
+/// The top inset a framed column plot keeps on its own account, whatever sits
+/// above it.
+///
+/// Measured on the native #841 exports, whose chart draws no title at all, so
+/// this is the whole distance from the chart area's top edge there.
+fn column_plot_own_top_inset_pt(chart: &Chart) -> f64 {
+    let size_pt: f64 = chart_axis_text_pt(chart, chart.value_axis_text_style);
+    chart
+        .value_axis_font_family()
+        .and_then(chart_face_line_box_em)
+        .map_or(
+            CHART_COLUMN_TOP_PAD_PT + CHART_COLUMN_TOP_PAD_EM * size_pt,
+            |metrics| metrics.plot_top_inset_pt(size_pt),
+        )
+}
+
+/// What the full chart-area frame leaves its inner content box after the title
+/// takes its band. The chart-area outline itself stays around both boxes; see
+/// [`write_chart_area_start`] (issue #1216).
+fn axis_content_frame(frame: Option<(f64, f64)>, title_h: f64) -> Option<(f64, f64)> {
+    frame.map(|(width, height)| (width, (height - title_h).max(MIN_PLOT_PT)))
+}
+
+/// Whether the chart is the one family whose vertical chrome is measured
+/// against native PowerPoint: a column plot on a slide.
+///
+/// The bar family keeps its own #706 calibration — see [`PPTX_TITLE_BAND_PT`]
+/// and [`chart_tick_band_pt`] — and the spreadsheet hosts theirs, so the two
+/// bands this gates never reach either (issue #1437).
+fn powerpoint_column_chrome(chart: &Chart) -> bool {
+    chart.host == crate::ir::ChartHost::Presentation
+        && matches!(chart.chart_type, ChartType::Column)
+}
+
+/// Where the plot sits when the chart states no rectangle of its own: hard
+/// against the chrome its labels and its legend reserve.
+fn automatic_plot_origin(
+    chart: &Chart,
+    content_frame: Option<(f64, f64)>,
+    title_h: f64,
+) -> (f64, f64) {
+    let legend: LegendBox = axis_legend_box(chart);
+    let (gutter_w, _) = axis_label_gutters(chart, content_frame);
+    let (inset_top, _) = axis_plot_insets(chart, content_frame, title_h);
+    (legend.left + gutter_w, legend.top + inset_top)
+}
+
+/// The plotting rectangle `c:plotArea/c:layout/c:manualLayout` states, in the
+/// plot box's own coordinates.
+///
+/// The fractions are of the whole chart area, whose top edge is `title_h` above
+/// the box, so the stated `y` comes back down by that much.
+///
+/// A rectangle that would run past the chart area is pulled back inside it
+/// along that axis — see [`pulled_back_plot_edge`]. `chart1.xml` of
+/// `tests/fixtures/xlsx/issue_1181_fit_to_height.xlsx` states `x` 0.092 with
+/// `w` 1, and its native export draws the plot from the chart area's own left
+/// edge; taken as written, the plot sat 13.9pt right of the export's
+/// (issue #1272). A bar plot whose value tick labels run along its bottom edge
+/// stops short of that edge by the last label's overhang instead — see
+/// [`pulled_back_labelled_plot_span`] (issue #1634).
+///
+/// `None` for a chart that states no rectangle, and for an unframed one: a
+/// flowed chart sizes itself from its own content, so there is no chart area to
+/// take a fraction of.
+fn stated_plot_rect(
+    chart: &Chart,
+    frame: Option<(f64, f64)>,
+    title_h: f64,
+) -> Option<(f64, f64, f64, f64)> {
+    let layout: crate::ir::ChartPlotAreaLayout = chart.plot_area_layout?;
+    let (frame_w, frame_h) = frame?;
+    let (x, width): (f64, f64) = match excel_bar_value_label_overhang_pt(chart) {
+        Some(overhang_pt) => pulled_back_labelled_plot_span(
+            layout.x * frame_w,
+            layout.width * frame_w,
+            frame_w - overhang_pt,
+            excel_bar_category_label_band_pt(chart),
+        ),
+        None => (
+            pulled_back_plot_edge(layout.x, layout.width) * frame_w,
+            layout.width * frame_w,
+        ),
+    };
+    Some((
+        x,
+        pulled_back_plot_edge(layout.y, layout.height) * frame_h - title_h,
+        width,
+        layout.height * frame_h,
+    ))
+}
+
+/// Excel's reading of a stated plot edge whose rectangle would overrun the
+/// chart area: the plot keeps its size and comes back until its far edge lands
+/// on the chart area's, and no further.
+///
+/// Measured on native Excel for Mac 16 exports of
+/// `tests/fixtures/xlsx/issue_1181_fit_to_height.xlsx` with one value of its
+/// cash-flow chart's layout rewritten per variant, the plot read off its
+/// plot-area fill and category axis. Along the width, `x` 0.092, 0.2 and 0
+/// with `w` 1 all print from the left edge; `w` 0.95 starts at 0.05 and `x` 0.3
+/// with `w` 0.8 at 0.2, each given back exactly its overrun; `w` 0.9 keeps its
+/// 0.092 because it fits. Down the frame, `y` 0.5 comes back to 0.4053 and
+/// `h` 0.7 pulls `y` 0.3277 back to 0.3, the other axis holding still every
+/// time. A rectangle larger than the chart area, or one starting before it,
+/// never reaches here: the parser keeps the automatic layout for it, as Excel
+/// does, so the pulled-back edge is never negative.
+///
+/// That chart has no tick labels. Where a bar plot's value axis prints them,
+/// the horizontal limit sits further in — see
+/// [`pulled_back_labelled_plot_span`].
+fn pulled_back_plot_edge(edge: f64, size: f64) -> f64 {
+    edge.min(1.0 - size)
+}
+
+/// Excel's reading of a stated horizontal span, in points, on a bar plot whose
+/// value tick labels run along its bottom edge: a span ending past `limit`
+/// comes back until it ends on it, but never to start inside `category_band`,
+/// so a span too wide for both gives up width instead.
+///
+/// Measured on native Excel for Mac 16.112 exports of
+/// `tests/fixtures/xlsx/issue_1181_fit_to_height.xlsx` with one value of its
+/// `january income:` bar chart's layout rewritten per variant, the plot read
+/// off its category axis and last gridline as fractions of the printed chart
+/// area. The file's `x` 0.302 with `w` 0.641 ends at 0.9437 and fits as
+/// stated; `x` 0.33, 0.36, 0.40 and 0.50 all end at 0.9538, although 0.33
+/// would still end inside the chart area; and `w` 0.9 runs from 0.2863 to
+/// 0.9538. `limit` is where [`excel_bar_value_label_overhang_pt`] puts that
+/// 0.9538, and `category_band` where [`excel_bar_category_label_band_pt`] puts
+/// the 0.2863.
+///
+/// Only a span that has to come back is held off the band. `x` 0.1 with the
+/// file's `w` fits, and Excel prints it at 0.1, cutting the category labels
+/// short with an ellipsis; `x` 0.1 with `w` 0.9 does not, and prints at 0.2863
+/// exactly as `w` 0.9 does from the file's `x` (issue #1634).
+fn pulled_back_labelled_plot_span(
+    edge: f64,
+    size: f64,
+    limit: f64,
+    category_band: f64,
+) -> (f64, f64) {
+    if edge + size <= limit {
+        return (edge, size);
+    }
+    let pulled_back: f64 = limit - size;
+    if pulled_back >= category_band {
+        (pulled_back, size)
+    } else {
+        (category_band, (limit - category_band).max(MIN_PLOT_PT))
+    }
+}
+
+/// The band a bar plot's category labels take between the chart area's left
+/// edge and a plot [`pulled_back_labelled_plot_span`] holds off them, in
+/// unscaled chart points: the widest label's advance plus
+/// [`EXCEL_CATEGORY_LABEL_BAND_PT`] and [`EXCEL_CATEGORY_LABEL_BAND_EM`] of
+/// the labels' size. Zero for an axis that prints no label.
+fn excel_bar_category_label_band_pt(chart: &Chart) -> f64 {
+    if chart.category_axis_deleted {
+        return 0.0;
+    }
+    let size_pt: f64 = chart_axis_text_pt(chart, chart.category_axis_text_style);
+    chart_category_label_widest_pt(chart).map_or(0.0, |widest_pt| {
+        widest_pt + EXCEL_CATEGORY_LABEL_BAND_PT + EXCEL_CATEGORY_LABEL_BAND_EM * size_pt
+    })
+}
+
+/// Excel's category-label band beyond the widest label, as a fixed and a
+/// text-scaled part.
+///
+/// Four native exports of the `w` 0.9 variant of the `january income:` chart
+/// (see [`pulled_back_labelled_plot_span`]) with the category axis' `sz`
+/// rewritten start the plot this far inside the chart area, the widest label
+/// `wages (after-tax)` measured in the chart's Trebuchet MS:
+///
+/// | size | band | label | remainder |
+/// | ---: | ---: | ---: | ---: |
+/// | 8pt | 70.846 | 62.184 | 8.662 |
+/// | 10pt | 88.165 | 77.730 | 10.436 |
+/// | 14pt | 122.824 | 108.821 | 14.003 |
+/// | 18pt | 157.488 | 139.913 | 17.575 |
+///
+/// The least-squares line through the remainders is `1.525 + 0.89152 em`, and
+/// no export sits further than 0.005pt from it. The widest label starts 1.50pt
+/// inside the chart area in all four, so the text-scaled part is the gap
+/// between the labels and the plot. This is not
+/// [`CHART_LABEL_EDGE_PAD_PT`]/[`CHART_LABEL_EDGE_PAD_EM`], PowerPoint's
+/// automatic gutter, which is 5.3pt wider at 10pt.
+const EXCEL_CATEGORY_LABEL_BAND_PT: f64 = 1.525;
+const EXCEL_CATEGORY_LABEL_BAND_EM: f64 = 0.89152;
+
+/// How far inside the chart area's right edge Excel stops a pulled-back bar
+/// plot: half the last value tick label, which sits centred on the plot's
+/// right edge, plus [`EXCEL_VALUE_LABEL_OVERHANG_PAD_PT`].
+///
+/// `None` wherever that was not measured — a column or line plot, whose
+/// horizontal axis is the category axis; a PowerPoint or Word host; a deleted
+/// value axis, which prints no labels; a chart stating no text size; or a face
+/// that cannot be measured. Each keeps [`pulled_back_plot_edge`]'s limit. Every
+/// export measured is a worksheet chart; a chartsheet's plot area is laid out
+/// by the same Excel chart engine and takes the same reading, unprobed.
+fn excel_bar_value_label_overhang_pt(chart: &Chart) -> Option<f64> {
+    let is_excel_host: bool = matches!(
+        chart.host,
+        crate::ir::ChartHost::Spreadsheet | crate::ir::ChartHost::SpreadsheetChartsheet
+    );
+    let has_declared_size: bool =
+        chart.text_style.size_pt.is_some() || chart.value_axis_text_style.size_pt.is_some();
+    if !matches!(chart.chart_type, ChartType::Bar)
+        || !is_excel_host
+        || chart.value_axis_deleted
+        || !has_declared_size
+    {
+        return None;
+    }
+    let last_label: String = chart_value_axis_labels(chart).pop()?;
+    let bold: bool = chart
+        .text_style
+        .resolved_bold(chart.value_axis_text_style)
+        .unwrap_or(false);
+    let family: &str = chart
+        .value_axis_font_family()
+        .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_FAMILY);
+    let advance_em: f64 = chart_text_advance_em(family, bold, &last_label)?;
+    Some(
+        advance_em * chart_axis_text_pt(chart, chart.value_axis_text_style) / 2.0
+            + EXCEL_VALUE_LABEL_OVERHANG_PAD_PT,
+    )
+}
+
+/// What Excel keeps between a bar plot's last value tick label and the chart
+/// area's right edge when it pulls the plot back, in unscaled chart points.
+///
+/// The three pulled-back exports of the `january income:` chart that change
+/// the label (see [`pulled_back_labelled_plot_span`]) end the plot this far
+/// inside the chart area, the label's advance measured in the chart's Trebuchet
+/// MS:
+///
+/// | last label | inset | half the label | remainder |
+/// | --- | ---: | ---: | ---: |
+/// | `50%` at 10pt | 14.245 | 8.245 | 6.000 |
+/// | `50.00%` at 10pt | 21.325 | 15.325 | 6.000 |
+/// | `50%` at 14pt | 17.540 | 11.542 | 5.998 |
+///
+/// Flat across the label's size, so it is not text-scaled. The label's true
+/// advance is what the limit reads, although Excel paints whole-point glyph
+/// advances: fitted on the painted widths instead (16, 31 and 23.39pt), the
+/// remainder spreads from 5.83 to 6.25pt. Every label measured ends in `%`.
+const EXCEL_VALUE_LABEL_OVERHANG_PAD_PT: f64 = 6.0;
+
+/// The plotting rectangle of a framed axis plot, in the plot box's own
+/// coordinates.
+struct AxisPlot {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    /// How far a stated rectangle moved the plot off the automatic origin.
+    ///
+    /// Zero for every chart that states none. The bars, the category labels and
+    /// the value tick labels are placed from the box's own edges rather than
+    /// from the plot's origin, so this is what carries them along with a plot
+    /// the file put somewhere else (issue #1182).
+    dx: f64,
+    dy: f64,
+}
+
+/// Lay out the plotting rectangle: the one `c:plotArea/c:layout` states, else
+/// the automatic one that fills the frame less its chrome.
+fn axis_plot_layout(chart: &Chart, frame: Option<(f64, f64)>, title_h: f64) -> AxisPlot {
+    let content_frame: Option<(f64, f64)> = axis_content_frame(frame, title_h);
+    let (auto_x, auto_y) = automatic_plot_origin(chart, content_frame, title_h);
+    let (x, y, width, height) = stated_plot_rect(chart, frame, title_h).unwrap_or_else(|| {
+        let (width, height) = axis_plot_size(chart, content_frame, title_h);
+        (auto_x, auto_y, width, height)
+    });
+    AxisPlot {
+        x,
+        y,
+        width,
+        height,
+        dx: x - auto_x,
+        dy: y - auto_y,
+    }
+}
+
+#[cfg(test)]
+pub(super) fn axis_plot_rect(
+    chart: &Chart,
+    frame: (f64, f64),
+    has_title: bool,
+) -> (f64, f64, f64, f64) {
+    let title_h = if has_title {
+        chart_area_title_h(chart)
+    } else {
+        0.0
+    };
+    let plot = axis_plot_layout(chart, Some(frame), title_h);
+    // The box sits `title_h` below the frame's own top edge.
+    let top = title_h + plot.y;
+    (plot.x, top, plot.x + plot.width, top + plot.height)
+}
+
+/// Smallest plotting rectangle worth drawing, in points.
+const MIN_PLOT_PT: f64 = 24.0;
+
+/// Height the chart-area title block takes above the plot box: an 11pt line
+/// plus the 4pt gap under it. A framed chart spends this out of its frame
+/// rather than on top of it, or the plot runs past the frame's bottom edge.
+const AREA_TITLE_H: f64 = 19.0;
+
+/// Size of the chart-area title when the chart declares no `c:txPr`.
+const CHART_AREA_TITLE_PT: f64 = 11.0;
+
+/// The string Office prints for an automatic title no series can name.
+///
+/// The part holds the title's face, size and colour but not its text, so the
+/// running application supplies it — and supplies it in *its own* UI language,
+/// not the chart's: `tests/fixtures/xlsx/any_sheets.xlsx` declares
+/// `<c:lang val="ru-RU"/>` and a Korean Excel for Mac 16.100 exports it as
+/// "차트 제목". No language in the package predicts that, so the English
+/// placeholder is written for every one of them; what the layout turns on is
+/// that a string is printed and takes a band, not which one (issue #1146).
+const AUTOMATIC_CHART_TITLE: &str = "Chart Title";
+
+/// What Office scales the chart's text size by for the chart-area title: the
+/// 18pt `bar-chart.pptx` declares comes back as a 22pt title.
+const CHART_AREA_TITLE_SCALE: f64 = 1.2;
+
+/// Band a chart-area title of a size the title itself states takes, above the
+/// plot's own inset.
+///
+/// Measured against twelve Excel for Mac 16.100 exports of the `Chart`
+/// chartsheet of `tests/fixtures/xlsx/any_sheets.xlsx`, forced to Letter
+/// landscape, with the title's `sz` rewritten one value at a time and nothing
+/// else touched. `mutool draw -F trace` puts the chart area's top edge at
+/// 58.00pt on every one of them, and the topmost major gridline — the plot
+/// box's top — this far below it:
+///
+/// | title `sz` | plot top below the chart area |
+/// | ---: | ---: |
+/// | 7 | 32.09 |
+/// | 8 | 33.83 |
+/// | 9 | 35.56 |
+/// | 10 | 37.28 |
+/// | 11 | 39.02 |
+/// | 12 | 40.75 |
+/// | 14 | 44.20 |
+/// | 16 | 47.66 |
+/// | 18 | 51.12 |
+/// | 24 | 61.50 |
+/// | 32 | 75.33 |
+/// | 36 | 82.24 |
+///
+/// A thirteenth export with the `<c:title>` element removed altogether starts
+/// its plot 11.00pt below the same edge, which is the inset the plot takes on
+/// its own account — [`axis_plot_insets`] models that separately, so it comes
+/// off before the band is fitted. The least-squares line through the twelve is
+/// then `8.994 + 1.72912 em`, and no export sits further than 0.007pt from it.
+const CHART_TITLE_BAND_PT: f64 = 8.994;
+const CHART_TITLE_BAND_EM: f64 = 1.72912;
+
+/// The title's share of the band a framed PowerPoint column plot keeps above
+/// itself — unlike [`CHART_TITLE_BAND_EM`], this is the PowerPoint fit.
+///
+/// Two one-factor native PowerPoint 16.112 sweeps of
+/// `tests/fixtures/pptx/bar-chart.pptx` repackaged as a column chart on its
+/// 480 x 320pt frame measure the band, the plot's top edge read off the value
+/// axis line with `mutool draw -F trace`:
+///
+/// | probe | factor | plot top below the frame |
+/// | --- | --- | --- |
+/// | `issue-1435-column-legend-center` | chart space 10, 12, 18, 24, 36pt | 34.752, 38.900, 51.353, 63.802, 88.708 |
+/// | `issue-1437-column-plot-top` | title 10, 14, 18, 24, 36pt at an 18pt chart space | 37.192, 42.077, 46.962, 54.282, 68.932 |
+///
+/// The first sweep carries the automatic title with the chart space at
+/// [`CHART_AREA_TITLE_SCALE`]; the second states the title's own size and
+/// leaves every other string at 18pt, so between them the title's share
+/// separates from the plot's own inset. Taking [`axis_plot_insets`]' measured
+/// `5pt + 0.607em` off both series leaves one least-squares line through all
+/// ten exports, `9.0253 + 1.22242 em` on the printed title size, and no export
+/// sits further than 0.026pt from it. Its fixed term lands on
+/// [`CHART_TITLE_BAND_PT`] to 0.032pt, so the two hosts differ in the
+/// text-scaled term alone.
+///
+/// The same measured band sizes the title block and the plot top through
+/// [`chart_area_title_h`] and [`powerpoint_column_top_band_pt`]. Its baseline
+/// is separately seated from the same exports by
+/// [`PPTX_COLUMN_TITLE_BASELINE_PT`] and `_EM` (#1678). The bar family keeps
+/// its own #706 band, whose constant carries a bar plot's top inset as well —
+/// see [`CHART_PLOT_TOP_PAD_PT`] — and re-splitting that needs bar-family
+/// exports this calibration does not have (issue #1437).
+///
+/// Both terms are Calibri quantities, because both sweeps export a Calibri
+/// deck: the fixed one is [`PPTX_COLUMN_TITLE_BAND_PT`] to 0.026pt and the
+/// scaled one is Calibri's own `1.2207em` line box to 0.0017. Thirteen faces
+/// separate them — see [`ChartFaceLineBox::title_band_pt`], which a column
+/// plot on a slide takes wherever its face resolves. This pair is what a
+/// build resolving no face falls back to (issue #1674).
+const PPTX_TITLE_BAND_PT: f64 = 9.0253;
+const PPTX_TITLE_BAND_EM: f64 = 1.22242;
+
+/// Left text inset inside a manually positioned PowerPoint chart-title box.
+///
+/// The two title layouts in `GENERAL SERVICES.pptx` put the first glyph
+/// exactly 3pt to the right of `chart_left + c:x * chart_width` in native
+/// PowerPoint PDF exports (issue #1423).
+const PPTX_CHART_TITLE_LEFT_INSET_PT: f64 = 3.0;
+
+/// Baseline seat of an Excel chartsheet title below the chart area's top.
+///
+/// The same twelve exports used for [`CHART_TITLE_BAND_PT`] put the title
+/// baselines on `8.251pt + 1.26390em`, with no sample further than 0.70pt from
+/// that fit (issue #1314). An explicit seat avoids inheriting the ascent and
+/// descent of whatever fallback face Typst happens to resolve.
+const CHARTSHEET_TITLE_BASELINE_PT: f64 = 8.251;
+const CHARTSHEET_TITLE_BASELINE_EM: f64 = 1.26390;
+
+/// PowerPoint column-title baseline below the chart area's top edge.
+///
+/// Native PowerPoint 16.112 exports from the two `#1437` one-factor sweeps
+/// put the baseline within 0.6pt of `8.21 + 0.923em` across title sizes 10,
+/// 14, 18, 24, and 36pt. The title uses this seat inside its measured band
+/// rather than being centred in the block (issue #1678).
+const PPTX_COLUMN_TITLE_BASELINE_PT: f64 = 8.21;
+const PPTX_COLUMN_TITLE_BASELINE_EM: f64 = 0.923;
+
+/// The chart-area title's size.
+///
+/// A `c:title` stating a size of its own states the printed size:
+/// `any_sheets.xlsx` writes `sz="1400"` on the title's `c:txPr` and Excel
+/// prints `trm="14 0 0 14"`. [`CHART_AREA_TITLE_SCALE`] belongs to the chart
+/// space's size, which Office scales *into* a title size, and applying it to a
+/// size the title already states would scale it twice (issue #1215). A
+/// `c:tx/c:rich` run or paragraph size outranks that `c:txPr` and arrives here
+/// the same way (issue #1424).
+///
+/// A chart declaring nothing keeps [`CHART_AREA_TITLE_PT`], which is what
+/// [`AREA_TITLE_H`] was measured against; one whose chart space declares a
+/// size gets that size scaled the way Office scales it (issue #669).
+fn chart_area_title_pt(chart: &Chart) -> f64 {
+    if let Some(stated) = chart.title_text_style.size_pt {
+        return stated;
+    }
+    chart
+        .text_style
+        .size_pt
+        .map_or(CHART_AREA_TITLE_PT, |declared| {
+            // Office states sizes in hundredths of a point, so the scaled value
+            // is rounded there rather than carried as `18 * 1.2` binary noise.
+            (declared * CHART_AREA_TITLE_SCALE * 100.0).round() / 100.0
+        })
+}
+
+/// Height the chart-area title block takes.
+///
+/// A framed PowerPoint column with a stated title or chart-space size uses the
+/// host's measured band, shared with its plot top. Other charts retain their
+/// existing title sizing rules: a title's own size uses the Excel-fit band,
+/// chart-space-only sizes use the prior plot-top fit, and [`AREA_TITLE_H`]
+/// preserves charts with no stated text size. Native PowerPoint 16.112 exports
+/// at 10, 12, 18, 24, and 36pt establish the explicit chart-space size
+/// relationship in between (#706). This changes only title/plot chrome, not
+/// the horizontal automatic axis scale resolved by [`powerpoint_nice_axis`].
+pub(super) fn chart_area_title_h(chart: &Chart) -> f64 {
+    if let Some(band) = powerpoint_column_title_band_pt(chart) {
+        band
+    } else if chart.title_text_style.size_pt.is_some() {
+        CHART_TITLE_BAND_PT + CHART_TITLE_BAND_EM * chart_area_title_pt(chart)
+    } else if chart.text_style.size_pt.is_some() {
+        CHART_PLOT_TOP_PAD_PT + CHART_PLOT_TOP_PAD_EM * chart_text_pt(chart)
+    } else {
+        AREA_TITLE_H / CHART_AREA_TITLE_PT * chart_area_title_pt(chart)
+    }
+}
+
+/// Every `text` argument the chart-area title carries beyond its size.
+///
+/// The title's own weight overrides the chart space's weight. The weight the
+/// title has always been drawn with is the fallback when neither states one,
+/// so a chart that says nothing does not change. The colour resolves the same
+/// way — the title's own over the chart space's — and stays empty where
+/// neither states one, leaving the black it was drawn in (issue #1215).
+///
+/// The title's own weight and colour are its `c:tx/c:rich` run properties over
+/// its `c:txPr`, resolved in the parser: PowerPoint writes a bold accented
+/// title on the run while leaving the regular grey paragraph default in the
+/// `c:txPr` beside it (issue #1424).
+fn chart_area_title_attrs(chart: &Chart) -> String {
+    let bold: bool = chart
+        .title_text_style
+        .bold
+        .or(chart.text_style.bold)
+        .unwrap_or(true);
+    let weight: &str = if bold { ", weight: \"bold\"" } else { "" };
+    let fill: String = match chart.text_style.resolved_fill(chart.title_text_style) {
+        (Some(color), alpha) => format!(", fill: {}", chart_text_paint(&color, alpha)),
+        (None, _) => String::new(),
+    };
+    format!("{weight}{fill}")
+}
+
+/// Draw a chart title in the width of the chart that owns it.
+///
+/// A fixed slide chart is placed inside a wider slide context. Percentage
+/// widths resolve against that context, not the chart's `<p:graphicFrame>`, so
+/// a framed title must name the frame width explicitly (#997). Flowed charts
+/// have no independent frame and keep their existing container alignment.
+fn write_chart_title(
+    out: &mut String,
+    chart: &Chart,
+    title: &str,
+    frame: Option<(f64, f64)>,
+    fixed_height: Option<f64>,
+) {
+    let escaped_title: String = escape_typst(title);
+    let title_size: String = format_f64(chart_area_title_pt(chart));
+    let attrs: String = chart_area_title_attrs(chart);
+    let powerpoint_column_baseline: Option<f64> = if fixed_height.is_some() {
+        powerpoint_column_title_band_pt(chart).map(|_| {
+            PPTX_COLUMN_TITLE_BASELINE_PT
+                + PPTX_COLUMN_TITLE_BASELINE_EM * chart_area_title_pt(chart)
+        })
+    } else {
+        None
+    };
+    let fixed_title: String = if chart.host == crate::ir::ChartHost::SpreadsheetChartsheet {
+        let baseline_pt: f64 = CHARTSHEET_TITLE_BASELINE_PT
+            + CHARTSHEET_TITLE_BASELINE_EM * chart_area_title_pt(chart);
+        format!(
+            "#align(center + top)[#text(top-edge: {}pt, bottom-edge: \"baseline\", size: {}pt{})[{}]]",
+            format_f64(baseline_pt),
+            title_size,
+            attrs,
+            escaped_title,
+        )
+    } else if let Some(baseline_pt) = powerpoint_column_baseline {
+        format!(
+            "#align(center + top)[#text(top-edge: {}pt, bottom-edge: \"baseline\", size: {}pt{})[{}]]",
+            format_f64(baseline_pt),
+            title_size,
+            attrs,
+            escaped_title,
+        )
+    } else {
+        format!(
+            "#align(center + horizon)[#text(size: {}pt{})[{}]]",
+            title_size, attrs, escaped_title,
+        )
+    };
+    match (frame, fixed_height) {
+        (Some((width, _)), Some(height)) => {
+            let _ = writeln!(
+                out,
+                "#block(width: {}pt, height: {}pt, above: 0pt, below: 0pt)[{}]",
+                format_f64(width),
+                format_f64(height),
+                fixed_title,
+            );
+        }
+        (None, Some(height)) => {
+            let _ = writeln!(
+                out,
+                "#block(width: 100%, height: {}pt, above: 0pt, below: 0pt)[{}]",
+                format_f64(height),
+                fixed_title,
+            );
+        }
+        (Some((width, _)), None) => {
+            let _ = writeln!(
+                out,
+                "#block(width: {}pt)[#align(center)[#text(size: {}pt{})[{}]]]",
+                format_f64(width),
+                title_size,
+                attrs,
+                escaped_title,
+            );
+        }
+        (None, None) => {
+            let _ = writeln!(
+                out,
+                "#align(center)[#text(size: {}pt{})[{}]]",
+                title_size, attrs, escaped_title,
+            );
+        }
+    }
+}
+
+/// Draw a PowerPoint title at the edge-mode anchor its own manual layout
+/// states while preserving the existing title band already reserved from the
+/// plot. `c:title/c:overlay` is not modelled yet, so manual placement does not
+/// change that reservation.
+fn write_manual_chart_title(
+    out: &mut String,
+    chart: &Chart,
+    title: &str,
+    frame: (f64, f64),
+    layout: crate::ir::ChartTitleLayout,
+    title_h: f64,
+    fixed_title_band: bool,
+) {
+    let escaped_title: String = escape_typst(title);
+    let title_size: f64 = chart_area_title_pt(chart);
+    let attrs: String = chart_area_title_attrs(chart);
+    let dx: f64 = layout.x * frame.0 + PPTX_CHART_TITLE_LEFT_INSET_PT;
+    let dy: f64 = layout.y * frame.1;
+    // Line/radar/pie titles historically contribute their natural line box
+    // plus a separate 4pt gap. `place` contributes no flow height, so keep the
+    // old total explicitly; fixed axis titles already own the entire band.
+    let block_h: f64 = if fixed_title_band {
+        title_h
+    } else {
+        (title_h - 4.0).max(0.0)
+    };
+    let _ = writeln!(
+        out,
+        "#block(width: {}pt, height: {}pt, above: 0pt, below: 0pt)[#place(top + left, dx: {}pt, dy: {}pt, text(top-edge: {}pt, bottom-edge: \"baseline\", size: {}pt{})[{}])]",
+        format_f64(frame.0),
+        format_f64(block_h),
+        format_f64(dx),
+        format_f64(dy),
+        format_f64(title_size),
+        format_f64(title_size),
+        attrs,
+        escaped_title,
+    );
+}
+
+struct ChartTitleBand {
+    height: f64,
+    fixed: bool,
+}
+
+/// Open a chart area's one outer outline and its title-bearing content stack.
+///
+/// `c:chartSpace/c:spPr` is a sibling of `c:chart`, so its stroke and fill
+/// enclose the title as well as the plot. A titled chart therefore opens the
+/// full-area box first, writes the title inside it, and gives an unstyled inner
+/// box the remaining content extent. An untitled chart keeps one box (#1216,
+/// #1217).
+///
+/// A fixed title band preserves the axis plot's measured title height.
+/// The line, radar and pie families keep their existing intrinsic title plus
+/// 4pt gap; only the ownership of the surrounding stroke changes.
+fn write_chart_area_start(
+    out: &mut String,
+    chart: &Chart,
+    title: Option<&str>,
+    chart_area: Option<(f64, f64)>,
+    content_extent: (f64, f64),
+    title_band: ChartTitleBand,
+) -> bool {
+    let wraps_title: bool = title.is_some();
+    if let Some(title) = title {
+        let (area_w, area_h): (f64, f64) =
+            chart_area.unwrap_or((content_extent.0, content_extent.1 + title_band.height));
+        write_paint_box_start(
+            out,
+            (area_w, area_h),
+            &chart_area_fill(&chart.chart_area_fill),
+            &chart_area_stroke(&chart.chart_area_outline, chart.host),
+        );
+        if let (crate::ir::ChartHost::Presentation, Some(layout), Some(frame)) =
+            (chart.host, chart.title_layout, chart_area)
+        {
+            write_manual_chart_title(
+                out,
+                chart,
+                title,
+                frame,
+                layout,
+                title_band.height,
+                title_band.fixed,
+            );
+        } else {
+            write_chart_title(
+                out,
+                chart,
+                title,
+                chart_area,
+                title_band.fixed.then_some(title_band.height),
+            );
+        }
+        if !title_band.fixed {
+            out.push_str("#v(4pt)\n");
+        }
+    }
+
+    let content_stroke: String = if wraps_title {
+        "none".to_string()
+    } else {
+        chart_area_stroke(&chart.chart_area_outline, chart.host)
+    };
+    let content_fill: String = if wraps_title {
+        "none".to_string()
+    } else {
+        chart_area_fill(&chart.chart_area_fill)
+    };
+    write_paint_box_start(out, content_extent, &content_fill, &content_stroke);
+    wraps_title
+}
+
+/// Open the painted box the chart's content is laid out in. On a worksheet
+/// the enclosing `place` already sits on the fitted sheet origin, so the
+/// fill, outline and content share it (#1542, #1607).
+fn write_paint_box_start(out: &mut String, extent: (f64, f64), fill: &str, stroke: &str) {
+    let _ = writeln!(
+        out,
+        "#box(width: {}pt, height: {}pt, fill: {fill}, stroke: {stroke})[",
+        format_f64(extent.0),
+        format_f64(extent.1),
+    );
+}
+
+/// Close the inner content box and, for a titled chart, its full-area wrapper.
+fn write_chart_area_end(out: &mut String, wraps_title: bool) {
+    out.push_str("]\n");
+    if wraps_title {
+        out.push_str("]\n");
+    }
+}
+
+/// Draw the shapes `<c:userShapes>` lays over the chart.
+///
+/// `area` is the chart area the anchors' fractions are of, and `title_h` the
+/// band of it the chart-area title took above the box this writes into: a
+/// shape is anchored to the whole area, not to what the title left.
+///
+/// **The placement is measured, not read off the schema.** Native Excel for
+/// Mac 16 exports of `tests/fixtures/xlsx/issue_1181_fit_to_height.xlsx`,
+/// staged inside Excel's own sandbox container and traced with
+/// `mutool draw -F trace`, with one factor of the `CASH FLOW` caption's own
+/// anchor rewritten at a time. Its chart area is 786.7 x 75.55pt and the sheet
+/// prints at 0.78; every figure below is in unscaled points:
+///
+/// | rewritten | the caption moves |
+/// | --- | --- |
+/// | `cdr:from/cdr:x` 0 -> 0.05 | 39.34pt right, which is 0.05 x 786.7 |
+/// | `cdr:from/cdr:y` 0.17913 -> 0.25 | 5.00pt down (13.53 -> 18.89 unrounded) |
+/// | `cdr:from/cdr:y` 0.17913 -> 0.3 | 9.00pt down (13.53 -> 22.67 unrounded) |
+/// | `a:bodyPr@lIns` 7.2 -> 0 | 7.20pt left |
+/// | `a:bodyPr@tIns` 3.6 -> 0 | 4.00pt up |
+/// | `a:rPr@sz` 1500 -> 1000 / 2000 / 3000 / 4000 | 4.00 up / 5.00 down / 15.00 down / 24.00 down |
+/// | `cdr:to/cdr:y` 0.50958 -> 0.9 | nothing |
+/// | `a:latin@typeface` Cambria -> Arial | nothing |
+///
+/// So the horizontal is exact — the fraction of the area's width, plus the
+/// left inset unrounded — while every vertical term is a whole point on its
+/// own: the corner's offset into the area, the top inset, and the ascent the
+/// first baseline sits below the text's top edge. The size sweep is what
+/// identifies that last one: `round(0.9502 x size)` for the 0.95020em ascent
+/// [`chart_face_line_metrics_em`] reads for Cambria is 10/14/19/29/38pt at
+/// 10/15/20/30/40pt, whose steps are exactly the measured -4/0/+5/+15/+24.
+/// Rounding the sum of the terms instead predicts +14 at 30pt, and a flat
+/// 1.0em ascent predicts +25 at 40pt; the export contradicts both. The shape's
+/// own height never enters — `cdr:to` at 0.9 left the caption where it was.
+///
+/// Two things this fixture cannot settle. Which table the ascent comes from:
+/// Cambria's `hhea` ascender and its `usWinAscent` are the same 1946/2048, so
+/// the sweep does not separate them, and the reader takes the `hhea` one every
+/// other chart face is measured from. And whether the ascent is the face's at
+/// all: Arial's 0.90527em rounds to the same 14pt at 15pt, which is why
+/// swapping the typeface moved nothing.
+///
+/// `<a:bodyPr@anchor>` is not modelled: the only shape available to measure
+/// carries `<a:spAutoFit/>`, so Excel sizes its box to the text and `ctr`
+/// exports identically to `t`.
+///
+/// Every plot variant calls this. The bordered-table fallback
+/// [`generate_chart_body`] drops to for a chart it cannot plot does not: that
+/// box is a placeholder listing the series, not a chart area, so a fraction of
+/// it would put the shape somewhere the file never asked for.
+fn write_chart_user_shapes(out: &mut String, chart: &Chart, area: (f64, f64), title_h: f64) {
+    let (area_w, area_h): (f64, f64) = area;
+    for shape in &chart.user_shapes {
+        let left: f64 = shape.from.0 * area_w;
+        let top: f64 = (shape.from.1 * area_h).round() - title_h;
+        let (width, height): (f64, f64) = match shape.extent {
+            crate::ir::ChartUserShapeExtent::Corner { x, y } => (
+                ((x - shape.from.0) * area_w).max(0.0),
+                ((y - shape.from.1) * area_h).max(0.0),
+            ),
+            crate::ir::ChartUserShapeExtent::Size { width, height } => (width, height),
+        };
+
+        let mut box_args: String = format!(
+            "width: {}pt, height: {}pt",
+            format_f64(width),
+            format_f64(height)
+        );
+        if let Some(fill) = shape.fill {
+            let _ = write!(box_args, ", fill: {}", fmt::rgb(&fill));
+        }
+        if let Some(ref border) = shape.border {
+            let _ = write!(
+                box_args,
+                ", stroke: {}pt + {}",
+                format_f64(border.width),
+                fmt::rgb(&border.color)
+            );
+        }
+        let _ = write!(
+            out,
+            "#place(top + left, dx: {}pt, dy: {}pt, box({box_args})[",
+            format_f64(left),
+            format_f64(top)
+        );
+        write_chart_user_shape_text(out, shape, width);
+        out.push_str("])\n");
+    }
+}
+
+/// The text body of one user shape, seated inside its box.
+///
+/// The body is `place`d rather than laid out as the box's content so that a
+/// `<a:bodyPr wrap="none"/>` line can run past the box's own width, which is
+/// what Excel draws: the reported caption's box is 91pt wide and holds 80pt of
+/// glyphs inside 14.4pt of insets, so wrapping it would break `CASH FLOW`
+/// across two lines.
+///
+/// Each paragraph carries the line box its first run's face and size give it,
+/// as a fixed `top-edge`/`bottom-edge` pair, which is what puts the first
+/// baseline where [`write_chart_user_shapes`] measured it. Office shares one
+/// line box across the runs of a line, so a paragraph mixing sizes takes the
+/// first run's rather than growing per run.
+fn write_chart_user_shape_text(out: &mut String, shape: &crate::ir::ChartUserShape, box_w: f64) {
+    if shape.paragraphs.is_empty() {
+        return;
+    }
+    let insets: crate::ir::Insets = shape.text_insets;
+    // A wrapping body is bounded by what the insets leave of the box; a
+    // `wrap="none"` one is not bounded at all.
+    let text_w: String = if shape.no_wrap {
+        "auto".to_string()
+    } else {
+        format!(
+            "{}pt",
+            format_f64((box_w - insets.left - insets.right).max(0.0))
+        )
+    };
+    let _ = write!(
+        out,
+        "#place(top + left, dx: {}pt, dy: {}pt, box(width: {text_w})[",
+        format_f64(insets.left),
+        format_f64(insets.top.round())
+    );
+
+    for paragraph in &shape.paragraphs {
+        let (above_pt, below_pt): (f64, f64) = chart_user_shape_line_box_pt(paragraph);
+        let _ = write!(
+            out,
+            "#block(above: 0pt, below: 0pt)[#set text(top-edge: {}pt, bottom-edge: -{}pt);#set par(leading: 0pt);",
+            format_f64(above_pt),
+            format_f64(below_pt)
+        );
+        let alignment: Option<&str> = match paragraph.style.alignment {
+            Some(crate::ir::Alignment::Center) => Some("center"),
+            Some(crate::ir::Alignment::Right) => Some("right"),
+            _ => None,
+        };
+        if let Some(alignment) = alignment {
+            let _ = write!(out, "#align({alignment})[");
+        }
+        for run in &paragraph.runs {
+            out.push_str(&chart_user_shape_run_markup(run));
+        }
+        if alignment.is_some() {
+            out.push(']');
+        }
+        out.push(']');
+    }
+
+    // Closes the body box opened above, and the `place` holding it.
+    out.push_str("])");
+}
+
+/// The `(above, below)` baseline split one user-shape paragraph's line takes,
+/// in points.
+///
+/// The ascent is rounded to a whole point because Excel seats the baseline
+/// there; the descent is not, because a single-line caption is all that was
+/// measured and it only sets the advance to a second line.
+fn chart_user_shape_line_box_pt(paragraph: &crate::ir::Paragraph) -> (f64, f64) {
+    let run: Option<&crate::ir::Run> = paragraph.runs.first();
+    let size_pt: f64 = run
+        .and_then(|run| run.style.font_size)
+        .unwrap_or(CHART_USER_SHAPE_DEFAULT_SIZE_PT);
+    let family: &str = run
+        .and_then(|run| run.style.font_family.as_deref())
+        .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_FAMILY);
+    let bold: bool = run.and_then(|run| run.style.bold).unwrap_or(false);
+    let (ascent_em, descent_em): (f64, f64) = chart_face_line_metrics_em(family, bold)
+        .unwrap_or(CHART_USER_SHAPE_FALLBACK_LINE_METRICS_EM);
+    ((ascent_em * size_pt).round(), descent_em * size_pt)
+}
+
+/// Size a user-shape run is set at when it declares none — DrawingML's own
+/// default body size.
+const CHART_USER_SHAPE_DEFAULT_SIZE_PT: f64 = 18.0;
+
+/// Line metrics for a face no font search can resolve, as wasm's cannot.
+/// Calibri's, which is what an Office file that names nothing else lands on.
+const CHART_USER_SHAPE_FALLBACK_LINE_METRICS_EM: (f64, f64) = CALIBRI_CHART_LINE_METRICS_EM;
+
+/// One user-shape run, as the `text` call that draws it.
+fn chart_user_shape_run_markup(run: &crate::ir::Run) -> String {
+    let mut args: Vec<String> = Vec::new();
+    if let Some(size) = run.style.font_size {
+        args.push(format!("size: {}pt", format_f64(size)));
+    }
+    if run.style.bold == Some(true) {
+        args.push("weight: \"bold\"".to_string());
+    }
+    if run.style.italic == Some(true) {
+        args.push("style: \"italic\"".to_string());
+    }
+    if let Some(color) = run.style.color {
+        args.push(format!("fill: {}", fmt::rgb(&color)));
+    }
+    if let Some(family) = run.style.font_family.as_deref() {
+        args.push(format!(
+            "font: {}",
+            font_subst::font_for_mixed_script_text(family, &run.text)
+        ));
+    }
+    format!("#text({})[{}]", args.join(", "), escape_typst(&run.text))
+}
+
+/// Width each legend entry occupies when the legend runs across the chart.
+///
+/// The key, the gap to the label, and the label itself measured in the face the
+/// chart sets its text in. An Excel worksheet axis chart then closes the entry
+/// with the row's measured clearance and takes no floor: native Excel advances
+/// a 6pt or a four-letter entry by exactly its own text, and holding such an
+/// entry at [`LEGEND_ENTRY_W`] laid the 6pt #1616 row 12pt left of the export
+/// (issues #1249 and #1616). Other hosts and chart variants retain the generic
+/// [`GAP`] and the floor of #827.
+///
+/// A name that cannot be measured — wasm has no font search — takes the floor
+/// whatever the regime, so an entry is never narrower than its text.
+fn legend_entry_widths(
+    chart: &Chart,
+    key_len_pt: f64,
+    key_label_gap_pt: f64,
+    names: &[String],
+) -> Vec<f64> {
+    let size_pt: f64 = chart_legend_text_pt(chart);
+    let is_bold: bool = chart_legend_text_is_bold(chart);
+    let family: &str = chart
+        .text_font_family
+        .as_deref()
+        .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_FAMILY);
+    let excel_trailing: Option<f64> = excel_legend_trailing_gutter_pt(chart, names);
+    names
+        .iter()
+        .map(|name| {
+            let label: Option<f64> =
+                chart_text_advance_em(family, is_bold, name).map(|advance| advance * size_pt);
+            match (label, excel_trailing) {
+                (Some(label), Some(trailing)) => key_len_pt + key_label_gap_pt + label + trailing,
+                (Some(label), None) => {
+                    (key_len_pt + key_label_gap_pt + label + GAP).max(LEGEND_ENTRY_W)
+                }
+                (None, _) => LEGEND_ENTRY_W,
+            }
+        })
+        .collect()
+}
+
+/// The invisible tail and centre correction of an Excel bottom-legend row.
+///
+/// The shared trailing clearance advances every following key, but after the
+/// final label there is no following entry, and Excel excludes that final
+/// clearance when centring the visible row. If the final label cannot be
+/// measured, no trim is attempted: the width floor is then what closes the
+/// entry, and subtracting a clearance the entry never took would move an
+/// otherwise unchanged fallback.
+fn excel_bottom_legend_row_adjustment(
+    chart: &Chart,
+    key_len_pt: f64,
+    key_label_gap_pt: f64,
+    names: &[String],
+) -> (f64, f64) {
+    if !matches!(chart.host, crate::ir::ChartHost::Spreadsheet)
+        || !matches!(chart.legend_position, LegendPosition::Bottom)
+    {
+        return (0.0, 0.0);
+    }
+    let Some(last) = names.last() else {
+        return (0.0, 0.0);
+    };
+    let size_pt: f64 = chart_legend_text_pt(chart);
+    let is_bold: bool = chart_legend_text_is_bold(chart);
+    let family: &str = chart
+        .text_font_family
+        .as_deref()
+        .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_FAMILY);
+    let Some(label_pt) =
+        chart_text_advance_em(family, is_bold, last).map(|advance| advance * size_pt)
+    else {
+        return (0.0, 0.0);
+    };
+    let Some(trailing_pt) = excel_legend_trailing_gutter_pt(chart, names) else {
+        return (0.0, 0.0);
+    };
+    debug_assert!(key_len_pt + key_label_gap_pt + label_pt + trailing_pt > 0.0);
+    (trailing_pt, EXCEL_BOTTOM_LEGEND_CENTER_X_SHIFT_PT)
+}
+
+/// The key box one entry of an axis chart's legend draws, and the space it
+/// leaves before its label.
+struct LegendKeyMetrics {
+    width_pt: f64,
+    height_pt: f64,
+    label_gap_pt: f64,
+}
+
+/// The legend key metrics of the host the chart came from.
+///
+/// PowerPoint and an Excel chartsheet draw an axis chart's key as a *square*
+/// [`LEGEND_KEY_LINE_BOX_SHARE`] of the legend face's line box on a side, and
+/// leave half that side less [`PPTX_LEGEND_KEY_LABEL_GAP_PT`] before the label
+/// (#804, #1315, #1439). An Excel chart anchored to a worksheet draws a flat
+/// bar instead — [`LEGEND_KEY_LEN_PT`] wide whatever the text, the same share
+/// of the line box tall — and leaves [`EXCEL_LEGEND_KEY_LABEL_GAP_PT`] before
+/// the label (#1169). A Word-hosted chart has never been measured against a
+/// native export, so it keeps the legacy square.
+///
+/// Only the chartsheet has been measured in one face; it shares this path with
+/// PowerPoint as #1315 established, and the worksheet bar beside it spends the
+/// same share of the same box, which is why the face term is not restated for
+/// it.
+fn axis_legend_entry_metrics(chart: &Chart) -> LegendKeyMetrics {
+    let size_pt: f64 = chart_legend_text_pt(chart);
+    if matches!(
+        chart.host,
+        crate::ir::ChartHost::Presentation | crate::ir::ChartHost::SpreadsheetChartsheet
+    ) {
+        let side_pt: f64 = legend_key_line_box_pt(chart).unwrap_or(PPTX_LEGEND_KEY_EM * size_pt);
+        return LegendKeyMetrics {
+            width_pt: side_pt,
+            height_pt: side_pt,
+            label_gap_pt: (PPTX_LEGEND_KEY_LABEL_GAP_KEY_SHARE * side_pt
+                + PPTX_LEGEND_KEY_LABEL_GAP_PT)
+                .max(0.0),
+        };
+    }
+    if matches!(chart.host, crate::ir::ChartHost::Spreadsheet)
+        && let Some(height_pt) = legend_key_line_box_pt(chart)
+    {
+        return LegendKeyMetrics {
+            width_pt: LEGEND_KEY_LEN_PT,
+            height_pt,
+            label_gap_pt: EXCEL_LEGEND_KEY_LABEL_GAP_PT,
+        };
+    }
+    LegendKeyMetrics {
+        width_pt: 9.0,
+        height_pt: 9.0,
+        label_gap_pt: LEGEND_KEY_LABEL_GAP_PT,
+    }
+}
+
+/// The share of the legend face's line box a filled legend key spends — an
+/// Excel key's height, a PowerPoint key's whole side — or `None` where the
+/// legend's face resolves to nothing measurable.
+///
+/// Falling back rather than substituting a nominal box keeps a font-search-free
+/// build (notably wasm) on a shape derived from the declared size instead of
+/// sizing the key from a face the export never used.
+fn legend_key_line_box_pt(chart: &Chart) -> Option<f64> {
+    let family: &str = chart
+        .text_font_family
+        .as_deref()
+        .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_FAMILY);
+    let (ascent_em, descent_em) =
+        chart_face_line_metrics_em(family, chart_legend_text_is_bold(chart))?;
+    Some(LEGEND_KEY_LINE_BOX_SHARE * (ascent_em + descent_em) * chart_legend_text_pt(chart))
+}
+
+/// Typst baseline offset that seats a PowerPoint right-legend square in its
+/// measured row instead of pinning its bottom to the label baseline.
+///
+/// Native one-factor exports fit a seat halfway through the font's line box,
+/// the square key, and a 1pt row term. PowerPoint rounds the label ascent to a
+/// whole point; expressing the difference from that baseline reproduces the
+/// measured key-bottom clearance across the face and size probes (#1680).
+pub(super) fn powerpoint_right_legend_key_baseline_pt(chart: &Chart) -> Option<f64> {
+    if !matches!(chart.host, crate::ir::ChartHost::Presentation)
+        || !matches!(chart_variant(chart), ChartVariant::AxisPlot)
+        || !chart.has_legend
+        || chart.legend_position != LegendPosition::Right
+    {
+        return None;
+    }
+
+    let family: &str = chart
+        .text_font_family
+        .as_deref()
+        .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_FAMILY);
+    let is_bold: bool = chart_legend_text_is_bold(chart);
+    let size_pt: f64 = chart_legend_text_pt(chart);
+    let (ascent_em, descent_em): (f64, f64) =
+        chart_face_line_metrics_em(family, is_bold).unwrap_or(CALIBRI_CHART_LINE_METRICS_EM);
+    let label_baseline_from_row_top_pt: f64 = (ascent_em * size_pt).round();
+    let key_bottom_from_row_top_pt: f64 =
+        ((ascent_em + descent_em) * size_pt + 1.0 + axis_legend_entry_metrics(chart).height_pt)
+            / 2.0;
+
+    Some(key_bottom_from_row_top_pt - label_baseline_from_row_top_pt)
+}
+
+/// Width of the widest entry in a PowerPoint right-side axis legend, and the
+/// clearance that entry keeps beyond the content box the stack is measured
+/// against.
+///
+/// PowerPoint places the stacked column as one right-fitted group, so every
+/// key starts at the position needed by its widest label. What it fits against
+/// is the *chart area's* right edge, not the plot's: repackaging
+/// `tests/fixtures/pptx/bar-chart.pptx` as a column chart through
+/// `scripts/probes/issue-1435-column-legend-center.json` leaves the legend key
+/// on the unpatched bar control's x to the last emitted digit at 10, 12, 18, 24
+/// and 36pt chart text — 441.4465, 435.6760, 418.4018, 401.1207 and 366.5520pt
+/// inside a 480pt frame.
+///
+/// The content box stops at the plot, and a column plot keeps
+/// [`axis_plot_insets`]' right inset — plus, where a secondary value axis is
+/// drawn, [`column_secondary_value_band_pt`]'s label band — inside the chart
+/// area. That reserve therefore comes back before the frame clearance is taken
+/// off, or the legend is fitted twice and lands inside its own gutter: page 8
+/// of the #1407 deck put its labels 11.011pt left of a native PowerPoint
+/// export. A bar plot reserves neither, which is why #999 and #1000 fitted the
+/// clearance alone and only the column family was wrong (#1436).
+///
+/// If the source face cannot be measured (notably in font-search-free WASM
+/// builds), returning `None` preserves the prior plot-relative fallback.
+fn powerpoint_right_legend_inset(
+    chart: &Chart,
+    frame: Option<(f64, f64)>,
+    names: &[String],
+    key_size_pt: f64,
+    key_label_gap_pt: f64,
+) -> Option<(f64, f64)> {
+    if !matches!(chart.host, crate::ir::ChartHost::Presentation)
+        || !matches!(
+            chart.legend_position,
+            LegendPosition::Right | LegendPosition::TopRight
+        )
+    {
+        return None;
+    }
+    let size_pt: f64 = chart_legend_text_pt(chart);
+    let is_bold: bool = chart_legend_text_is_bold(chart);
+    let family = chart
+        .text_font_family
+        .as_deref()
+        .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_FAMILY);
+    let widest_label = names
+        .iter()
+        .map(|name| chart_text_advance_em(family, is_bold, name))
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .reduce(f64::max)?
+        * size_pt;
+    // Only the right reserve is wanted here, and no title band reaches it, so
+    // the band argument is immaterial.
+    let plot_right_reserve: f64 =
+        axis_plot_insets(chart, frame, 0.0).1 + column_secondary_value_band_pt(chart);
+    Some((
+        key_size_pt + key_label_gap_pt + widest_label,
+        PPTX_LEGEND_RIGHT_EDGE_PAD_PT - plot_right_reserve,
+    ))
+}
+
+/// How far up the generic side stack a PowerPoint right legend has to move to
+/// land where the native automatic layout puts it.
+///
+/// Both families are centred beside a content box that reaches down past the
+/// plot, but a bar chart's box ends in the value tick band and a column
+/// chart's in the category label band, so each needs its own measured pair.
+/// Anything else — another host, another edge, another plot family — keeps the
+/// uncorrected placement.
+pub(super) fn powerpoint_right_legend_y_shift(
+    chart: &Chart,
+    frame: Option<(f64, f64)>,
+    title_h: f64,
+) -> f64 {
+    if !matches!(chart.host, crate::ir::ChartHost::Presentation)
+        || !matches!(chart.legend_position, LegendPosition::Right)
+    {
+        return 0.0;
+    }
+    let size_pt: f64 = chart_legend_text_pt(chart);
+    match chart.chart_type {
+        ChartType::Bar => PPTX_RIGHT_LEGEND_Y_SHIFT_PT + PPTX_RIGHT_LEGEND_Y_SHIFT_EM * size_pt,
+        ChartType::Column => {
+            // The stack is centred on a box whose top is the plot's own inset,
+            // and that box's centre moves half as far as the inset does. #1437
+            // re-placed the plot's top edge from a measured band, so the pair
+            // fitted against the pre-#1437 box gives the difference back and
+            // the native key tops it was fitted to stay put.
+            //
+            // What it gives back is measured against the box the pair was
+            // fitted on, which is why the inset subtracted here is the flat
+            // `5pt + 0.607em` of that fit rather than the face-measured one
+            // #1674 replaced it with. Subtracting the live inset instead would
+            // let every later refinement of it drag the legend along (#1674).
+            let moved: f64 = axis_plot_insets(chart, frame, title_h).0
+                - (CHART_COLUMN_TOP_PAD_PT
+                    + CHART_COLUMN_TOP_PAD_EM
+                        * chart_axis_text_pt(chart, chart.value_axis_text_style));
+            let title_band_shift: f64 =
+                if title_h > 0.0 && powerpoint_column_title_band_pt(chart).is_some() {
+                    PPTX_COLUMN_TITLE_LEGEND_Y_SHIFT_PT
+                } else {
+                    0.0
+                };
+            PPTX_COLUMN_RIGHT_LEGEND_Y_SHIFT_PT + PPTX_COLUMN_RIGHT_LEGEND_Y_SHIFT_EM * size_pt
+                - moved / 2.0
+                + title_band_shift
+        }
+        _ => 0.0,
+    }
+}
+
+fn axis_legend_row_height_pt(chart: &Chart) -> f64 {
+    if matches!(chart.host, crate::ir::ChartHost::Presentation)
+        && matches!(chart.chart_type, ChartType::Column)
+        && matches!(chart.legend_position, LegendPosition::Right)
+    {
+        PPTX_COLUMN_RIGHT_LEGEND_ROW_EM * chart_legend_text_pt(chart)
+    } else {
+        LEGEND_ROW_H
+    }
+}
+
+/// Space the axis plot's legend reserves.
+///
+/// A vertical legend measures its longest series name and adds the key and
+/// edge clearances observed in the same native multi-size exports used for the
+/// other #706 chart chrome. Horizontal legends retain their per-entry layout;
+/// neither branch chooses the host-specific axis scale. Horizontal PowerPoint
+/// scaling is resolved after this box yields the plot width; a vertical
+/// PowerPoint value axis still scales itself, though the rectangle it runs
+/// down is measured (issue #1437).
+fn axis_legend_box(chart: &Chart) -> LegendBox {
+    if !chart.has_legend {
+        return LegendBox::hidden();
+    }
+    let mut legend = LegendBox::new(
+        chart.legend_position,
+        axis_legend_row_height_pt(chart),
+        LEGEND_ENTRY_W,
+    );
+    if chart.host == crate::ir::ChartHost::Spreadsheet
+        && matches!(chart.chart_type, ChartType::Column)
+        && matches!(chart.legend_position, LegendPosition::Bottom)
+        && (chart.text_style.size_pt.is_some() || chart.legend_text_style.size_pt.is_some())
+    {
+        let size_pt: f64 = chart_legend_text_pt(chart);
+        legend.bottom = EXCEL_BOTTOM_LEGEND_BAND_AT_NINE_PT
+            + EXCEL_BOTTOM_LEGEND_BAND_GROWTH_EM * (size_pt - 9.0);
+    }
+    if matches!(
+        chart.legend_position,
+        LegendPosition::Left | LegendPosition::Right
+    ) {
+        let size_pt: f64 = chart_legend_text_pt(chart);
+        let is_bold: bool = chart_legend_text_is_bold(chart);
+        let family = chart
+            .text_font_family
+            .as_deref()
+            .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_FAMILY);
+        let widest_label = chart
+            .series
+            .iter()
+            .enumerate()
+            .map(|(index, series)| {
+                series
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("Series {}", index + 1))
+            })
+            .filter_map(|name| chart_text_advance_em(family, is_bold, &name))
+            .fold(0.0_f64, f64::max)
+            * size_pt;
+        let measured = widest_label
+            + CHART_LEGEND_BASE_PAD_PT
+            + powerpoint_column_legend_key_band_pt(chart).unwrap_or(CHART_LEGEND_PAD_EM * size_pt);
+        let side = if chart
+            .text_style
+            .resolved_size_pt(chart.legend_text_style)
+            .is_none()
+        {
+            measured.max(LEGEND_ENTRY_W + GAP)
+        } else {
+            measured
+        };
+        match chart.legend_position {
+            LegendPosition::Left => legend.left = side,
+            LegendPosition::Right | LegendPosition::TopRight => legend.right = side,
+            LegendPosition::Top | LegendPosition::Bottom => {}
+        }
+    }
+    legend
+}
+
+/// Whether a framed PowerPoint column plot's right edge is placed by the
+/// measured legend band rather than by the pre-#1663 fit plus a flat inset.
+///
+/// Scoped to the one arrangement the #1663 probes export: a column plot with
+/// its legend down the right edge and a stated text size. A `tr` legend, a
+/// bar plot and a chart stating no size at all keep what they had.
+fn powerpoint_column_right_legend_band(chart: &Chart) -> bool {
+    powerpoint_column_chrome(chart)
+        && chart.has_legend
+        && matches!(chart.legend_position, LegendPosition::Right)
+        && (chart.text_style.size_pt.is_some() || chart.legend_text_style.size_pt.is_some())
+}
+
+/// The size-scaled part of that band: twice the legend key's own side.
+///
+/// `frame width - plot right` on native PowerPoint 16.113.1 exports of
+/// `tests/fixtures/pptx/bar-chart.pptx` repackaged as a column chart measures
+/// 51.397, 60.870, 79.793 and 98.721pt at 9, 12, 18 and 24pt legend text
+/// (`scripts/probes/issue-1663-column-legend-size.json`), and 51.047pt when
+/// the series name shrinks to `S` at 18pt
+/// (`issue-1663-column-legend-label.json`). Every one of them is the widest
+/// label's advance plus [`CHART_LEGEND_BASE_PAD_PT`] plus two key sides,
+/// within 0.010pt, and page 8 of the #1220 deck measures the same band in
+/// Arial: 94.903pt against the 94.922 this predicts.
+///
+/// The key term is the *face's*, not a multiple of the size: substituting
+/// Calibri's own `PPTX_LEGEND_KEY_EM` share for Arial's line box on that page
+/// misses by 1.1pt. The old `CHART_LEGEND_PAD_EM` stand-in, fitted on the bar
+/// family, reserved 1.605 em where the column family spends 1.099 em of
+/// Calibri, and the plot then stopped 20.1pt short of the legend it was
+/// already drawing in the right place (issue #1663).
+fn powerpoint_column_legend_key_band_pt(chart: &Chart) -> Option<f64> {
+    powerpoint_column_right_legend_band(chart)
+        .then(|| 2.0 * axis_legend_entry_metrics(chart).width_pt)
+}
+
+/// Where the bars of one category sit inside the band it gets, in points along
+/// the category axis.
+struct BandBars {
+    /// Thickness of one bar.
+    thickness: f64,
+    /// Offset of the first series' bar from the start of the band.
+    lead: f64,
+    /// Distance from one series' bar to the next one's along the category axis.
+    /// Zero only when the two sit exactly on top of each other.
+    step: f64,
+}
+
+/// Divide a category's band between the bars sharing it, the way Office does.
+///
+/// `<c:gapWidth>` and `<c:overlap>` are both measured in units of ONE bar, not
+/// of the band, so the band spans the cluster its series form plus a gutter of
+/// `gap_width_percent`: `bars - (bars - 1) * overlap + gap` bars in all. The
+/// cluster then sits centred, half the gutter on each side.
+///
+/// Measured against PowerPoint 16.0 rather than read off the schema: sweeping
+/// `<c:gapWidth>` from 0 to 500 over `tests/fixtures/pptx/bar-chart.pptx` and
+/// tracing each export put every bar edge within one 1/1200in device quantum of
+/// this, with the band itself never moving, and a two-series sweep of
+/// `<c:overlap>` over -27, 0 and 50 did the same for the step.
+///
+/// The grouping does not enter into it: a stacked chart divides its band by the
+/// same law, with `bars` still the series count. Rewriting `<c:overlap>` on the
+/// four-series stacked chart of `office2pdf_introduction_ko.pptx` (gapWidth 90)
+/// and tracing PowerPoint 16.0's export gave, on a 167.6pt pitch, one 88.2pt
+/// column at 100 (167.64/1.9) but a STAIRCASE of four 34.2pt segments stepping
+/// 34.2pt at 0 (167.52/4.9) — each segment still stacked on the running total,
+/// only slid sideways. Overlaps of 50 and -25 landed on 49.3/24.7pt and
+/// 29.6/37.1pt, both what this predicts. Deleting the element reproduced the 0
+/// case exactly, so an absent `<c:overlap>` is 0 here and not the 100 Office
+/// happens to write beside its own stacked charts.
+fn band_bars(band: f64, series_count: usize, layout: BarBandLayout) -> BandBars {
+    let bars: f64 = series_count.max(1) as f64;
+    let gap: f64 = layout.gap_width_percent / 100.0;
+    let overlap: f64 = layout.overlap_percent / 100.0;
+    // How many bar widths the band is worth. Over the ranges the parser holds
+    // its inputs to this bottoms out at 1 — an overlap of 100% collapses the
+    // cluster to a single bar and the gap only ever adds — so it can neither
+    // vanish nor turn the geometry inside out.
+    let bar_widths_per_band: f64 = (bars - (bars - 1.0) * overlap + gap).max(1.0);
+    let thickness: f64 = band / bar_widths_per_band;
+    let step: f64 = thickness * (1.0 - overlap);
+    let cluster: f64 = thickness + (bars - 1.0) * step;
+    BandBars {
+        thickness,
+        lead: (band - cluster) / 2.0,
+        step,
+    }
+}
+
+/// Seat one worksheet column on whole sheet points, the way Excel paints it.
+///
+/// An anchored Excel worksheet chart rounds each column edge to a whole
+/// unscaled sheet point and then clips the column to the plot rectangle. Ten
+/// re-zip-controlled native exports of the gift workbook — `<c:gapWidth>` 0,
+/// 50, 100, 150, 219, 300 and 500 at the stacked overlap of 100, and
+/// `<c:overlap>` 0, 50 and -27 at gapWidth 150 — paint 50 columns whose every
+/// edge but one is `round(continuous edge)`; the one remaining edge is the
+/// gapWidth-0 first column's left, which stops at the plot's exact left edge
+/// rather than the rounded point beyond it (#1543). The sheet point is taken
+/// on the fitted sheet origin the frame, chrome and markers share, so the
+/// column lands where native paints it. Column tops stay continuous: native
+/// tops are not whole points. Horizontal-bar band-edge snapping remains
+/// unmeasured, so those charts keep the continuous band.
+fn worksheet_column_span(
+    start: f64,
+    thickness: f64,
+    plot_x: f64,
+    plot_w: f64,
+    placement: Option<WorksheetMarkerPlacement>,
+) -> (f64, f64) {
+    let Some(placement) = placement else {
+        return (start, thickness);
+    };
+    let origin: f64 = placement.frame_origin.0;
+    let snap = |chart_local: f64| (origin + chart_local).round() - origin;
+    let left: f64 = snap(start).max(plot_x);
+    let right: f64 = snap(start + thickness).min(plot_x + plot_w);
+    (left, (right - left).max(0.0))
+}
+
+/// Seat one value-axis gridline, label, or tick for a column chart.
+///
+/// An anchored Excel worksheet chart lays out its plot in unscaled sheet
+/// points. It preserves the exact plot edges but rounds every interior chrome
+/// seat to the nearest whole sheet point before fit-to-page scaling (#1471).
+/// Bars and overlaid data series keep their continuous value coordinates.
+fn column_value_chrome_y(
+    chart: &Chart,
+    plot_y: f64,
+    plot_h: f64,
+    frac: f64,
+    sheet_frame_top_pt: Option<f64>,
+) -> f64 {
+    let y: f64 = plot_y + (1.0 - frac) * plot_h;
+    if chart.host != crate::ir::ChartHost::Spreadsheet || !(0.0 < frac && frac < 1.0) {
+        return y;
+    }
+    let Some(frame_top) = sheet_frame_top_pt else {
+        return y;
+    };
+    (frame_top + y).round() - frame_top
+}
+
+/// Seat an Excel column-chart value label independently of its gridline.
+///
+/// Native no-fit and fit-to-page exports of the same 9pt axis constrain the
+/// label baseline phase to 3.0335..3.1256 sheet points after its continuous
+/// gridline coordinate. The phase changes which side of a whole-point boundary
+/// the label reaches, while Typst still supplies the label's ordinary glyph
+/// seat. Preserve that seat and apply only Excel's additional rounding delta.
+fn column_value_label_y(
+    chart: &Chart,
+    plot_y: f64,
+    plot_h: f64,
+    frac: f64,
+    sheet_frame_top_pt: Option<f64>,
+) -> f64 {
+    let chrome_y: f64 = column_value_chrome_y(chart, plot_y, plot_h, frac, sheet_frame_top_pt);
+    if chart.host != crate::ir::ChartHost::Spreadsheet || !(0.0 < frac && frac < 1.0) {
+        return chrome_y;
+    }
+    let Some(frame_top) = sheet_frame_top_pt else {
+        return chrome_y;
+    };
+
+    const EXCEL_VALUE_LABEL_BASELINE_PHASE_EM: f64 = 0.34;
+    let continuous_sheet_y: f64 = frame_top + plot_y + (1.0 - frac) * plot_h;
+    let baseline_phase: f64 = chart_axis_text_pt(chart, chart.value_axis_text_style)
+        * EXCEL_VALUE_LABEL_BASELINE_PHASE_EM;
+    let independent_snap_delta: f64 = (continuous_sheet_y + baseline_phase).round()
+        - continuous_sheet_y.round()
+        - baseline_phase.round();
+    chrome_y + independent_snap_delta
+}
+
+/// A horizontal bar chart's interior category label baseline, snapped to a
+/// whole Excel sheet point.
+///
+/// Excel 16.112 measurements of regular Trebuchet MS place an interior
+/// row's label baseline at
+/// `floor(sheet_frame_top_pt + row_top + row / 2) + K`, with `K` an integer
+/// that depends on the declared size within that measured face — not on which chart,
+/// how many categories it has, or the row's own position. Measured across two
+/// worksheet bar charts, two category counts and three sizes (#1621); see
+/// `assets/validation/issue-1621/README.md`. Other plot geometries use the same
+/// formula but have not been independently probed. Returns the LOCAL offset (still
+/// relative to `sheet_frame_top_pt`, matching `row_top`'s own coordinate
+/// space); the caller places it directly as a baseline (`text(top-edge: 0pt,
+/// bottom-edge: 0pt)`), not as the `dy` of the unquantized box(height:
+/// row)/`align(horizon)` placement — the two box models aren't interchangeable.
+///
+/// The caller gates this lookup to the measured family and weight.
+/// `None` for a size this issue never measured against native Excel. This
+/// function carries no row-position information and does not know whether its
+/// caller is an edge row: the plot rectangle's own top and bottom edge rows
+/// deviate from this rule by a further whole sheet point, in a direction that
+/// flips between the two measured charts for a reason not yet isolated, so
+/// `generate_chart_axis` never calls this function for one (it keeps that
+/// row's existing continuous seat instead of guessing at the residual).
+pub(super) fn bar_category_label_baseline_pt(
+    sheet_frame_top_pt: f64,
+    row_top: f64,
+    row: f64,
+    size_pt: f64,
+) -> Option<f64> {
+    let k: f64 = match size_pt {
+        size if (size - 8.0).abs() < 0.01 => 4.0,
+        size if (size - 10.0).abs() < 0.01 => 4.0,
+        size if (size - 14.0).abs() < 0.01 => 5.0,
+        _ => return None,
+    };
+    let centre_sheet: f64 = sheet_frame_top_pt + row_top + row / 2.0;
+    Some(centre_sheet.floor() + k - sheet_frame_top_pt)
+}
+
+/// Ignore negligible floating-point noise when a segment lands on a plot edge,
+/// so an exact endpoint does not take the overflow-clipping path.
+const PLOT_EDGE_EPSILON_PT: f64 = 1e-6;
+
+/// Paint one bar segment's rectangle.
+///
+/// `(x, y, w, h)` is the segment's true, unclamped geometry — it may start,
+/// end, or both past the plot's edge when its value is outside the axis
+/// interval. A segment that stays within the plot rectangle paints exactly as
+/// before (a bare `#place`d rectangle); one that does not is wrapped in a
+/// `clip: true` box sized to the plot, so the rectangle itself keeps its true
+/// full-value length — matching what Office's own paint geometry does under
+/// its plot area's clip — while the visible result still ends on the plot
+/// edge (issue #1633).
+#[allow(clippy::too_many_arguments)]
+fn write_clipped_bar_rect(
+    out: &mut String,
+    worksheet_clip: Option<WorksheetPlotClip>,
+    plot_x: f64,
+    plot_y: f64,
+    plot_w: f64,
+    plot_h: f64,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    color: &str,
+) {
+    let overruns_plot: bool = x < plot_x - PLOT_EDGE_EPSILON_PT
+        || y < plot_y - PLOT_EDGE_EPSILON_PT
+        || x + w > plot_x + plot_w + PLOT_EDGE_EPSILON_PT
+        || y + h > plot_y + plot_h + PLOT_EDGE_EPSILON_PT;
+    if overruns_plot {
+        let markup: String = format!(
+            "#place(top + left, dx: {}pt, dy: {}pt, box(width: {}pt, height: {}pt, clip: true)[#place(top + left, dx: {}pt, dy: {}pt, rect(width: {}pt, height: {}pt, fill: {}, stroke: none))])",
+            format_f64(plot_x),
+            format_f64(plot_y),
+            format_f64(plot_w),
+            format_f64(plot_h),
+            format_f64(x - plot_x),
+            format_f64(y - plot_y),
+            format_f64(w),
+            format_f64(h),
+            color
+        );
+        write_plotted(out, worksheet_clip, &markup);
+    } else {
+        let markup: String = format!(
+            "#place(top + left, dx: {}pt, dy: {}pt, rect(width: {}pt, height: {}pt, fill: {}, stroke: none))",
+            format_f64(x),
+            format_f64(y),
+            format_f64(w),
+            format_f64(h),
+            color
+        );
+        write_plotted(out, worksheet_clip, &markup);
+    }
+}
+
+/// Render a bar (horizontal) or column (vertical) chart as an axis-scaled
+/// plot with gridlines, tick labels, and a legend.
+fn generate_chart_axis(
+    out: &mut String,
+    chart: &Chart,
+    frame: Option<(f64, f64)>,
+    sheet_frame_origin_pt: Option<(f64, f64)>,
+) {
+    let horizontal: bool = matches!(chart.chart_type, ChartType::Bar);
+    let sheet_frame_top_pt: Option<f64> = sheet_frame_origin_pt.map(|origin| origin.1);
+    let worksheet_markers =
+        sheet_frame_origin_pt.map(|frame_origin| WorksheetMarkerPlacement { frame_origin });
+    let categories: usize = chart.categories.len();
+    let series: &[crate::ir::ChartSeries] = &chart.series;
+    let series_count: usize = series.len().max(1);
+    let stacked: bool = matches!(
+        chart.grouping,
+        ChartGrouping::Stacked | ChartGrouping::PercentStacked
+    );
+    // Which series this plot draws as columns and which it lays over them as a
+    // line. Only a combo plot area has both; every series of a single-family
+    // chart is a column here (issue #1067).
+    let overlaid: Vec<bool> = series.iter().map(|s| plots_as_line(chart, s)).collect();
+    let bar_slots: Vec<usize> = (0..series.len())
+        .filter(|index| !overlaid[*index])
+        .collect();
+    let overlay_slots: Vec<usize> = (0..series.len()).filter(|index| overlaid[*index]).collect();
+    let bar_series = || bar_slots.iter().map(|index| &series[*index]);
+
+    let auto_max_value: f64 = chart_auto_max_value(chart, crate::ir::ChartValueAxisRole::Primary);
+
+    // Chart-area title: the explicit chart title, else the automatic one —
+    // unless the chart declined that with `<c:autoTitleDeleted val="1"/>`
+    // (issue #883).
+    //
+    // Office derives the automatic title from a lone series' name where there
+    // is one. Where there is not — several series, or one that names itself
+    // nothing — it still prints the title a `<c:title>` without a `<c:tx>`
+    // asks for, as the placeholder string it writes into a new chart (#1146).
+    let area_title: Option<&str> = chart.title.as_deref().or_else(|| {
+        if chart.auto_title_deleted {
+            return None;
+        }
+        let from_lone_series: Option<&str> = match series {
+            [only] => only.name.as_deref(),
+            _ => None,
+        };
+        from_lone_series.or(chart.has_automatic_title.then_some(AUTOMATIC_CHART_TITLE))
+    });
+    let title_h: f64 = if area_title.is_some() {
+        chart_area_title_h(chart)
+    } else {
+        0.0
+    };
+
+    // The chart area the fractions of a stated plot rectangle are taken of,
+    // kept before the title band comes off it.
+    let chart_area: Option<(f64, f64)> = frame;
+    let frame: Option<(f64, f64)> = axis_content_frame(frame, title_h);
+    let (total_w, total_h) = match frame {
+        Some(extent) => extent,
+        None => chart_axis_extent(chart),
+    };
+    let wraps_title: bool = write_chart_area_start(
+        out,
+        chart,
+        area_title,
+        chart_area,
+        (total_w, total_h),
+        ChartTitleBand {
+            height: title_h,
+            fixed: true,
+        },
+    );
+
+    // The plotting rectangle: the one `c:plotArea/c:layout` states, else the
+    // automatic one, whose origin is shifted by whatever the legend reserves on
+    // the left or above (issue #1182).
+    let legend: LegendBox = axis_legend_box(chart);
+    let plot: AxisPlot = axis_plot_layout(chart, chart_area, title_h);
+    let (plot_x, plot_y): (f64, f64) = (plot.x, plot.y);
+    let (plot_w, plot_h): (f64, f64) = (plot.width, plot.height);
+    // Excel clips columns and the overlaid line to the plot rectangle's whole
+    // sheet points. Horizontal bars use a chart-local clip for actual value
+    // overruns (#1633); their worksheet-point edge snapping remains unmeasured
+    // (#1745).
+    let plot_clip: Option<WorksheetPlotClip> = (!horizontal)
+        .then(|| WorksheetPlotClip::snapped(worksheet_markers, plot_x, plot_y, plot_w, plot_h))
+        .flatten();
+    let auto_axis: (f64, f64) = if matches!(chart.grouping, ChartGrouping::PercentStacked) {
+        // Every stack fills the plot, so the axis is the percentage scale
+        // itself and needs no rounding.
+        (100.0, 20.0)
+    } else {
+        chart_auto_axis(chart, horizontal, plot_w, auto_max_value)
+    };
+    // The interval every plotted position is a share of. A part stating
+    // `<c:scaling><c:min>`/`<c:max>` fixes it; otherwise it is the automatic
+    // scale, which reaches below zero only when the data does (issue #1184).
+    let scale: ValueScale = chart_value_scale(chart, auto_axis);
+    // The secondary axis group's interval, counted out of its own series and
+    // bounded by what its `<c:valAx>` states, for the series read against it
+    // (issue #1374).
+    let secondary_axis: Option<&crate::ir::ChartSecondaryValueAxis> = chart_secondary_axis(chart);
+    let secondary_scale: Option<ValueScale> = secondary_axis.map(|_| {
+        let auto_axis: (f64, f64) = if matches!(chart.grouping, ChartGrouping::PercentStacked) {
+            (100.0, 20.0)
+        } else {
+            chart_auto_axis(
+                chart,
+                horizontal,
+                plot_w,
+                chart_auto_max_value(chart, crate::ir::ChartValueAxisRole::Secondary),
+            )
+        };
+        value_scale_for_axis(chart, crate::ir::ChartValueAxisRole::Secondary, auto_axis)
+    });
+    // Where the value-zero line lands across the plot: the baseline the bars
+    // grow from, and the line the category axis stands on.
+    let zero_frac: f64 = scale.zero_fraction();
+    // Decided once for the whole axis: labels all slant or none do, so a short
+    // label in a crowded axis still hangs with its neighbours (issue #884), and
+    // they all reserve the deepest one's line count (issue #1675).
+    let category_layout: CategoryLabelLayout = chart_category_label_layout(chart, frame);
+    let category_labels_rotated: bool = category_layout == CategoryLabelLayout::Rotated;
+    let category_label_lines: usize = match category_layout {
+        CategoryLabelLayout::Flat { lines } => lines,
+        CategoryLabelLayout::Rotated => 1,
+    };
+    // Pitch of one category along the category axis. `ROW` is the intrinsic
+    // value; a framed chart divides the axis it actually got, so widening the
+    // frame widens the bars rather than leaving them stranded at one end.
+    let row: f64 = if categories == 0 {
+        chart_category_band_pt(chart)
+    } else if horizontal {
+        plot_h / categories as f64
+    } else {
+        plot_w / categories as f64
+    };
+
+    // `<c:delete val="1"/>` switches an axis off: Office then draws neither its
+    // line, nor its tick marks, nor its tick labels. Gridlines are a chart
+    // element of their own — switching the axis off leaves them standing — so
+    // only the axis' own furniture answers to this.
+    //
+    // TODO(gutter reflow): `axis_label_gutters` still reserves the band a
+    // switched-off axis' labels would have printed in, so the plot keeps the
+    // size and position it has with them drawn. Office reclaims that space.
+    let value_axis_drawn: bool = !chart.value_axis_deleted;
+    let category_axis_drawn: bool = !chart.category_axis_deleted;
+
+    // Gridlines + value tick labels. The gridlines take the line
+    // `<c:majorGridlines><c:spPr><a:ln>` declares, if it declares one (#900).
+    let gridline_stroke = chart_chrome_stroke(chart.major_gridline_line);
+    let (label_box_x, label_box_w): (f64, f64) = chart_column_value_label_box(chart);
+    let major_units: Vec<f64> = scale.ticks();
+    for tick in &major_units {
+        let frac: f64 = scale.fraction(*tick);
+        if horizontal {
+            let x: f64 = plot_x + frac * plot_w;
+            if let Some(stroke) = gridline_stroke.as_deref() {
+                let _ = writeln!(
+                    out,
+                    "#place(top + left, dx: {}pt, dy: {}pt, line(end: (0pt, {}pt), stroke: {}))",
+                    format_f64(x),
+                    format_f64(plot_y),
+                    format_f64(plot_h),
+                    stroke
+                );
+            }
+            if value_axis_drawn {
+                let _ = writeln!(
+                    out,
+                    "#place(top + left, dx: {}pt, dy: {}pt, box(width: 24pt)[#align(center)[#text(size: {}pt{})[{}]]])",
+                    format_f64(x - 12.0),
+                    format_f64(plot_y + plot_h + horizontal_value_label_gap(chart)),
+                    format_f64(chart_axis_text_pt(chart, chart.value_axis_text_style)),
+                    chart_value_text_attrs(chart),
+                    escape_typst(&chart_value_label_formatted(
+                        *tick,
+                        chart_value_number_format(chart)
+                    ))
+                );
+            }
+        } else {
+            let y: f64 = column_value_chrome_y(chart, plot_y, plot_h, frac, sheet_frame_top_pt);
+            let label_y: f64 =
+                column_value_label_y(chart, plot_y, plot_h, frac, sheet_frame_top_pt);
+            if let Some(stroke) = gridline_stroke.as_deref() {
+                let _ = writeln!(
+                    out,
+                    "#place(top + left, dx: {}pt, dy: {}pt, line(end: ({}pt, 0pt), stroke: {}))",
+                    format_f64(plot_x),
+                    format_f64(y),
+                    format_f64(plot_w),
+                    stroke
+                );
+            }
+            if value_axis_drawn {
+                let _ = writeln!(
+                    out,
+                    "#place(top + left, dx: {}pt, dy: {}pt, box(width: {}pt, height: {}pt)[#align(right + horizon)[#text(size: {}pt{})[{}]]])",
+                    format_f64(label_box_x + plot.dx),
+                    format_f64(
+                        label_y
+                            - chart_label_box_h(chart_axis_text_pt(
+                                chart,
+                                chart.value_axis_text_style
+                            )) / 2.0
+                    ),
+                    format_f64(label_box_w),
+                    format_f64(chart_label_box_h(chart_axis_text_pt(
+                        chart,
+                        chart.value_axis_text_style
+                    ))),
+                    format_f64(chart_axis_text_pt(chart, chart.value_axis_text_style)),
+                    chart_value_text_attrs(chart),
+                    escape_typst(&chart_value_label_formatted(
+                        *tick,
+                        chart_value_number_format(chart)
+                    ))
+                );
+            }
+        }
+    }
+
+    // The secondary axis' own tick labels, line and ticks down the plot's right
+    // edge, in the band `axis_plot_size` reserved for them (issue #1374).
+    //
+    // TODO(horizontal secondary axis): a bar chart's secondary value axis runs
+    // along the plot's top edge, which is not drawn; its series still read
+    // against its scale.
+    if let (Some(axis), Some(secondary_scale), false) =
+        (secondary_axis, secondary_scale, horizontal)
+        && !axis.deleted
+    {
+        write_secondary_value_axis(
+            out,
+            chart,
+            axis,
+            secondary_scale,
+            SecondaryAxisPlacement {
+                plot_x,
+                plot_y,
+                plot_w,
+                plot_h,
+                label_gap: GAP,
+                label_w: label_box_w,
+            },
+        );
+    }
+
+    // Bars, grouped per category when multiple series are present. Only the
+    // series this plot draws as columns share the band; a line laid over them
+    // takes no place in it (issue #1067).
+    let bars: BandBars = band_bars(row, bar_slots.len().max(1), chart.bar_band_layout);
+    let bar_thickness: f64 = bars.thickness;
+    for (cat_index, category) in chart.categories.iter().enumerate() {
+        let group_start: f64 = cat_index as f64 * row;
+        // The running totals the next segment stacks on. Positives and
+        // negatives grow away from zero as two separate stacks, which is how
+        // Office stacks a category holding both (issue #1184).
+        let mut stack_positive: f64 = 0.0;
+        let mut stack_negative: f64 = 0.0;
+        let category_total: f64 = category_total(bar_series(), cat_index);
+        for (band_slot, s_index) in bar_slots.iter().copied().enumerate() {
+            let s: &crate::ir::ChartSeries = &series[s_index];
+            let value: f64 = s.value_at_point(cat_index).unwrap_or(0.0);
+            // Percent stacking rescales each stack to fill the axis, so an
+            // XLSX column totalling 6 reads the same height as a DOCX one
+            // totalling 9.
+            let value: f64 = match chart.grouping {
+                ChartGrouping::PercentStacked if category_total > 0.0 => {
+                    value / category_total * 100.0
+                }
+                ChartGrouping::PercentStacked => 0.0,
+                _ => value,
+            };
+            // Where this segment starts and ends in value space: on zero for a
+            // clustered bar, and on the stack below it for a stacked one.
+            let base: f64 = if !stacked {
+                0.0
+            } else if value < 0.0 {
+                stack_negative
+            } else {
+                stack_positive
+            };
+            let end: f64 = base + value;
+            if stacked {
+                if value < 0.0 {
+                    stack_negative = end;
+                } else {
+                    stack_positive = end;
+                }
+            }
+            let (near_frac, far_frac): (f64, f64) = {
+                let scale: ValueScale = series_value_scale(s, scale, secondary_scale);
+                let base_frac: f64 = scale.fraction(base);
+                let end_frac: f64 = scale.fraction(end);
+                (base_frac.min(end_frac), base_frac.max(end_frac))
+            };
+            // The share of the axis the segment covers, which is its own length
+            // whichever side of the zero line it falls on.
+            let frac: f64 = far_frac - near_frac;
+            // The segment's own painted length and position, kept separate from
+            // `near_frac`/`far_frac` above (still used for data-label placement):
+            // a value past the axis interval must paint at its true length, not
+            // the length truncated to the interval, so the rectangle this plots
+            // matches what the host paints under its own plot-area clip
+            // (issue #1633).
+            let (near_frac_raw, far_frac_raw): (f64, f64) = {
+                let scale: ValueScale = series_value_scale(s, scale, secondary_scale);
+                let base_frac: f64 = scale.raw_fraction(base);
+                let end_frac: f64 = scale.raw_fraction(end);
+                (base_frac.min(end_frac), base_frac.max(end_frac))
+            };
+            let raw_frac: f64 = far_frac_raw - near_frac_raw;
+            // The palette is assigned over every series the chart declares, so
+            // the colour keeps the series' own index while the band position
+            // counts only the columns.
+            let color: String = series_fill(s, s_index, cat_index, &chart.theme_accent_colors);
+            let offset: f64 = bars.lead + band_slot as f64 * bars.step;
+            if horizontal {
+                // Bar charts stack categories bottom-up.
+                let row_top: f64 = plot.dy + plot_h - (cat_index as f64 + 1.0) * row;
+                let bar_w: f64 = raw_frac * plot_w;
+                write_clipped_bar_rect(
+                    out,
+                    plot_clip,
+                    plot_x,
+                    plot_y,
+                    plot_w,
+                    plot_h,
+                    plot_x + near_frac_raw * plot_w,
+                    row_top + offset,
+                    bar_w.max(0.0),
+                    bar_thickness,
+                    &color,
+                );
+            } else {
+                let bar_h: f64 = raw_frac * plot_h;
+                let (column_x, column_w): (f64, f64) = worksheet_column_span(
+                    plot_x + group_start + offset,
+                    bar_thickness,
+                    plot_x,
+                    plot_w,
+                    worksheet_markers,
+                );
+                write_clipped_bar_rect(
+                    out,
+                    plot_clip,
+                    plot_x,
+                    plot_y,
+                    plot_w,
+                    plot_h,
+                    column_x,
+                    plot_y + (1.0 - far_frac_raw) * plot_h,
+                    column_w,
+                    bar_h.max(0.0),
+                    &color,
+                );
+            }
+            if let Some(label) = data_label_text(chart, s, cat_index, category_total) {
+                let label_pt: f64 = data_label_text_pt(chart, &s.data_labels);
+                let label_line_h: f64 = data_label_line_h(chart, &s.data_labels);
+                // Where the label sits along the bar, from `<c:dLblPos>` or the
+                // grouping's default (issue #901). A stacked segment centres
+                // because an outside label would land on the segment above.
+                let position = s.data_labels.position;
+                let (label_x, label_y, label_w) = if horizontal {
+                    let row_top: f64 = plot.dy + plot_h - (cat_index as f64 + 1.0) * row;
+                    let bar_start: f64 = plot_x + near_frac * plot_w;
+                    let bar_w: f64 = frac * plot_w;
+                    let x: f64 = match position {
+                        DataLabelPosition::Center => bar_start,
+                        DataLabelPosition::OutsideEnd => bar_start + bar_w + LABEL_OUTSIDE_GAP,
+                        DataLabelPosition::InsideEnd => bar_start + bar_w - LABEL_OUTSIDE_W,
+                        DataLabelPosition::InsideBase => bar_start,
+                    };
+                    let w: f64 = match position {
+                        DataLabelPosition::Center => bar_w,
+                        _ => LABEL_OUTSIDE_W,
+                    };
+                    (
+                        x,
+                        row_top + offset + bar_thickness / 2.0 - label_line_h / 2.0,
+                        w,
+                    )
+                } else {
+                    let bar_top: f64 = plot_y + (1.0 - far_frac) * plot_h;
+                    let bar_bottom: f64 = plot_y + (1.0 - near_frac) * plot_h;
+                    let y: f64 = match position {
+                        DataLabelPosition::Center => {
+                            (bar_top + bar_bottom) / 2.0 - label_line_h / 2.0
+                        }
+                        DataLabelPosition::OutsideEnd => bar_top - label_line_h - LABEL_OUTSIDE_GAP,
+                        DataLabelPosition::InsideEnd => bar_top,
+                        DataLabelPosition::InsideBase => bar_bottom - label_line_h,
+                    } - pptx_column_data_label_seat_pt(chart, &s.data_labels);
+                    // The label centres on the column as painted, so a
+                    // worksheet column's whole-point edges carry it along.
+                    let (column_x, column_w): (f64, f64) = worksheet_column_span(
+                        plot_x + group_start + offset,
+                        bar_thickness,
+                        plot_x,
+                        plot_w,
+                        worksheet_markers,
+                    );
+                    (column_x, y, column_w)
+                };
+                let _ = writeln!(
+                    out,
+                    "#place(top + left, dx: {}pt, dy: {}pt, box(width: {}pt, height: {}pt)[#align(center + horizon)[#text(size: {}pt, weight: \"bold\", fill: {})[{}]]])",
+                    format_f64(label_x),
+                    format_f64(label_y),
+                    format_f64(label_w.max(0.0)),
+                    format_f64(label_line_h),
+                    format_f64(label_pt),
+                    chart_data_label_fill(chart),
+                    escape_typst(&label)
+                );
+            }
+        }
+        // Category label, which goes with the axis it labels.
+        if !category_axis_drawn {
+            continue;
+        }
+        let formatted_category: String = formatted_category_axis_label(chart, category);
+        if formatted_category.is_empty() {
+            continue;
+        }
+        let category: &str = &formatted_category;
+        if horizontal {
+            let row_top: f64 = plot.dy + plot_h - (cat_index as f64 + 1.0) * row;
+            let size_pt: f64 = chart_axis_text_pt(chart, chart.category_axis_text_style);
+            // Only a row strictly between the plot's own top and bottom edge
+            // gets the quantized seat (see `bar_category_label_baseline_pt`).
+            let is_edge_row: bool = cat_index == 0 || cat_index + 1 == categories;
+            let (family, bold, _) = chart_category_label_face(chart);
+            let has_measured_face: bool = family.eq_ignore_ascii_case("Trebuchet MS") && !bold;
+            let quantized_baseline: Option<f64> = if is_edge_row || !has_measured_face {
+                None
+            } else {
+                sheet_frame_top_pt
+                    .and_then(|top| bar_category_label_baseline_pt(top, row_top, row, size_pt))
+            };
+            if let Some(baseline) = quantized_baseline {
+                let _ = writeln!(
+                    out,
+                    "#place(top + left, dx: {}pt, dy: {}pt, box(width: {}pt)[#align(right)[#text(top-edge: 0pt, bottom-edge: 0pt, size: {}pt{})[{}]]])",
+                    format_f64(plot.dx + excel_bar_category_label_x_shift_pt(chart)),
+                    format_f64(baseline),
+                    format_f64(chart_category_label_box_w(chart)),
+                    format_f64(size_pt),
+                    chart_category_text_attrs(chart),
+                    escape_category_axis_label(category)
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "#place(top + left, dx: {}pt, dy: {}pt, box(width: {}pt, height: {}pt)[#align(right + horizon)[#text(size: {}pt{})[{}]]])",
+                    format_f64(plot.dx + excel_bar_category_label_x_shift_pt(chart)),
+                    format_f64(row_top),
+                    format_f64(chart_category_label_box_w(chart)),
+                    format_f64(row),
+                    format_f64(size_pt),
+                    chart_category_text_attrs(chart),
+                    escape_category_axis_label(category)
+                );
+            }
+        } else if category_labels_rotated {
+            // Every label hangs from the axis by its trailing end, pinned at
+            // its band's centre (less the PowerPoint-only inset of #1022),
+            // and slants away down-left. Rotating about
+            // `top + right` is what puts all of them on one top edge, which is
+            // how the reference draws them (issue #884). The box is the widest
+            // label's width for every label so that right-aligning inside it
+            // lands each trailing end on the pivot — except what an ellipsized
+            // label swallowed, which deliberately overflows past it (#1076).
+            let label_box_w: f64 = chart_category_label_widest_pt(chart).unwrap_or(row);
+            let label: String = chart_category_label_text(chart, category, label_box_w);
+            let centre: f64 = plot_x + group_start + row / 2.0;
+            let _ = writeln!(
+                out,
+                "#place(top + left, dx: {}pt, dy: {}pt, rotate(-{}deg, origin: top + right, box(width: {}pt)[#align(right)[#text(size: {}pt{})[{}]]]))",
+                format_f64(chart_category_rotated_label_x(chart, centre, label_box_w)),
+                format_f64(chart_category_rotated_label_y(chart, plot_y + plot_h)),
+                format_f64(CATEGORY_LABEL_ROTATION_DEG),
+                format_f64(label_box_w),
+                format_f64(chart_axis_text_pt(chart, chart.category_axis_text_style)),
+                chart_category_text_attrs(chart),
+                rotated_category_label_content(chart, category, &label)
+            );
+        } else {
+            // A wrapped label grows downwards from the seat one flat line would
+            // have taken, one whole leaded line of its own face at a time, and
+            // the band [`axis_label_gutters`] reserved already holds them
+            // (issue #1675). The lines are broken here rather than left to
+            // Typst so that the break and the reserve cannot disagree.
+            let size_pt: f64 = chart_axis_text_pt(chart, chart.category_axis_text_style);
+            let lines: Vec<String> = if category_label_lines > 1 {
+                wrap_category_label(chart, category, chart_category_label_band_pt(chart, frame))
+                    .unwrap_or_else(|| vec![category.to_string()])
+            } else {
+                vec![category.to_string()]
+            };
+            let pitch: f64 = category_label_line_pitch_pt(chart);
+            for (index, line) in lines.iter().enumerate() {
+                // The inner `box` is what stops Typst breaking the line
+                // again: past the measured share PowerPoint abandons the wrap
+                // and lets one flat line overlap its neighbours, and a label
+                // Typst re-broke there would reserve one band and paint
+                // another (issue #1675).
+                let _ = writeln!(
+                    out,
+                    "#place(top + left, dx: {}pt, dy: {}pt, box(width: {}pt, height: {}pt)[#align(center + horizon)[#box[#text(size: {}pt{})[{}]]]])",
+                    format_f64(plot_x + group_start),
+                    format_f64(
+                        plot_y
+                            + plot_h
+                            + 2.0
+                            + excel_category_label_y_shift_pt(chart)
+                            + index as f64 * pitch
+                    ),
+                    format_f64(row),
+                    format_f64(chart_category_band_pt(chart)),
+                    format_f64(size_pt),
+                    chart_category_text_attrs(chart),
+                    escape_category_axis_label(line)
+                );
+            }
+        }
+    }
+
+    // The axis lines and their major tick marks, drawn after the bars so they
+    // paint on top as Office paints them — an inward tick would otherwise
+    // disappear under the bar it crosses — but before any line series laid
+    // over the columns: where that line runs along the category axis (a run
+    // of zero values), Excel shows the line's colour, not the rule's, so the
+    // rule has to go down first (#1604).
+    //
+    // A bar chart's value axis runs along the bottom edge and its category axis
+    // down the left one; a column chart's are the other way round.
+    let (left_axis_drawn, bottom_axis_drawn) = if horizontal {
+        (category_axis_drawn, value_axis_drawn)
+    } else {
+        (value_axis_drawn, category_axis_drawn)
+    };
+    // Each axis draws with the line it declares, if it declares one (#900).
+    let (left_stroke, bottom_stroke) = if horizontal {
+        (
+            chart_chrome_stroke(chart.category_axis_line),
+            chart_chrome_stroke(chart.value_axis_line),
+        )
+    } else {
+        (
+            chart_chrome_stroke(chart.value_axis_line),
+            chart_chrome_stroke(chart.category_axis_line),
+        )
+    };
+    // The category axis stands on the value-zero line, which coincides with the
+    // plot's own edge only while the value axis starts at zero. A bar chart's
+    // category axis is the vertical one and a column chart's the horizontal
+    // one, so which edge leaves its seat depends on the orientation (#1184).
+    let (left_axis_x, bottom_axis_y): (f64, f64) = if horizontal {
+        (plot_x + zero_frac * plot_w, plot_y + plot_h)
+    } else {
+        (plot_x, plot_y + (1.0 - zero_frac) * plot_h)
+    };
+    if let (true, Some(stroke)) = (left_axis_drawn, left_stroke.as_deref()) {
+        write_left_axis_line(out, left_axis_x, plot_y, plot_h, stroke);
+    }
+    if let (true, Some(stroke)) = (bottom_axis_drawn, bottom_stroke.as_deref()) {
+        write_bottom_axis_line(out, plot_x, bottom_axis_y, plot_w, stroke);
+    }
+    if value_axis_drawn
+        && let Some(reach) = tick_reach(
+            chart.value_axis_major_tick_mark,
+            chart_axis_text_pt(chart, chart.value_axis_text_style),
+        )
+    {
+        // Every value tick sits on its own gridline, both being one major unit.
+        for tick in &major_units {
+            let frac: f64 = scale.fraction(*tick);
+            if horizontal {
+                if let Some(stroke) = bottom_stroke.as_deref() {
+                    write_tick_under_plot(
+                        out,
+                        plot_x + frac * plot_w,
+                        plot_y + plot_h,
+                        reach,
+                        stroke,
+                    );
+                }
+            } else if let Some(stroke) = left_stroke.as_deref() {
+                write_tick_left_of_plot(
+                    out,
+                    plot_x,
+                    column_value_chrome_y(chart, plot_y, plot_h, frac, sheet_frame_top_pt),
+                    reach,
+                    stroke,
+                );
+            }
+        }
+    }
+    // The category ticks land on band boundaries rather than band centres:
+    // `<c:crossBetween val="between"/>` sits each band between two ticks, so
+    // the bars, which fill the bands, sit between them too and three categories
+    // take four ticks.
+    if categories > 0
+        && category_axis_drawn
+        && let Some(reach) = tick_reach(
+            chart.category_axis_major_tick_mark,
+            chart_axis_text_pt(chart, chart.category_axis_text_style),
+        )
+    {
+        for boundary in 0..=categories {
+            let offset: f64 = boundary as f64 * row;
+            if horizontal {
+                if let Some(stroke) = left_stroke.as_deref() {
+                    write_tick_left_of_plot(out, left_axis_x, plot_y + offset, reach, stroke);
+                }
+            } else {
+                if let Some(stroke) = bottom_stroke.as_deref() {
+                    write_tick_under_plot(out, plot_x + offset, bottom_axis_y, reach, stroke);
+                }
+            }
+        }
+    }
+
+    // A combo plot area's line-family series, over the columns they share the
+    // axis with. Each point sits at its category band's centre, where the
+    // band's own column is centred by `<c:crossBetween val="between"/>`, and at
+    // its own value rather than on top of the stack: the line records what was
+    // spent against the budget the columns total, not one more segment of it
+    // (issue #1067). Drawn after every column and after the axis rules so
+    // neither a later category's bar nor the category axis buries it, which
+    // is the order Excel paints them in (#1604).
+    for s_index in overlay_slots.iter().copied() {
+        let s: &crate::ir::ChartSeries = &series[s_index];
+        let color: String = series_color(s, s_index, 0, &chart.theme_accent_colors);
+        let mut paths: Vec<Vec<(f64, f64)>> = Vec::new();
+        let mut path: Vec<(f64, f64)> = Vec::new();
+        for cat_index in 0..categories {
+            let Some(value) = s.value_at_point(cat_index) else {
+                if !path.is_empty() {
+                    paths.push(std::mem::take(&mut path));
+                }
+                continue;
+            };
+            let frac: f64 = series_value_scale(s, scale, secondary_scale).fraction(value);
+            if horizontal {
+                // Bar charts run their categories bottom-up and place from
+                // the plot box's own top edge, as the column loop above does.
+                path.push((
+                    plot_x + frac * plot_w,
+                    plot.dy + plot_h - (cat_index as f64 + 0.5) * row,
+                ));
+            } else {
+                path.push((
+                    plot_x + (cat_index as f64 + 0.5) * row,
+                    plot_y + plot_h - frac * plot_h,
+                ));
+            }
+        }
+        if !path.is_empty() {
+            paths.push(path);
+        }
+        // A missing cached value breaks the line into separate paths; joining
+        // its neighbours would invent a segment across a point Office omits.
+        for points in &paths {
+            if points.len() < 2 {
+                continue;
+            }
+            let segments: String = polyline_curve_segments(points);
+            write_plotted(
+                out,
+                plot_clip,
+                &format!(
+                    "#place(top + left, curve(stroke: {}, {segments}))",
+                    series_stroke(s, &color)
+                ),
+            );
+        }
+        for (x, y) in paths.iter().flatten() {
+            write_series_marker(out, s_index, s, *x, *y, &color, worksheet_markers);
+        }
+    }
+
+    // Axis titles, in the bands `axis_title_gutters` reserved for them.
+    if let Some(title) = chart.value_axis_title.as_deref() {
+        let _ = writeln!(
+            out,
+            "#place(top + left, dx: {}pt, dy: {}pt, box(width: {}pt, height: {}pt)[#align(center + horizon)[#rotate(-90deg, reflow: false)[#text(size: 9pt, weight: \"bold\")[{}]]]])",
+            format_f64(legend.left),
+            format_f64(plot_y),
+            format_f64(AXIS_TITLE_H),
+            format_f64(plot_h),
+            escape_typst(title)
+        );
+    }
+    if let Some(title) = chart.category_axis_title.as_deref() {
+        let (_, gutter_h) = axis_label_gutters(chart, frame);
+        let _ = writeln!(
+            out,
+            "#place(top + left, dx: {}pt, dy: {}pt, box(width: {}pt, height: {}pt)[#align(center + horizon)[#text(size: 9pt, weight: \"bold\")[{}]]])",
+            format_f64(plot_x),
+            format_f64(plot_y + plot_h + 2.0 + gutter_h - AXIS_TITLE_H),
+            format_f64(plot_w),
+            format_f64(AXIS_TITLE_H),
+            escape_typst(title)
+        );
+    }
+
+    // Legend on the edge `<c:legendPos>` asks for — none when the chart
+    // declares no `<c:legend>` (issue #762). Bounded rather than returned
+    // early: the markup's closing delimiter is written after this loop.
+    let legend_names: Vec<String> = series
+        .iter()
+        .enumerate()
+        .map(|(index, s)| {
+            s.name
+                .clone()
+                .unwrap_or_else(|| format!("Series {}", index + 1))
+        })
+        .collect();
+    let key: LegendKeyMetrics = axis_legend_entry_metrics(chart);
+    let entry_widths: Vec<f64> =
+        legend_entry_widths(chart, key.width_pt, key.label_gap_pt, &legend_names);
+    let (horizontal_end_trim, horizontal_x_shift) =
+        excel_bottom_legend_row_adjustment(chart, key.width_pt, key.label_gap_pt, &legend_names);
+    let right_inset =
+        powerpoint_right_legend_inset(chart, frame, &legend_names, key.width_pt, key.label_gap_pt);
+    let legend_entries: usize = if chart.has_legend { series.len() } else { 0 };
+    for (s_index, s) in series.iter().enumerate().take(legend_entries) {
+        let color: String = series_color(s, s_index, 0, &chart.theme_accent_colors);
+        let default_name: String = format!("Series {}", s_index + 1);
+        let name: &str = s.name.as_deref().unwrap_or(&default_name);
+        // The content the legend sits beside spans the plot and both label
+        // gutters, so a bottom legend clears the category labels.
+        // A column plot on a slide measures its own bottom band, so the box
+        // has to be the one the plot was laid out inside; taking the generic
+        // band here left the legend centred on a box the plot no longer filled
+        // (issue #1437).
+        let measures_own_band: bool = (chart.host == crate::ir::ChartHost::Spreadsheet
+            || powerpoint_column_chrome(chart))
+            && (chart.text_style.size_pt.is_some()
+                || chart.category_axis_text_style.size_pt.is_some());
+        let (gutter_w, gutter_h) = if horizontal {
+            (
+                chart_category_gutter_pt(chart) + GAP,
+                if powerpoint_column_chrome(chart) && measures_own_band {
+                    axis_label_gutters(chart, frame).1
+                } else {
+                    chart_tick_band_pt(chart)
+                },
+            )
+        } else {
+            let category_gutter_h: f64 = if measures_own_band {
+                axis_label_gutters(chart, frame).1
+            } else {
+                chart_category_band_pt(chart)
+            };
+            (chart_tick_band_pt(chart) + GAP, category_gutter_h)
+        };
+        let (entry_x, entry_y) = legend.entry_origin(
+            chart.legend_position,
+            s_index,
+            series_count,
+            (
+                plot_x - gutter_w,
+                plot_y,
+                gutter_w + plot_w,
+                plot_h + gutter_h,
+            ),
+            LegendEntryLayout {
+                row_h: axis_legend_row_height_pt(chart),
+                widths: &entry_widths,
+                right_inset,
+                side_y_shift: powerpoint_right_legend_y_shift(chart, frame, title_h),
+                horizontal_end_trim,
+                horizontal_x_shift,
+            },
+        );
+        let entry_y: f64 = entry_y + excel_bottom_legend_y_shift_pt(chart);
+        // Each series' key is drawn the way its family plots it: a filled
+        // swatch for a column, a stroke-and-marker sample for a line laid over
+        // them (issue #1067).
+        let key_markup: String = if overlaid[s_index] {
+            line_legend_key(s_index, s, &color, chart_legend_text_pt(chart))
+        } else {
+            let fill: &str = if s.fill_mode == crate::ir::ChartFillMode::Suppressed {
+                "none"
+            } else {
+                &color
+            };
+            let baseline: String = powerpoint_right_legend_key_baseline_pt(chart)
+                .map(|value| format!(", baseline: {}pt", format_f64(value)))
+                .unwrap_or_default();
+            format!(
+                "#box(width: {}pt, height: {}pt{}, fill: {})",
+                format_f64(key.width_pt),
+                format_f64(key.height_pt),
+                baseline,
+                fill
+            )
+        };
+        let _ = writeln!(
+            out,
+            "#place(top + left, dx: {}pt, dy: {}pt, box[{key_markup}#h({}pt)#text(size: {}pt{})[{}]])",
+            format_f64(entry_x),
+            format_f64(entry_y),
+            format_f64(key.label_gap_pt),
+            format_f64(chart_legend_text_pt(chart)),
+            chart_legend_text_attrs(chart),
+            escape_typst(name)
+        );
+    }
+
+    write_chart_user_shapes(
+        out,
+        chart,
+        chart_area.unwrap_or((total_w, total_h + title_h)),
+        title_h,
+    );
+    write_chart_area_end(out, wraps_title);
+}
+
+fn generate_chart_bar(out: &mut String, chart: &Chart) {
+    let max_value: f64 = chart
+        .series
+        .iter()
+        .flat_map(|series| series.present_values())
+        .fold(0.0_f64, f64::max);
+    let max_value: f64 = if max_value == 0.0 { 1.0 } else { max_value };
+
+    let colors: &[&str] = &CHART_CATEGORY_COLORS[..4];
+
+    for (row_index, category) in chart.categories.iter().enumerate() {
+        let escaped_category: String = escape_typst(category);
+        let _ = writeln!(out, "#text(weight: \"bold\")[{escaped_category}]");
+        for (series_index, series) in chart.series.iter().enumerate() {
+            let value: f64 = series.value_at_point(row_index).unwrap_or(0.0);
+            let percent: u32 = (value / max_value * 100.0).round().min(100.0) as u32;
+            // The fallback here indexes by series, not by point, because each
+            // row of this table is one category across all series.
+            let color: String = match (
+                series.paints_fill_for_point(row_index),
+                series.fill_for_point(row_index),
+            ) {
+                (false, _) => "none".to_string(),
+                (true, Some(declared)) => rgb(&declared),
+                (true, None) => colors[series_index % colors.len()].to_string(),
+            };
+            let _ = writeln!(
+                out,
+                "#box(width: {percent}%, height: 14pt, fill: {color}, radius: 2pt)[#text(size: 8pt, fill: white)[ {}]]",
+                format_f64(value)
+            );
+        }
+        let _ = writeln!(out);
+    }
+
+    if chart.series.len() > 1 {
+        let _ = writeln!(out);
+        for (index, series) in chart.series.iter().enumerate() {
+            let default_name: String = format!("Series {}", index + 1);
+            let name: &str = series.name.as_deref().unwrap_or(&default_name);
+            let color: &str = if series.fill_mode == crate::ir::ChartFillMode::Suppressed {
+                "none"
+            } else {
+                colors[index % colors.len()]
+            };
+            let _ = writeln!(
+                out,
+                "#box(width: 10pt, height: 10pt, fill: {color}) #text(size: {}pt{})[{name}] ",
+                format_f64(chart_legend_text_pt(chart)),
+                chart_legend_text_attrs(chart)
+            );
+        }
+    }
+}
+
+/// Baseline for explicitly sized labels below a framed worksheet line plot.
+///
+/// Native Excel size, face, plot-height and fractional frame-height probes of
+/// the budget workbook (#1568) separate two seats. The natural seat follows
+/// the plot with half a line pitch and 1pt clearance; Excel rounds that origin
+/// and the bare ascent separately. The bottom cap rounds the space left after
+/// the bare line box and 1pt edge padding. Leading contributes to
+/// the natural gap, but not to the ink box used by the cap (Arial distinguishes
+/// those terms). A short plot therefore moves labels until the cap is reached.
+///
+/// A framed slide chart is seated by `powerpoint_line_category_baseline_pt`
+/// instead, on its own native probes (#1651). Flowed charts, implicit sizes and
+/// the remaining hosts have no native calibration for this rule and retain
+/// their existing layout.
+fn worksheet_line_category_baseline(
+    chart: &Chart,
+    frame: Option<(f64, f64)>,
+    plot_bottom: f64,
+    legend_bottom: f64,
+) -> Option<f64> {
+    if chart.host != crate::ir::ChartHost::Spreadsheet
+        || (chart.category_axis_text_style.size_pt.is_none() && chart.text_style.size_pt.is_none())
+    {
+        return None;
+    }
+    let (_, frame_h) = frame?;
+    let (family, bold, size) = chart_category_label_face(chart);
+    let (ascent, descent, line_gap) =
+        calibrated_chart_line_metrics_em(family, bold).or_else(|| {
+            let (ascent, descent) = chart_face_line_metrics_em(family, bold)?;
+            Some((
+                ascent,
+                descent,
+                crate::render::pdf::font_line_gap_em(family).unwrap_or(0.0),
+            ))
+        })?;
+    Some(line_category_baseline_pt(
+        frame_h - legend_bottom,
+        plot_bottom,
+        size,
+        (ascent, descent, line_gap),
+    ))
+}
+
+/// Seat a category line from its measured face metrics and available space.
+pub(super) fn line_category_baseline_pt(
+    available_height: f64,
+    plot_bottom: f64,
+    size: f64,
+    metrics: (f64, f64, f64),
+) -> f64 {
+    let (ascent, descent, line_gap) = metrics;
+    let above = (ascent * size).round();
+    // Excel quantizes the face's leading before using half the line pitch.
+    // Arial 15pt (0.49pt leading) and 24pt (0.79pt) distinguish this from
+    // rounding the combined metric, while zero-leading faces stay unchanged.
+    let pitch = (ascent + descent) * size + (line_gap * size).round();
+    let natural = (plot_bottom + pitch / 2.0 + 1.0).round() + above;
+    let cap = (available_height - (ascent + descent) * size - 1.0).round() + above;
+    natural.min(cap)
+}
+
+/// The value-label gutter of a framed PowerPoint plot, split into the parts
+/// the labels and the plot each stand on.
+///
+/// PowerPoint spends the band on the labels themselves: the widest one starts
+/// [`EXCEL_VALUE_LABEL_EDGE_PAD_PT`] inside the chart frame and the plot
+/// begins one face-measured clearance past its end, which is the same
+/// composition the Excel column exports measure (issue #1166) rather than the
+/// pure `a + b * size` fit a slide chart used to reserve. The line family
+/// measured it first (#1651) and the column family measures the same
+/// composition (#1663), so one type serves both.
+#[derive(Clone, Copy)]
+struct PowerPointValueGutter {
+    /// Frame inset the widest label's first glyph sits on.
+    label_x: f64,
+    /// Advance of the widest label, which is the label box's width.
+    label_w: f64,
+    /// Clearance between the labels and the plot's edge.
+    clearance: f64,
+}
+
+impl PowerPointValueGutter {
+    /// The whole band, from the frame edge to the plot's.
+    fn total(self) -> f64 {
+        self.label_x + self.label_w + self.clearance
+    }
+}
+
+/// Whether a chart's line plot is laid out on the native PowerPoint
+/// measurements, or on the pre-#1651 constants.
+///
+/// A chart stating no text size at all keeps the old geometry, as the probes
+/// only cover charts that state one — the same gate
+/// [`chart_column_value_gutter_pt`] applies to the column family.
+fn powerpoint_line_chrome(chart: &Chart, axis: crate::ir::ChartTextStyle) -> bool {
+    chart.host == crate::ir::ChartHost::Presentation
+        && (chart.text_style.size_pt.is_some() || axis.size_pt.is_some())
+}
+
+/// Clearance one axis' tick labels keep between themselves and the plot.
+///
+/// The fractions are [`EXCEL_VALUE_LABEL_ASCENT_FRACTION`] and
+/// [`EXCEL_VALUE_LABEL_DESCENT_FRACTION`]: the quantity is the face's line box
+/// rather than a multiple of the size, which is what makes it differ by face
+/// at one size.
+fn chart_label_clearance_pt(family: &str, bold: bool, size_pt: f64) -> Option<f64> {
+    let (ascent_em, descent_em) = chart_face_line_metrics_em(family, bold)?;
+    Some(
+        (EXCEL_VALUE_LABEL_ASCENT_FRACTION * ascent_em
+            + EXCEL_VALUE_LABEL_DESCENT_FRACTION * descent_em)
+            * size_pt,
+    )
+}
+
+/// The gutter a framed PowerPoint line plot's primary value labels take down
+/// its left edge, or `None` where the chart or the face is outside the
+/// measured regime.
+///
+/// Native exports of `tests/fixtures/pptx/line-chart.pptx`, one factor per
+/// variant (`scripts/probes/issue-1651-line-value-size.json` and
+/// `issue-1651-line-value-format.json`), reserve 19.409pt at 9pt, 23.713pt at
+/// 12pt and 32.326pt at 18pt for single-digit labels, and 55.121pt for
+/// `0.00` at 18pt. Every one of them is this model within 0.02pt, and page 11
+/// of the #1220 deck — 40.752pt for `20%` at 11.97pt in another face — lands
+/// within 0.005pt of it (issue #1651).
+fn powerpoint_line_value_gutter(chart: &Chart) -> Option<PowerPointValueGutter> {
+    if !powerpoint_line_chrome(chart, chart.value_axis_text_style) {
+        return None;
+    }
+    powerpoint_primary_value_gutter(chart)
+}
+
+/// The same gutter under a framed PowerPoint *column* plot, or `None` where
+/// the chart or the face is outside the measured regime.
+///
+/// Native PowerPoint 16.113.1 exports of `tests/fixtures/pptx/bar-chart.pptx`
+/// repackaged as a column chart reserve 19.409pt at 9pt, 23.713pt at 12pt and
+/// 32.326pt at 18pt for single-digit labels, and 55.121 and 73.371pt for
+/// `0.00` and `0.0000` at 18pt — the line family's own numbers to the last
+/// emitted digit (`scripts/probes/issue-1663-column-value-size.json` and
+/// `issue-1663-column-value-format.json`). Page 8 of the #1220 deck measures
+/// it in a second face: 36.762pt for `800` in Arial at 11.97pt, against the
+/// 36.770pt this predicts.
+///
+/// The pre-#1663 `9.5 + 3.13 em` fit read no labels at all, so it started the
+/// plot 10.2pt too far right there. Its 9.5pt intercept was the 6.5pt frame
+/// pad plus the tracking of the #841 deck it was fitted on — see
+/// [`powerpoint_value_label_widest_pt`] (issue #1663).
+fn powerpoint_column_value_gutter(chart: &Chart) -> Option<PowerPointValueGutter> {
+    if !powerpoint_column_chrome(chart)
+        || (chart.text_style.size_pt.is_none() && chart.value_axis_text_style.size_pt.is_none())
+    {
+        return None;
+    }
+    powerpoint_primary_value_gutter(chart)
+}
+
+/// The band either family gives its primary value labels, once the caller has
+/// established that the chart is inside the measured regime.
+fn powerpoint_primary_value_gutter(chart: &Chart) -> Option<PowerPointValueGutter> {
+    let bold: bool = chart
+        .text_style
+        .resolved_bold(chart.value_axis_text_style)
+        .unwrap_or(false);
+    let family: &str = chart
+        .value_axis_font_family()
+        .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_FAMILY);
+    let size_pt: f64 = chart_axis_text_pt(chart, chart.value_axis_text_style);
+    Some(PowerPointValueGutter {
+        label_x: EXCEL_VALUE_LABEL_EDGE_PAD_PT,
+        label_w: powerpoint_value_label_widest_pt(chart)?,
+        clearance: chart_label_clearance_pt(family, bold, size_pt)?,
+    })
+}
+
+/// Advance of the widest value tick label a PowerPoint plot prints, tracking
+/// included, or `None` where the face cannot be measured.
+///
+/// `a:defRPr@spc` widens each label by one step after *every* glyph, the last
+/// included: sweeping it over 0, 1 and 2pt on four-glyph `0.00` labels
+/// (`scripts/probes/issue-1663-column-value-tracking.json`) moves the native
+/// gutter by exactly 4.000pt per point of tracking. Excel's own worksheet
+/// gutter is left on the untracked advance its #1166 exports measured, since
+/// no Excel probe sweeps `spc` (issue #1663).
+fn powerpoint_value_label_widest_pt(chart: &Chart) -> Option<f64> {
+    let untracked_pt: f64 = chart_column_value_label_widest_pt(chart)?;
+    let tracking_pt: f64 = chart
+        .text_style
+        .resolved_letter_spacing(chart.value_axis_text_style)
+        .unwrap_or(0.0);
+    if tracking_pt == 0.0 {
+        return Some(untracked_pt);
+    }
+    let bold: bool = chart
+        .text_style
+        .resolved_bold(chart.value_axis_text_style)
+        .unwrap_or(false);
+    let family: &str = chart
+        .value_axis_font_family()
+        .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_FAMILY);
+    let size_pt: f64 = chart_axis_text_pt(chart, chart.value_axis_text_style);
+    chart_value_axis_labels(chart)
+        .iter()
+        .filter_map(|label| {
+            chart_text_advance_em(family, bold, label)
+                .map(|advance_em| advance_em * size_pt + tracking_pt * label.chars().count() as f64)
+        })
+        .reduce(f64::max)
+}
+
+/// The same band mirrored onto a drawn secondary axis: its widest label ends
+/// [`EXCEL_VALUE_LABEL_EDGE_PAD_PT`] inside the frame's right edge, and the
+/// plot stops the same clearance before it.
+///
+/// Page 11 of the #1220 deck measures the mirror natively: its `0`..`7`
+/// labels at 11.97pt end 6.500pt inside the frame with the plot 10.296pt
+/// before them, against the 10.299pt the primary gutter's clearance predicts
+/// (issue #1651).
+fn powerpoint_line_secondary_gutter(
+    chart: &Chart,
+    axis: &crate::ir::ChartSecondaryValueAxis,
+    scale: ValueScale,
+) -> Option<PowerPointValueGutter> {
+    if !powerpoint_line_chrome(chart, axis.text_style) {
+        return None;
+    }
+    let bold: bool = chart
+        .text_style
+        .resolved_bold(axis.text_style)
+        .unwrap_or(false);
+    let family: &str = axis
+        .text_font_family
+        .as_deref()
+        .or_else(|| chart.value_axis_font_family())
+        .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_FAMILY);
+    let size_pt: f64 = chart_axis_text_pt(chart, axis.text_style);
+    let number_format: Option<&str> =
+        value_axis_number_format(chart, crate::ir::ChartValueAxisRole::Secondary);
+    let widest_em: f64 = scale
+        .ticks()
+        .into_iter()
+        .filter_map(|tick| {
+            chart_text_advance_em(
+                family,
+                bold,
+                &chart_value_label_formatted(tick, number_format),
+            )
+        })
+        .fold(0.0_f64, f64::max);
+    (widest_em > 0.0).then_some(())?;
+    Some(PowerPointValueGutter {
+        label_x: EXCEL_VALUE_LABEL_EDGE_PAD_PT,
+        label_w: widest_em * size_pt,
+        clearance: chart_label_clearance_pt(family, bold, size_pt)?,
+    })
+}
+
+/// The band a framed PowerPoint line plot leaves below itself for its category
+/// labels: twice their clearance, over the same frame pad every other edge
+/// keeps.
+///
+/// Measured on `scripts/probes/issue-1651-line-category-size.json`, whose
+/// native exports keep 23.198pt at 9pt, 28.767pt at 12pt, 39.902pt at 18pt and
+/// 51.028pt at 24pt — all within 0.004pt of this, and page 11 of the #1220
+/// deck's 27.093pt in another face within 0.005pt. A label that wraps takes a
+/// further line of its face's line height per extra line, which this does not
+/// model (issue #1651).
+fn powerpoint_line_category_band_pt(chart: &Chart) -> Option<f64> {
+    if !powerpoint_line_chrome(chart, chart.category_axis_text_style) {
+        return None;
+    }
+    let (family, bold, size_pt) = chart_category_label_face(chart);
+    Some(EXCEL_VALUE_LABEL_EDGE_PAD_PT + 2.0 * chart_label_clearance_pt(family, bold, size_pt)?)
+}
+
+/// Where that band seats the category label's baseline.
+///
+/// The label's line box rests on the band's own frame pad, so the baseline is
+/// one descent above it. PowerPoint rounds the label block itself, so the
+/// native baselines scatter by up to half a point around this (issue #1651).
+fn powerpoint_line_category_baseline_pt(chart: &Chart, plot_bottom: f64) -> Option<f64> {
+    if !powerpoint_line_chrome(chart, chart.category_axis_text_style) {
+        return None;
+    }
+    let (family, bold, size_pt) = chart_category_label_face(chart);
+    let (_, descent_em) = chart_face_line_metrics_em(family, bold)?;
+    Some(
+        plot_bottom + 2.0 * chart_label_clearance_pt(family, bold, size_pt)? - descent_em * size_pt,
+    )
+}
+
+/// Render a line/area chart as a polyline plot over a value axis, matching
+/// the native Excel/PowerPoint composition (gridlines, tick labels, category
+/// axis, markers, legend).
+fn generate_chart_line_plot(
+    out: &mut String,
+    chart: &Chart,
+    frame: Option<(f64, f64)>,
+    sheet_frame_origin_pt: Option<(f64, f64)>,
+) {
+    let worksheet_markers =
+        sheet_frame_origin_pt.map(|frame_origin| WorksheetMarkerPlacement { frame_origin });
+    const PLOT_W: f64 = 320.0;
+    const PLOT_H: f64 = 210.0;
+    const VALUE_GAP: f64 = 24.0; // value tick label gutter (left)
+    const CAT_GAP: f64 = 18.0; // category label gutter (bottom)
+    const LEGEND_W: f64 = 88.0;
+    // Entry-to-entry pitch, measured between the legend key centres of the
+    // native Excel export of `WithChart.xlsx` at 150 DPI: 37px = 17.76pt for
+    // 10pt entries. LibreOffice puts its own entries 14.07pt apart on the same
+    // file, so this one is Excel's rather than a renderer consensus (#800).
+    const LINE_LEGEND_ROW_H: f64 = 17.76;
+    const GAP: f64 = 6.0;
+
+    let categories: usize = chart.categories.len();
+    let series: &[crate::ir::ChartSeries] = &chart.series;
+
+    // As in `generate_chart_axis`, the axis spans the interval the part states
+    // and only otherwise the automatic one, so a point below zero has a floor
+    // to dip towards (issue #1184). Each axis group counts its interval out of
+    // its own series: a secondary-axis ratio must not stretch the primary
+    // percentage axis, nor be squashed onto it (issue #1374).
+    let primary_max_value: f64 =
+        chart_auto_max_value(chart, crate::ir::ChartValueAxisRole::Primary);
+    let scale: ValueScale = chart_value_scale(chart, nice_axis(primary_max_value));
+    let secondary_axis: Option<&crate::ir::ChartSecondaryValueAxis> = chart_secondary_axis(chart);
+    let secondary_scale: Option<ValueScale> = secondary_axis.map(|_| {
+        value_scale_for_axis(
+            chart,
+            crate::ir::ChartValueAxisRole::Secondary,
+            nice_axis(chart_auto_max_value(
+                chart,
+                crate::ir::ChartValueAxisRole::Secondary,
+            )),
+        )
+    });
+    // A drawn secondary axis takes a right-hand gutter for its tick labels,
+    // mirroring the primary's on the left. A switched-off one reserves
+    // nothing, as Office reclaims that band.
+    let secondary_axis_drawn: bool = secondary_axis.is_some_and(|axis| !axis.deleted);
+
+    // As in `generate_chart_axis`: the title takes a band from the content,
+    // while the full chart-area outline stays around both (issue #1216).
+    let title_h: f64 = if chart.title.is_some() {
+        chart_area_title_h(chart)
+    } else {
+        0.0
+    };
+    // The chart area a user shape's fractions are of, kept before the title
+    // band comes off it (issue #1186).
+    let chart_area: Option<(f64, f64)> = frame;
+    let frame: Option<(f64, f64)> =
+        frame.map(|(width, height)| (width, (height - title_h).max(MIN_PLOT_PT)));
+
+    // `<c:legendPos>` says which edge a legend would take, not that the chart
+    // has one. Reserving the band from the position alone left a legendless
+    // line chart's plot 94pt short of its frame with nothing drawn in the gap
+    // (issue #1649); the axis, radar and pie renderers already reclaim it
+    // (issue #762).
+    let legend: LegendBox = if chart.has_legend {
+        LegendBox::new(chart.legend_position, LINE_LEGEND_ROW_H, LEGEND_W)
+    } else {
+        LegendBox::hidden()
+    };
+    // Line and scatter plots honour the same inner plot rectangle as the bar
+    // and column families. `stated_plot_rect` also translates chart-area y
+    // fractions into the title-reduced content box's coordinates (#1265).
+    let stated_plot: Option<(f64, f64, f64, f64)> = stated_plot_rect(chart, chart_area, title_h);
+    // A framed PowerPoint plot measures both gutters from the labels that
+    // stand in them; anything else keeps the flat pre-#1651 band. The native
+    // probes only cover the automatic rectangle, so a chart stating its own
+    // `c:plotArea/c:layout` keeps the geometry it had (#1265, #1568).
+    let measured_chrome: bool = frame.is_some() && stated_plot.is_none();
+    let value_gutter: Option<PowerPointValueGutter> = measured_chrome
+        .then(|| powerpoint_line_value_gutter(chart))
+        .flatten();
+    let secondary_gutter: Option<PowerPointValueGutter> = measured_chrome
+        .then(|| {
+            secondary_axis
+                .zip(secondary_scale)
+                .and_then(|(axis, scale)| powerpoint_line_secondary_gutter(chart, axis, scale))
+        })
+        .flatten();
+    let left_gutter: f64 = value_gutter.map_or(VALUE_GAP + GAP, PowerPointValueGutter::total);
+    let right_gutter: f64 = if secondary_axis_drawn {
+        secondary_gutter.map_or(VALUE_GAP + GAP, PowerPointValueGutter::total)
+    } else {
+        0.0
+    };
+    // The box one value tick label is right-aligned in, as `(left, width)`
+    // inside the chart frame.
+    let (value_label_x, value_label_w): (f64, f64) =
+        value_gutter.map_or((0.0, VALUE_GAP), |gutter| (gutter.label_x, gutter.label_w));
+
+    // A framed chart fills its `<p:graphicFrame>`; a flowed one keeps the
+    // intrinsic plot size (issue #548). Keep the automatic rectangle so the
+    // value-label gutter can follow the same displacement when the part states
+    // a different one below.
+    // The band below the plot is the category labels' own, measured from
+    // their face where the chart is a framed PowerPoint one (issue #1651).
+    let category_band: f64 = measured_chrome
+        .then(|| powerpoint_line_category_band_pt(chart))
+        .flatten()
+        .unwrap_or(CAT_GAP);
+    let (automatic_plot_w, automatic_plot_h) = match frame {
+        Some((frame_w, frame_h)) => (
+            (frame_w - left_gutter - right_gutter - legend.left - legend.right).max(MIN_PLOT_PT),
+            (frame_h - category_band - legend.top - legend.bottom).max(MIN_PLOT_PT),
+        ),
+        None => (PLOT_W, PLOT_H),
+    };
+    let automatic_plot_x: f64 = legend.left + left_gutter;
+    let automatic_plot_y: f64 = legend.top;
+    let (plot_x, plot_y, plot_w, plot_h): (f64, f64, f64, f64) = stated_plot.unwrap_or((
+        automatic_plot_x,
+        automatic_plot_y,
+        automatic_plot_w,
+        automatic_plot_h,
+    ));
+    let plot_dx: f64 = plot_x - automatic_plot_x;
+    // The #1265 chart was already at the bottom cap; a shorter manual plot
+    // can move explicitly sized worksheet labels above that cap (#1568).
+    let category_baseline =
+        worksheet_line_category_baseline(chart, frame, plot_y + plot_h, legend.bottom).or_else(
+            || {
+                measured_chrome
+                    .then(|| powerpoint_line_category_baseline_pt(chart, plot_y + plot_h))
+                    .flatten()
+            },
+        );
+    let category_label_y: f64 =
+        category_baseline.unwrap_or(automatic_plot_y + automatic_plot_h + 3.0);
+    let category_baseline_attrs: &str = if category_baseline.is_some() {
+        ", top-edge: 0pt, bottom-edge: 0pt"
+    } else {
+        ""
+    };
+    let (total_w, total_h) = match frame {
+        Some(extent) => extent,
+        None => (
+            legend.left + left_gutter + PLOT_W + right_gutter + legend.right,
+            legend.top + PLOT_H + category_band + legend.bottom,
+        ),
+    };
+    let wraps_title: bool = write_chart_area_start(
+        out,
+        chart,
+        chart.title.as_deref(),
+        chart_area,
+        (total_w, total_h),
+        ChartTitleBand {
+            height: title_h,
+            fixed: false,
+        },
+    );
+
+    // `<c:delete val="1"/>` switches an axis off; see `generate_chart_axis`.
+    let value_axis_drawn: bool = !chart.value_axis_deleted;
+    let category_axis_drawn: bool = !chart.category_axis_deleted;
+
+    // Horizontal gridlines + value tick labels, with the line
+    // `<c:majorGridlines>` declares when it declares one (#900).
+    let gridline_stroke = chart_chrome_stroke(chart.major_gridline_line);
+    let major_units: Vec<f64> = scale.ticks();
+    for tick in &major_units {
+        let y: f64 = plot_y + (1.0 - scale.fraction(*tick)) * plot_h;
+        if let Some(stroke) = gridline_stroke.as_deref() {
+            let _ = writeln!(
+                out,
+                "#place(top + left, dx: {}pt, dy: {}pt, line(end: ({}pt, 0pt), stroke: {}))",
+                format_f64(plot_x),
+                format_f64(y),
+                format_f64(plot_w),
+                stroke
+            );
+        }
+        if value_axis_drawn {
+            let _ = writeln!(
+                out,
+                "#place(top + left, dx: {}pt, dy: {}pt, box(width: {}pt, height: {}pt)[#align(right + horizon)[#text(size: {}pt{})[{}]]])",
+                format_f64(plot_dx + value_label_x),
+                format_f64(
+                    y - chart_label_box_h(chart_axis_text_pt(chart, chart.value_axis_text_style))
+                        / 2.0
+                ),
+                format_f64(value_label_w),
+                format_f64(chart_label_box_h(chart_axis_text_pt(
+                    chart,
+                    chart.value_axis_text_style
+                ))),
+                format_f64(chart_axis_text_pt(chart, chart.value_axis_text_style)),
+                chart_value_text_attrs(chart),
+                escape_typst(&chart_value_label_formatted(
+                    *tick,
+                    chart_value_number_format(chart)
+                ))
+            );
+        }
+    }
+
+    // The category axis is split into one band per category, and both the point
+    // and its label sit at their band's centre — `<c:crossBetween val="between"/>`,
+    // which is what every category axis in the fixture corpus asks for and what
+    // the category tick marks below are the boundaries of. PowerPoint's own
+    // export of `tests/fixtures/pptx/line-chart.pptx` spaces its four points
+    // 90.91pt apart over a 363.65pt axis, the first of them half a band in
+    // (issue #672).
+    //
+    // TODO(crossBetween): the element itself is not parsed, so an axis asking
+    // for `midCat` — points on the boundaries, the series spanning the plot
+    // edge to edge — is laid out as `between` as well.
+    //
+    // `chart_variant` only routes a chart with two categories or more here, but
+    // the band width still has to be safe if that ever changes.
+    let band_w: f64 = plot_w / categories.max(1) as f64;
+    let point_x = |index: usize| -> f64 { plot_x + (index as f64 + 0.5) * band_w };
+    // Each point is a share of the interval its own axis spans (issue #1374).
+    let point_y = |series: &crate::ir::ChartSeries, value: f64| -> f64 {
+        let scale: ValueScale = series_value_scale(series, scale, secondary_scale);
+        plot_y + (1.0 - scale.fraction(value)) * plot_h
+    };
+    // The category axis stands on the value-zero line, wherever the interval
+    // puts it (issue #1184).
+    let category_axis_y: f64 = plot_y + (1.0 - scale.zero_fraction()) * plot_h;
+
+    // Category axis labels, each laid out in the band its point stands in the
+    // middle of — the width `generate_chart_axis` has always given its own
+    // labels. A fixed box wraps anything wider than itself whatever the axis
+    // has room for, which broke `Year 1` into `Year` over `1` on a band more
+    // than four times that box wide (issue #1650). The band is the layout and
+    // not a floor under it, so a crowded axis narrows the box with it and the
+    // label wraps only where the band itself is too narrow.
+    if category_axis_drawn {
+        for (index, category) in chart.categories.iter().enumerate() {
+            let formatted_category: String = formatted_category_axis_label(chart, category);
+            if formatted_category.is_empty() {
+                continue;
+            }
+            let category: &str = &formatted_category;
+            // Centring the box on the band keeps the text centred on
+            // `point_x(index)` however wide the box grows.
+            let band_start: f64 = plot_x + index as f64 * band_w;
+            let _ = writeln!(
+                out,
+                "#place(top + left, dx: {}pt, dy: {}pt, box(width: {}pt)[#align(center)[#text(size: {}pt{}{category_baseline_attrs})[{}]]])",
+                format_f64(band_start),
+                format_f64(category_label_y),
+                format_f64(band_w),
+                format_f64(chart_axis_text_pt(chart, chart.category_axis_text_style)),
+                chart_category_text_attrs(chart),
+                escape_category_axis_label(category)
+            );
+        }
+    }
+
+    // Native Excel paints axes and ticks before the series, so an opaque
+    // marker occludes the rule beneath it (#1578). Keep the value axis at
+    // the left edge and the category axis at value zero.
+    let value_stroke = chart_chrome_stroke(chart.value_axis_line);
+    let category_stroke = chart_chrome_stroke(chart.category_axis_line);
+    if let (true, Some(stroke)) = (value_axis_drawn, value_stroke.as_deref()) {
+        write_left_axis_line(out, plot_x, plot_y, plot_h, stroke);
+    }
+    if let (true, Some(stroke)) = (category_axis_drawn, category_stroke.as_deref()) {
+        write_bottom_axis_line(out, plot_x, category_axis_y, plot_w, stroke);
+    }
+    if value_axis_drawn
+        && let Some(reach) = tick_reach(
+            chart.value_axis_major_tick_mark,
+            chart_axis_text_pt(chart, chart.value_axis_text_style),
+        )
+    {
+        // Every value tick sits on its own gridline, both being one major unit.
+        for tick in &major_units {
+            let y: f64 = plot_y + (1.0 - scale.fraction(*tick)) * plot_h;
+            if let Some(stroke) = value_stroke.as_deref() {
+                write_tick_left_of_plot(out, plot_x, y, reach, stroke);
+            }
+        }
+    }
+    // The boundaries of the bands `point_x` centres each category in, so every
+    // category label sits midway between two ticks.
+    if categories > 0
+        && category_axis_drawn
+        && let Some(reach) = tick_reach(
+            chart.category_axis_major_tick_mark,
+            chart_axis_text_pt(chart, chart.category_axis_text_style),
+        )
+    {
+        for boundary in 0..=categories {
+            if let Some(stroke) = category_stroke.as_deref() {
+                write_tick_under_plot(
+                    out,
+                    plot_x + boundary as f64 * band_w,
+                    category_axis_y,
+                    reach,
+                    stroke,
+                );
+            }
+        }
+    }
+
+    // The secondary axis' own furniture down the plot's right edge: its tick
+    // labels in its own format, its line and its ticks. It shares the plot's
+    // gridlines, which are the primary axis' (issue #1374).
+    if let (Some(axis), Some(secondary_scale), true) =
+        (secondary_axis, secondary_scale, secondary_axis_drawn)
+    {
+        write_secondary_value_axis(
+            out,
+            chart,
+            axis,
+            secondary_scale,
+            SecondaryAxisPlacement {
+                plot_x,
+                plot_y,
+                plot_w,
+                plot_h,
+                label_gap: secondary_gutter.map_or(GAP, |gutter| gutter.clearance),
+                label_w: secondary_gutter.map_or(VALUE_GAP, |gutter| gutter.label_w),
+            },
+        );
+    }
+
+    // Series polylines + markers. A worksheet chart cuts its polylines at the
+    // plot rectangle's whole sheet points, as the combo plot of #1745 was
+    // measured to; this renderer's own worksheet case is unprobed and follows
+    // from that rule rather than from an export of its own.
+    let plot_clip: Option<WorksheetPlotClip> =
+        WorksheetPlotClip::snapped(worksheet_markers, plot_x, plot_y, plot_w, plot_h);
+    for (s_index, s) in series.iter().enumerate() {
+        let color: String = series_color(s, s_index, 0, &chart.theme_accent_colors);
+        let mut paths: Vec<Vec<(f64, f64)>> = Vec::new();
+        let mut path: Vec<(f64, f64)> = Vec::new();
+        for index in 0..categories {
+            if let Some(value) = s.value_at_point(index) {
+                path.push((point_x(index), point_y(s, value)));
+            } else if !path.is_empty() {
+                paths.push(std::mem::take(&mut path));
+            }
+        }
+        if !path.is_empty() {
+            paths.push(path);
+        }
+
+        // A missing cached value breaks the line into separate paths; joining
+        // its neighbours would invent a segment across a point Office omits.
+        for points in &paths {
+            if points.len() < 2 {
+                continue;
+            }
+            let segments: String = polyline_curve_segments(points);
+            write_plotted(
+                out,
+                plot_clip,
+                &format!(
+                    "#place(top + left, curve(stroke: {}, {segments}))",
+                    series_stroke(s, &color)
+                ),
+            );
+        }
+        // Point markers: the symbol the series names, else the shape cycle.
+        for (x, y) in paths.iter().flatten() {
+            write_series_marker(out, s_index, s, *x, *y, &color, worksheet_markers);
+        }
+    }
+
+    // Legend on the edge `<c:legendPos>` asks for — none when the chart
+    // declares no `<c:legend>` (issue #762). Bounded rather than returned
+    // early: the markup's closing delimiter is written after this loop.
+    let legend_names: Vec<String> = series
+        .iter()
+        .enumerate()
+        .map(|(index, s)| {
+            s.name
+                .clone()
+                .unwrap_or_else(|| format!("Series {}", index + 1))
+        })
+        .collect();
+    let entry_widths: Vec<f64> = legend_entry_widths(
+        chart,
+        LEGEND_KEY_LEN_PT,
+        LEGEND_KEY_LABEL_GAP_PT,
+        &legend_names,
+    );
+    let legend_entries: usize = if chart.has_legend { series.len() } else { 0 };
+    for (s_index, s) in series.iter().enumerate().take(legend_entries) {
+        let color: String = series_color(s, s_index, 0, &chart.theme_accent_colors);
+        let default_name: String = format!("Series {}", s_index + 1);
+        let name: &str = s.name.as_deref().unwrap_or(&default_name);
+        let (entry_x, entry_y) = legend.entry_origin(
+            chart.legend_position,
+            s_index,
+            series.len().max(1),
+            (
+                plot_x - left_gutter,
+                plot_y,
+                left_gutter + plot_w + right_gutter,
+                plot_h + category_band,
+            ),
+            LegendEntryLayout {
+                row_h: LINE_LEGEND_ROW_H,
+                widths: &entry_widths,
+                right_inset: None,
+                side_y_shift: 0.0,
+                horizontal_end_trim: 0.0,
+                horizontal_x_shift: 0.0,
+            },
+        );
+        let key: String = line_legend_key(s_index, s, &color, chart_legend_text_pt(chart));
+        let _ = writeln!(
+            out,
+            "#place(top + left, dx: {}pt, dy: {}pt, box[{key}#h({}pt)#text(size: {}pt{})[{}]])",
+            format_f64(entry_x),
+            format_f64(entry_y),
+            format_f64(LEGEND_KEY_LABEL_GAP_PT),
+            format_f64(chart_legend_text_pt(chart)),
+            chart_legend_text_attrs(chart),
+            escape_typst(name)
+        );
+    }
+
+    write_chart_user_shapes(
+        out,
+        chart,
+        chart_area.unwrap_or((total_w, total_h + title_h)),
+        title_h,
+    );
+    write_chart_area_end(out, wraps_title);
+}
+
+/// Whether the chart part declared `<c:radarChart>`.
+///
+/// The parser labels it `ChartType::Other("Radar Chart")` because the family
+/// has no variant of its own; matching the label keeps that decision in one
+/// place (issue #679).
+fn is_radar(chart: &Chart) -> bool {
+    matches!(&chart.chart_type, ChartType::Other(kind) if kind == crate::ir::RADAR_CHART_LABEL)
+}
+
+/// Render a radar chart: one spoke per category radiating from a common
+/// centre, each series a closed polygon through its value on every spoke.
+///
+/// Before this the family fell through to the bordered-table fallback, so a
+/// slide whose primary content was a radar lost it entirely and showed a plain
+/// table of the series values instead (issue #679).
+fn generate_chart_radar_plot(
+    out: &mut String,
+    chart: &Chart,
+    frame: Option<(f64, f64)>,
+    sheet_frame_origin_pt: Option<(f64, f64)>,
+) {
+    let worksheet_markers =
+        sheet_frame_origin_pt.map(|frame_origin| WorksheetMarkerPlacement { frame_origin });
+    /// Intrinsic plot size for a flowed radar, matching the pie's.
+    const RADAR_DIAMETER: f64 = 200.0;
+    const RADAR_LEGEND_ROW_H: f64 = 14.0;
+    /// Width of the gutter the value tick labels are right-aligned in, left of
+    /// the centre. Matches the line plot's own value gutter.
+    const RADAR_VALUE_GAP: f64 = 24.0;
+    /// Room left outside the outermost web ring for the category labels.
+    ///
+    /// A label sits beyond its spoke's end, so the web has to stop short of the
+    /// box or the labels leave it.
+    const RADAR_LABEL_MARGIN_PT: f64 = 30.0;
+    /// Half-width of the box a category label is centred in.
+    ///
+    /// Wider than the margin the web gives up: the box is centred on the point
+    /// outside the spoke, so half of it lies back over the web, and a category
+    /// name only as wide as the margin would wrap. `기동 지연 최소화` still
+    /// wrapped to two lines at the margin's 30pt; widening the box to 48pt
+    /// stopped it. Observed on the rendered page rather than measured from the
+    /// face's advances.
+    const RADAR_LABEL_HALF_W_PT: f64 = 48.0;
+
+    let category_count: usize = chart.categories.len();
+    if category_count < 3 {
+        return;
+    }
+    let max_value: f64 = chart
+        .series
+        .iter()
+        .flat_map(|series| series.present_values())
+        .fold(0.0_f64, f64::max);
+    let (nice_max, step) = axis_with_stated_unit(nice_axis(max_value), chart.value_axis_major_unit);
+    if nice_max <= 0.0 {
+        return;
+    }
+
+    let legend: LegendBox = if chart.has_legend {
+        LegendBox::new(chart.legend_position, RADAR_LEGEND_ROW_H, LEGEND_ENTRY_W)
+    } else {
+        LegendBox::hidden()
+    };
+    // The title takes its band from the content, while the chart-area outline
+    // remains around the original full frame (issue #1216).
+    let title_h: f64 = if chart.title.is_some() {
+        chart_area_title_h(chart)
+    } else {
+        0.0
+    };
+    // The chart area a user shape's fractions are of, kept before the title
+    // band comes off it (issue #1186).
+    let chart_area: Option<(f64, f64)> = frame;
+    let frame: Option<(f64, f64)> =
+        frame.map(|(width, height)| (width, (height - title_h).max(MIN_PLOT_PT)));
+    let (total_w, total_h) = match frame {
+        Some(extent) => extent,
+        None => (
+            legend.left + RADAR_DIAMETER + legend.right,
+            legend.top + RADAR_DIAMETER + legend.bottom,
+        ),
+    };
+
+    // The web stays circular, so it takes the smaller of the two axes, less the
+    // room the category labels need outside it.
+    let span_w: f64 = total_w - legend.left - legend.right;
+    let span_h: f64 = total_h - legend.top - legend.bottom;
+    let radius: f64 = (span_w.min(span_h) / 2.0 - RADAR_LABEL_MARGIN_PT).max(MIN_PLOT_PT / 2.0);
+    let centre_x: f64 = legend.left + span_w / 2.0;
+    let centre_y: f64 = legend.top + span_h / 2.0;
+
+    let wraps_title: bool = write_chart_area_start(
+        out,
+        chart,
+        chart.title.as_deref(),
+        chart_area,
+        (total_w, total_h),
+        ChartTitleBand {
+            height: title_h,
+            fixed: false,
+        },
+    );
+
+    // Office puts the first category at twelve o'clock and runs clockwise, the
+    // same origin and direction the pie's first wedge takes.
+    let angle = |index: usize| -> f64 {
+        -std::f64::consts::FRAC_PI_2
+            + (index as f64) * std::f64::consts::TAU / (category_count as f64)
+    };
+    let point = |index: usize, value: f64| -> (f64, f64) {
+        let reach: f64 = radius * (value / nice_max).clamp(0.0, 1.0);
+        let a: f64 = angle(index);
+        (centre_x + reach * a.cos(), centre_y + reach * a.sin())
+    };
+
+    // The web: one closed ring per major unit, so the rings land on the same
+    // values the tick labels name.
+    for unit in major_units(nice_max, step) {
+        if unit <= 0.0 {
+            continue;
+        }
+        let ring: String = (0..category_count)
+            .map(|index| {
+                let (x, y) = point(index, unit);
+                format!("({}pt, {}pt)", format_f64(x), format_f64(y))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            out,
+            "#place(top + left, polygon(stroke: {}, {ring}))",
+            CHART_AUTOMATIC_LINE
+        );
+    }
+
+    // The spokes, each running the full radius so the outermost ring's vertices
+    // sit on them.
+    for index in 0..category_count {
+        let (x, y) = point(index, nice_max);
+        let _ = writeln!(
+            out,
+            "#place(top + left, dx: {}pt, dy: {}pt, line(end: ({}pt, {}pt), stroke: {}))",
+            format_f64(centre_x),
+            format_f64(centre_y),
+            format_f64(x - centre_x),
+            format_f64(y - centre_y),
+            CHART_AUTOMATIC_LINE
+        );
+    }
+
+    // The value tick labels, read up the first spoke as Office reads them.
+    let label_pt: f64 = chart_axis_text_pt(chart, chart.value_axis_text_style);
+    if !chart.value_axis_deleted {
+        for unit in major_units(nice_max, step) {
+            if unit <= 0.0 {
+                continue;
+            }
+            let (_, y) = point(0, unit);
+            let _ = writeln!(
+                out,
+                "#place(top + left, dx: {}pt, dy: {}pt, box(width: {}pt, height: {}pt)[#align(right + horizon)[#text(size: {}pt{})[{}]]])",
+                format_f64(centre_x - RADAR_VALUE_GAP - GAP),
+                format_f64(y - chart_label_box_h(label_pt) / 2.0),
+                format_f64(RADAR_VALUE_GAP),
+                format_f64(chart_label_box_h(label_pt)),
+                format_f64(label_pt),
+                chart_value_text_attrs(chart),
+                chart_value_label(unit)
+            );
+        }
+    }
+
+    // Each series as one closed polygon through its value on every spoke.
+    for (series_index, series) in chart.series.iter().enumerate() {
+        let color: String = series_color(series, series_index, 0, &chart.theme_accent_colors);
+        let points: Vec<(f64, f64)> = (0..category_count)
+            .map(|index| point(index, series.value_at_point(index).unwrap_or(0.0)))
+            .collect();
+        let coords: String = points
+            .iter()
+            .map(|(x, y)| format!("({}pt, {}pt)", format_f64(*x), format_f64(*y)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            out,
+            "#place(top + left, polygon(stroke: {}, {coords}))",
+            series_stroke(series, &color)
+        );
+        for (index, (x, y)) in points.iter().enumerate() {
+            if series.value_at_point(index).is_some() {
+                write_series_marker(out, series_index, series, *x, *y, &color, worksheet_markers);
+            }
+        }
+    }
+
+    // The category labels, each just outside its spoke's end.
+    if !chart.category_axis_deleted {
+        let category_pt: f64 = chart_axis_text_pt(chart, chart.category_axis_text_style);
+        let weight: String = chart_category_text_attrs(chart);
+        for (index, category) in chart.categories.iter().enumerate() {
+            let formatted_category: String = formatted_category_axis_label(chart, category);
+            if formatted_category.is_empty() {
+                continue;
+            }
+            let category: &str = &formatted_category;
+            let a: f64 = angle(index);
+            let label_x: f64 = centre_x + (radius + GAP) * a.cos();
+            let label_y: f64 = centre_y + (radius + GAP) * a.sin();
+            // The box is centred on the point outside the spoke, so a label at
+            // the left of the web grows leftwards and one at the right grows
+            // rightwards rather than every label running off one side.
+            let _ = writeln!(
+                out,
+                "#place(top + left, dx: {}pt, dy: {}pt, box(width: {}pt, height: {}pt)[#align(center + horizon)[#text(size: {}pt{})[{}]]])",
+                format_f64(label_x - RADAR_LABEL_HALF_W_PT),
+                format_f64(label_y - chart_label_box_h(category_pt) / 2.0),
+                format_f64(RADAR_LABEL_HALF_W_PT * 2.0),
+                format_f64(chart_label_box_h(category_pt)),
+                format_f64(category_pt),
+                weight,
+                escape_category_axis_label(category)
+            );
+        }
+    }
+
+    // The legend, keyed like the line plot's: a stroke sample carrying the
+    // marker the series draws on each vertex.
+    let legend_names: Vec<String> = chart
+        .series
+        .iter()
+        .enumerate()
+        .map(|(index, series)| {
+            series
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Series {}", index + 1))
+        })
+        .collect();
+    let entry_widths: Vec<f64> = legend_entry_widths(
+        chart,
+        LEGEND_KEY_LEN_PT,
+        LEGEND_KEY_LABEL_GAP_PT,
+        &legend_names,
+    );
+    if chart.has_legend {
+        for (series_index, series) in chart.series.iter().enumerate() {
+            let color: String = series_color(series, series_index, 0, &chart.theme_accent_colors);
+            let default_name: String = format!("Series {}", series_index + 1);
+            let name: &str = series.name.as_deref().unwrap_or(&default_name);
+            let (entry_x, entry_y) = legend.entry_origin(
+                chart.legend_position,
+                series_index,
+                chart.series.len().max(1),
+                (legend.left, legend.top, span_w, span_h),
+                LegendEntryLayout {
+                    row_h: RADAR_LEGEND_ROW_H,
+                    widths: &entry_widths,
+                    right_inset: None,
+                    side_y_shift: 0.0,
+                    horizontal_end_trim: 0.0,
+                    horizontal_x_shift: 0.0,
+                },
+            );
+            let key: String =
+                line_legend_key(series_index, series, &color, chart_legend_text_pt(chart));
+            let _ = writeln!(
+                out,
+                "#place(top + left, dx: {}pt, dy: {}pt, box[{key}#h({}pt)#text(size: {}pt{})[{}]])",
+                format_f64(entry_x),
+                format_f64(entry_y),
+                format_f64(LEGEND_KEY_LABEL_GAP_PT),
+                format_f64(chart_legend_text_pt(chart)),
+                chart_legend_text_attrs(chart),
+                escape_typst(name)
+            );
+        }
+    }
+
+    write_chart_user_shapes(
+        out,
+        chart,
+        chart_area.unwrap_or((total_w, total_h + title_h)),
+        title_h,
+    );
+    write_chart_area_end(out, wraps_title);
+}
+
+/// The margin PowerPoint keeps between an automatically laid-out pie or
+/// doughnut plot and its chart area, per side, in points.
+///
+/// Measured on native Microsoft PowerPoint for Mac 16.112 exports through
+/// `scripts/probe_harness.py --backend office`
+/// (`scripts/probes/issue-1425-doughnut-plot-size.json` and its width, pie and
+/// title companions), reading the plot circle back off the exported wedge
+/// paths with `mutool draw -F trace`. The circle's diameter is the chart
+/// area's smaller side less exactly 22pt at every size probed — 122.4, 160,
+/// 200, 240, 280, 320 and 480pt of frame, over both a 4:3 and a 16:9 deck, and
+/// with either side binding. The reduction does not scale with the frame, so
+/// it is an absolute margin rather than a fraction: over that 3.9x range a
+/// proportional model drifts by more than 17pt.
+///
+/// Zero for every other host. Excel and Word draw their own automatic pies and
+/// neither margin has been measured, so they keep the plot they drew before
+/// (issue #1425).
+const PPTX_PIE_PLOT_INSET_PT: f64 = 11.0;
+
+/// The inset [`PPTX_PIE_PLOT_INSET_PT`] describes, for the chart at hand.
+///
+/// A chart whose `c:plotArea/c:layout` states a rectangle is placed by that
+/// rectangle rather than by the automatic rule, so it is left where it was.
+fn automatic_pie_plot_inset_pt(chart: &Chart) -> f64 {
+    if chart.host == crate::ir::ChartHost::Presentation && chart.plot_area_layout.is_none() {
+        PPTX_PIE_PLOT_INSET_PT
+    } else {
+        0.0
+    }
+}
+
+/// Render a pie chart as a circle of wedges, each sized by its share of the
+/// series total, with the legend on the edge `<c:legendPos>` asks for.
+fn generate_chart_pie_plot(out: &mut String, chart: &Chart, frame: Option<(f64, f64)>) {
+    const PIE_DIAMETER: f64 = 200.0;
+    const PIE_LEGEND_ROW_H: f64 = 14.0;
+
+    let inset: f64 = automatic_pie_plot_inset_pt(chart);
+
+    let Some(series) = chart.series.first() else {
+        return;
+    };
+    let total: f64 = series.present_values().sum();
+    if total <= 0.0 {
+        return;
+    }
+
+    let legend: LegendBox = if chart.has_legend {
+        LegendBox::new(chart.legend_position, PIE_LEGEND_ROW_H, LEGEND_ENTRY_W)
+    } else {
+        LegendBox::hidden()
+    };
+    // The title takes its band from the content, while the chart-area outline
+    // remains around the original full frame (issue #1216).
+    let title_h: f64 = if chart.title.is_some() {
+        chart_area_title_h(chart)
+    } else {
+        0.0
+    };
+    // The chart area a user shape's fractions are of, kept before the title
+    // band comes off it (issue #1186).
+    let chart_area: Option<(f64, f64)> = frame;
+    let frame: Option<(f64, f64)> =
+        frame.map(|(width, height)| (width, (height - title_h).max(MIN_PLOT_PT)));
+    let (total_w, total_h) = match frame {
+        Some(extent) => extent,
+        None => (
+            legend.left + PIE_DIAMETER + 2.0 * inset + legend.right,
+            legend.top + PIE_DIAMETER + 2.0 * inset + legend.bottom,
+        ),
+    };
+    // The pie stays circular, so it takes the smaller of the two axes, less
+    // the margin the host application keeps around an automatic plot.
+    let diameter: f64 = (total_w - legend.left - legend.right - 2.0 * inset)
+        .min(total_h - legend.top - legend.bottom - 2.0 * inset)
+        .max(MIN_PLOT_PT);
+    let radius: f64 = diameter / 2.0;
+    let centre_x: f64 = legend.left + (total_w - legend.left - legend.right) / 2.0;
+    let centre_y: f64 = legend.top + (total_h - legend.top - legend.bottom) / 2.0;
+
+    let wraps_title: bool = write_chart_area_start(
+        out,
+        chart,
+        chart.title.as_deref(),
+        chart_area,
+        (total_w, total_h),
+        ChartTitleBand {
+            height: title_h,
+            fixed: false,
+        },
+    );
+
+    // Office sweeps clockwise from the boundary `<c:firstSliceAng>` names,
+    // which is twelve o'clock for the chart that declares nothing.
+    let mut start: f64 = -std::f64::consts::FRAC_PI_2 + first_slice_offset_radians(chart);
+    for index in 0..series.values.len() {
+        let Some(value) = series.value_at_point(index) else {
+            continue;
+        };
+        if value <= 0.0 {
+            continue;
+        }
+        let sweep: f64 = value / total * std::f64::consts::TAU;
+        let color: String = category_color(
+            series,
+            index,
+            &CHART_CATEGORY_COLORS,
+            &chart.theme_accent_colors,
+        );
+        match doughnut_inner_radius(chart, radius) {
+            Some(inner) => {
+                write_doughnut_segment(out, centre_x, centre_y, radius, inner, start, sweep, &color)
+            }
+            None => write_pie_wedge(out, centre_x, centre_y, radius, start, sweep, &color),
+        }
+        if let Some(label) = data_label_text(chart, series, index, total) {
+            let label_pt: f64 = data_label_text_pt(chart, &series.data_labels);
+            // A wedge label sits on the bisector, two thirds of the way out —
+            // clear of the centre where narrow wedges converge, and inside the
+            // circumference where the fill still backs it.
+            let bisector: f64 = start + sweep / 2.0;
+            let label_radius: f64 = radius * 2.0 / 3.0;
+            // The box is centred on that point, so it is placed from its own
+            // top-left corner.
+            let label_w: f64 = radius;
+            let _ = writeln!(
+                out,
+                "#place(top + left, dx: {}pt, dy: {}pt, box(width: {}pt)[#align(center)[#text(size: {}pt, weight: \"bold\", fill: {})[{}]]])",
+                format_f64(centre_x + label_radius * bisector.cos() - label_w / 2.0),
+                format_f64(
+                    centre_y + label_radius * bisector.sin()
+                        - data_label_line_h(chart, &series.data_labels) / 2.0
+                ),
+                format_f64(label_w),
+                format_f64(label_pt),
+                chart_data_label_fill(chart),
+                escape_typst(&label)
+            );
+        }
+        start += sweep;
+    }
+
+    // Legend entries, one per slice, at the position the chart asks for —
+    // none when the chart declares no `<c:legend>`. A pie's own legend
+    // duplicates the slice labels, so one the file never asked for is doubly
+    // visible (issue #762).
+    let entries: usize = chart.categories.len().max(series.values.len());
+    let entry_widths: Vec<f64> = legend_entry_widths(
+        chart,
+        LEGEND_KEY_LEN_PT,
+        LEGEND_KEY_LABEL_GAP_PT,
+        &chart.categories,
+    );
+    let legend_entries: usize = if chart.has_legend { entries } else { 0 };
+    for (index, category) in chart.categories.iter().enumerate().take(legend_entries) {
+        let color: String = category_color(
+            series,
+            index,
+            &CHART_CATEGORY_COLORS,
+            &chart.theme_accent_colors,
+        );
+        let (entry_x, entry_y) = legend.entry_origin(
+            chart.legend_position,
+            index,
+            entries,
+            (centre_x - radius, centre_y - radius, diameter, diameter),
+            LegendEntryLayout {
+                row_h: PIE_LEGEND_ROW_H,
+                widths: &entry_widths,
+                right_inset: None,
+                side_y_shift: 0.0,
+                horizontal_end_trim: 0.0,
+                horizontal_x_shift: 0.0,
+            },
+        );
+        let _ = writeln!(
+            out,
+            "#place(top + left, dx: {}pt, dy: {}pt, box[#box(width: 9pt, height: 9pt, fill: {})#h({}pt)#text(size: {}pt{})[{}]])",
+            format_f64(entry_x),
+            format_f64(entry_y),
+            color,
+            format_f64(LEGEND_KEY_LABEL_GAP_PT),
+            format_f64(chart_legend_text_pt(chart)),
+            chart_legend_text_attrs(chart),
+            escape_typst(category)
+        );
+    }
+
+    write_chart_user_shapes(
+        out,
+        chart,
+        chart_area.unwrap_or((total_w, total_h + title_h)),
+        title_h,
+    );
+    write_chart_area_end(out, wraps_title);
+}
+
+/// `curve.move(first), curve.line(next), ...` tracing an open polyline.
+///
+/// typst 0.15 removed the `path` element these polylines used to be; a `curve`
+/// of straight segments draws the same PDF path.
+fn polyline_curve_segments(points: &[(f64, f64)]) -> String {
+    points
+        .iter()
+        .enumerate()
+        .map(|(index, (x, y))| {
+            let verb: &str = if index == 0 { "move" } else { "line" };
+            format!("curve.{verb}(({}pt, {}pt))", format_f64(*x), format_f64(*y))
+        })
+        .collect::<Vec<String>>()
+        .join(", ")
+}
+
+/// A curve vertex with its incoming and outgoing Bézier handles, both relative
+/// to the vertex, as typst 0.14's removed `path` element took them.
+struct BezierVertex {
+    point: (f64, f64),
+    control_in: (f64, f64),
+    control_out: (f64, f64),
+}
+
+impl BezierVertex {
+    fn corner(point: (f64, f64)) -> Self {
+        Self {
+            point,
+            control_in: (0.0, 0.0),
+            control_out: (0.0, 0.0),
+        }
+    }
+}
+
+/// Emit a filled, closed Typst `curve` through `vertices`.
+///
+/// Each edge is a cubic whose controls sit at the handles of the two vertices
+/// it joins, or a straight line where both handles are zero: the rule typst
+/// 0.14's `path` element drew by, the closing edge included.
+fn write_closed_bezier_curve(out: &mut String, color: &str, vertices: &[BezierVertex]) {
+    let Some(first) = vertices.first() else {
+        return;
+    };
+    let point = |(x, y): (f64, f64)| format!("({}pt, {}pt)", format_f64(x), format_f64(y));
+    let mut curve: String = format!(
+        "#place(top + left, curve(fill: {color}, stroke: none, curve.move({})",
+        point(first.point)
+    );
+    let ends = vertices.iter().skip(1).chain(std::iter::once(first));
+    for (from, to) in vertices.iter().zip(ends) {
+        if from.control_out == (0.0, 0.0) && to.control_in == (0.0, 0.0) {
+            let _ = write!(curve, ", curve.line({})", point(to.point));
+        } else {
+            let control_start = (
+                from.point.0 + from.control_out.0,
+                from.point.1 + from.control_out.1,
+            );
+            let control_end = (to.point.0 + to.control_in.0, to.point.1 + to.control_in.1);
+            let _ = write!(
+                curve,
+                ", curve.cubic({}, {}, {})",
+                point(control_start),
+                point(control_end),
+                point(to.point)
+            );
+        }
+    }
+    curve.push_str(", curve.close(mode: \"straight\")))");
+    let _ = writeln!(out, "{curve}");
+}
+
+/// Emit one filled wedge from `start` through `sweep` radians.
+///
+/// A cubic Bézier tracks a circular arc closely up to a quarter turn, so the
+/// sweep is split into at most quarter-turn segments. Each arc vertex carries
+/// handles of `4/3 * tan(step/4) * radius` along the tangent — the standard
+/// construction — as a [`BezierVertex`], both controls relative to the vertex.
+fn write_pie_wedge(
+    out: &mut String,
+    centre_x: f64,
+    centre_y: f64,
+    radius: f64,
+    start: f64,
+    sweep: f64,
+    color: &str,
+) {
+    let segments: usize = (sweep / std::f64::consts::FRAC_PI_2).ceil().max(1.0) as usize;
+    let step: f64 = sweep / segments as f64;
+    let handle: f64 = 4.0 / 3.0 * (step / 4.0).tan() * radius;
+
+    let point = |angle: f64| -> (f64, f64) {
+        (
+            centre_x + radius * angle.cos(),
+            centre_y + radius * angle.sin(),
+        )
+    };
+    // Unit tangent in the sweep direction, which the handles run along.
+    let tangent = |angle: f64| -> (f64, f64) { (-angle.sin(), angle.cos()) };
+
+    // The wedge starts at the centre; the closing edge draws the final radius
+    // back to it, so the last vertex leaves no outgoing handle to curve it.
+    let mut vertices: Vec<BezierVertex> = vec![BezierVertex::corner((centre_x, centre_y))];
+    for segment in 0..=segments {
+        let angle: f64 = start + step * segment as f64;
+        let (x, y) = point(angle);
+        let (tx, ty) = tangent(angle);
+        // The first vertex has nothing arriving at it and the last nothing
+        // leaving, so their unused handles stay zero.
+        let (in_dx, in_dy) = if segment == 0 {
+            (0.0, 0.0)
+        } else {
+            (-tx * handle, -ty * handle)
+        };
+        let (out_dx, out_dy) = if segment == segments {
+            (0.0, 0.0)
+        } else {
+            (tx * handle, ty * handle)
+        };
+        vertices.push(BezierVertex {
+            point: (x, y),
+            control_in: (in_dx, in_dy),
+            control_out: (out_dx, out_dy),
+        });
+    }
+    write_closed_bezier_curve(out, color, &vertices);
+}
+
+/// Where the first wedge begins, in radians clockwise of twelve o'clock.
+///
+/// `<c:firstSliceAng>` turns the whole plot: every wedge keeps its share of
+/// the circle and the boundaries move together. Native PowerPoint for Mac
+/// 16.112 exports of `GENERAL SERVICES.pptx` put the first boundary of the
+/// page-13 doughnut at 11.996 degrees against its authored 12, and the
+/// page-14 one at 11.003 against its authored 11, measured off the exported
+/// wedge paths with `mutool draw -F trace`.
+///
+/// `ST_FirstSliceAng` defaults to 0, so a chart that declares nothing starts
+/// at twelve o'clock as it always did. The renderer's angles grow clockwise
+/// because Typst's y grows downward, so the authored degrees add directly
+/// (issue #1429).
+fn first_slice_offset_radians(chart: &Chart) -> f64 {
+    f64::from(chart.first_slice_angle_deg.unwrap_or(0)).to_radians()
+}
+
+/// The inner radius of a doughnut, or `None` for a pie.
+///
+/// `<c:holeSize>` gives the inner radius as a percentage of the outer. The
+/// bounds here are defensive rather than quoted from the schema: at 0 the hole
+/// closes and the ring becomes a pie, and at 100 there is no ring left to
+/// draw, so both ends are clamped away from those degenerate results.
+///
+/// The 50 used when the element is absent is a placeholder, not a measured
+/// default — the audited deck always writes `holeSize`, so no fixture
+/// exercises it. If one ever does, check what the source application draws
+/// before trusting this number.
+fn doughnut_inner_radius(chart: &Chart, outer_radius: f64) -> Option<f64> {
+    if !matches!(chart.chart_type, ChartType::Doughnut) {
+        return None;
+    }
+    let percent: f64 = chart.hole_size_percent.unwrap_or(50) as f64;
+    Some(outer_radius * percent.clamp(1.0, 90.0) / 100.0)
+}
+
+/// A doughnut ring segment: the outer arc swept forward, the inner arc swept
+/// back, closed.
+///
+/// Kept apart from `write_pie_wedge` rather than folded into it: a wedge starts
+/// at the centre, which has no incoming handle to curve, and merging the two
+/// would bury that.
+///
+/// The hole is absent ink, not a background-coloured disc — a chart draws over
+/// whatever the slide puts behind it, so punching with a guessed colour would
+/// be wrong (issue #679).
+#[allow(clippy::too_many_arguments)]
+fn write_doughnut_segment(
+    out: &mut String,
+    centre_x: f64,
+    centre_y: f64,
+    outer_radius: f64,
+    inner_radius: f64,
+    start: f64,
+    sweep: f64,
+    color: &str,
+) {
+    let segments: usize = (sweep / std::f64::consts::FRAC_PI_2).ceil().max(1.0) as usize;
+    let step: f64 = sweep / segments as f64;
+
+    let mut vertices: Vec<BezierVertex> = Vec::new();
+
+    let mut arc = |radius: f64, forward: bool| {
+        let handle: f64 = 4.0 / 3.0 * (step / 4.0).tan() * radius;
+        for index in 0..=segments {
+            let position = if forward { index } else { segments - index };
+            let angle: f64 = start + step * position as f64;
+            let (x, y) = (
+                centre_x + radius * angle.cos(),
+                centre_y + radius * angle.sin(),
+            );
+            // The return leg reverses the sweep, so its tangent flips.
+            let direction = if forward { 1.0 } else { -1.0 };
+            let (tx, ty) = (-angle.sin() * direction, angle.cos() * direction);
+            // The join between the arcs is a straight radial edge, so the
+            // handles facing it stay zero.
+            let (in_dx, in_dy) = if index == 0 {
+                (0.0, 0.0)
+            } else {
+                (-tx * handle, -ty * handle)
+            };
+            let (out_dx, out_dy) = if index == segments {
+                (0.0, 0.0)
+            } else {
+                (tx * handle, ty * handle)
+            };
+            vertices.push(BezierVertex {
+                point: (x, y),
+                control_in: (in_dx, in_dy),
+                control_out: (out_dx, out_dy),
+            });
+        }
+    };
+    arc(outer_radius, true);
+    arc(inner_radius, false);
+
+    write_closed_bezier_curve(out, color, &vertices);
+}
+
+fn generate_chart_pie(out: &mut String, chart: &Chart) {
+    let Some(series) = chart.series.first() else {
+        return;
+    };
+
+    let total: f64 = series.present_values().filter(|value| *value > 0.0).sum();
+    let total: f64 = if total == 0.0 { 1.0 } else { total };
+
+    let colors: &[&str] = &CHART_CATEGORY_COLORS;
+
+    let _ = writeln!(out, "#table(");
+    let _ = writeln!(out, "  columns: 3,");
+    let _ = writeln!(out, "  [*Slice*], [*Value*], [*%*],");
+
+    for (index, category) in chart.categories.iter().enumerate() {
+        let escaped_category: String = escape_typst(category);
+        let Some(value) = series.value_at_point(index) else {
+            let _ = writeln!(out, "  [{escaped_category}], [], [],");
+            continue;
+        };
+        let percent: f64 = value / total * 100.0;
+        // Each pie slice is one data point of the single series, so a
+        // `<c:dPt>` fill names the wedge's colour directly.
+        let color: String = category_color(series, index, colors, &chart.theme_accent_colors);
+        let _ = writeln!(
+            out,
+            "  [#box(width: 8pt, height: 8pt, fill: {color}) {escaped_category}], [{}], [{:.1}%],",
+            format_f64(value),
+            percent
+        );
+    }
+
+    let _ = writeln!(out, ")\n");
+}
+
+fn generate_chart_line(out: &mut String, chart: &Chart) {
+    let column_count: usize = 1 + chart.series.len();
+    let _ = writeln!(out, "#table(");
+    let _ = writeln!(out, "  columns: {column_count},");
+
+    out.push_str("  [*Category*], ");
+    for (index, series) in chart.series.iter().enumerate() {
+        let default_name: String = format!("Series {}", index + 1);
+        let name: &str = series.name.as_deref().unwrap_or(&default_name);
+        let _ = write!(out, "[*{name}*]");
+        if index + 1 < chart.series.len() {
+            out.push_str(", ");
+        }
+    }
+    out.push_str(",\n");
+
+    for (row_index, category) in chart.categories.iter().enumerate() {
+        let escaped_category: String = escape_typst(category);
+        let _ = write!(out, "  [{escaped_category}], ");
+        for (series_index, series) in chart.series.iter().enumerate() {
+            if let Some(value) = series.value_at_point(row_index) {
+                let trend: &str = if row_index > 0 {
+                    series.value_at_point(row_index - 1).map_or("", |previous| {
+                        if value > previous {
+                            " ↑"
+                        } else if value < previous {
+                            " ↓"
+                        } else {
+                            " →"
+                        }
+                    })
+                } else {
+                    ""
+                };
+                let _ = write!(out, "[{}{}]", format_f64(value), trend);
+            } else {
+                out.push_str("[]");
+            }
+            if series_index + 1 < chart.series.len() {
+                out.push_str(", ");
+            }
+        }
+        out.push_str(",\n");
+    }
+
+    let _ = writeln!(out, ")\n");
+}
+
+fn generate_chart_table(out: &mut String, chart: &Chart) {
+    let column_count: usize = 1 + chart.series.len();
+    let _ = writeln!(out, "#table(");
+    let _ = writeln!(out, "  columns: {column_count},");
+
+    out.push_str("  [*Category*], ");
+    for (index, series) in chart.series.iter().enumerate() {
+        let default_name: String = format!("Series {}", index + 1);
+        let name: &str = series.name.as_deref().unwrap_or(&default_name);
+        let _ = write!(out, "[*{name}*]");
+        if index + 1 < chart.series.len() {
+            out.push_str(", ");
+        }
+    }
+    out.push_str(",\n");
+
+    for (row_index, category) in chart.categories.iter().enumerate() {
+        let escaped_category: String = escape_typst(category);
+        let _ = write!(out, "  [{escaped_category}], ");
+        for (index, series) in chart.series.iter().enumerate() {
+            if let Some(value) = series.value_at_point(row_index) {
+                let _ = write!(
+                    out,
+                    "[{}]",
+                    escape_typst(&chart_value_label_formatted(
+                        value,
+                        series.number_format.as_deref()
+                    ))
+                );
+            } else {
+                out.push_str("[]");
+            }
+            if index + 1 < chart.series.len() {
+                out.push_str(", ");
+            }
+        }
+        out.push_str(",\n");
+    }
+
+    let _ = writeln!(out, ")\n");
+}
+
+/// Generate Typst markup for a SmartArt diagram.
+///
+/// Renders SmartArt as a visually distinct bordered box with:
+/// - Hierarchy items (varying depths): indented tree with depth-based padding
+/// - Flat items (all same depth): numbered steps with arrows
+pub(super) fn generate_smartart(out: &mut String, smartart: &SmartArt, width: f64, height: f64) {
+    let _ = writeln!(
+        out,
+        "#block(width: {}pt, height: {}pt, stroke: 1pt + rgb(70, 130, 180), radius: 4pt, inset: 10pt, fill: rgb(245, 248, 255))[",
+        format_f64(width),
+        format_f64(height),
+    );
+    let _ = writeln!(
+        out,
+        "#align(center)[#text(size: 11pt, weight: \"bold\", fill: rgb(70, 130, 180))[SmartArt Diagram]]\n"
+    );
+
+    if smartart.items.is_empty() {
+        out.push_str("]\n");
+        return;
+    }
+
+    let has_hierarchy: bool = smartart.items.iter().any(|node| node.depth > 0);
+
+    if has_hierarchy {
+        generate_smartart_hierarchy(out, smartart);
+    } else {
+        generate_smartart_steps(out, smartart);
+    }
+
+    out.push_str("]\n");
+}
+
+fn generate_smartart_hierarchy(out: &mut String, smartart: &SmartArt) {
+    for node in &smartart.items {
+        let escaped: String = escape_typst(&node.text);
+        if node.depth == 0 {
+            let _ = writeln!(out, "#text(weight: \"bold\")[{escaped}]");
+        } else {
+            let indent: f64 = node.depth as f64 * 16.0;
+            let branch: &str = if node.depth == 1 { "├" } else { "└" };
+            let _ = writeln!(
+                out,
+                "#pad(left: {}pt)[{branch} {escaped}]",
+                format_f64(indent),
+            );
+        }
+    }
+}
+
+fn generate_smartart_steps(out: &mut String, smartart: &SmartArt) {
+    for (index, node) in smartart.items.iter().enumerate() {
+        let escaped: String = escape_typst(&node.text);
+        let step_number: usize = index + 1;
+        let _ = writeln!(
+            out,
+            "#box(stroke: 0.5pt + rgb(70, 130, 180), radius: 3pt, inset: 6pt)[#text(weight: \"bold\")[{}. ] {escaped}]",
+            step_number,
+        );
+        if index + 1 < smartart.items.len() {
+            let _ = writeln!(out, "#align(center)[#text(size: 14pt)[↓]]");
+        }
+    }
+}
+
+#[cfg(test)]
+mod chart_value_label_tests {
+    use super::{
+        AXIS_HEADROOM_DIVISOR, chart_text_advance_em, chart_value_label, nice_axis,
+        powerpoint_nice_axis,
+    };
+
+    #[test]
+    fn source_office_chart_metrics_are_environment_independent() {
+        assert_eq!(
+            chart_text_advance_em("Calibri", false, "Category 1"),
+            Some(8964.0 / 2048.0)
+        );
+        assert_eq!(
+            chart_text_advance_em("Avenir Next LT Pro", false, "Product Alpha"),
+            Some(13394.0 / 2048.0)
+        );
+        assert_eq!(
+            chart_text_advance_em("AvenirNextLTPro", false, "~"),
+            Some(1364.0 / 2048.0)
+        );
+    }
+
+    #[test]
+    fn formats_without_float_noise() {
+        assert_eq!(chart_value_label(8.200000000000001), "8.2");
+        assert_eq!(chart_value_label(3.0), "3");
+        assert_eq!(chart_value_label(0.0), "0");
+        assert_eq!(chart_value_label(1234.5), "1234.5");
+        assert_eq!(chart_value_label(0.333333333), "0.3333");
+    }
+
+    #[test]
+    fn nice_axis_rounds_up() {
+        // The first three are entries of MEASURED_AUTO_SCALE, restated here so
+        // the everyday shape of the rule — clear the data, divide into whole
+        // steps — stays readable next to the degenerate guard, which is the
+        // only assertion below that no rendering pins.
+        assert_eq!(nice_axis(8.2), (9.0, 1.0));
+        assert_eq!(nice_axis(3.2), (3.5, 0.5));
+        assert_eq!(nice_axis(45.0), (50.0, 5.0));
+        assert_eq!(nice_axis(0.0), (1.0, 1.0));
+    }
+
+    /// PowerPoint 16.112 exports of `tests/fixtures/pptx/bar-chart.pptx`, with
+    /// all four values scaled by one factor and the chart's 18pt text kept
+    /// unchanged. `scripts/measure_powerpoint_chart_axis.py` regenerates these
+    /// rows from the native PDFs.
+    const MEASURED_POWERPOINT_AUTO_SCALE: [(f64, f64, f64); 20] = [
+        (0.44, 0.5, 0.1),
+        (1.0, 1.5, 0.5),
+        (1.9, 2.0, 0.5),
+        (3.2, 4.0, 1.0),
+        (5.5, 6.0, 2.0),
+        (8.0, 10.0, 2.0),
+        (8.2, 10.0, 2.0),
+        (8.6, 10.0, 2.0),
+        (9.7, 15.0, 5.0),
+        (12.5, 15.0, 5.0),
+        (17.0, 20.0, 5.0),
+        (21.0, 25.0, 5.0),
+        (45.0, 50.0, 10.0),
+        (78.0, 100.0, 20.0),
+        (97.0, 150.0, 50.0),
+        (199.0, 250.0, 50.0),
+        (520.0, 600.0, 200.0),
+        (970.0, 1500.0, 500.0),
+        (2300.0, 2500.0, 500.0),
+        (23334.0, 25000.0, 5000.0),
+    ];
+
+    #[test]
+    fn powerpoint_axis_reproduces_every_measured_18pt_scale() {
+        for (data_max, want_max, want_step) in MEASURED_POWERPOINT_AUTO_SCALE {
+            assert_eq!(
+                powerpoint_nice_axis(data_max, 18.0, 311.365),
+                (want_max, want_step),
+                "PowerPoint 16.112 at data maximum {data_max}"
+            );
+        }
+    }
+
+    #[test]
+    fn powerpoint_axis_coarsens_as_its_horizontal_labels_grow() {
+        // Same 8.2 chart and frame, with only c:txPr's size changed. These
+        // representative sizes pin each regime without fitting its boundary
+        // to a single sample.
+        for (text_pt, plot_w, want) in [
+            (10.0, 375.738, (9.0, 1.0)),
+            (12.0, 357.807, (10.0, 2.0)),
+            (18.0, 311.365, (10.0, 2.0)),
+            (24.0, 264.916, (10.0, 5.0)),
+            (36.0, 178.607, (10.0, 5.0)),
+            (44.0, 118.116, (10.0, 10.0)),
+        ] {
+            assert_eq!(
+                powerpoint_nice_axis(8.2, text_pt, plot_w),
+                want,
+                "{text_pt}pt over a {plot_w}pt plot"
+            );
+        }
+    }
+
+    #[test]
+    fn powerpoint_axis_coarsens_as_its_plot_narrows() {
+        // Same 8.2 chart at 18pt, with only its graphic-frame width changed.
+        // Reading the bar geometry back from the native PDFs gives these plot
+        // widths independently of the surrounding frame.
+        for (plot_w, want) in [
+            (59.859, (10.0, 10.0)),
+            (71.365, (10.0, 5.0)),
+            (231.462, (10.0, 5.0)),
+            (311.365, (10.0, 2.0)),
+            (391.267, (10.0, 2.0)),
+        ] {
+            assert_eq!(
+                powerpoint_nice_axis(8.2, 18.0, plot_w),
+                want,
+                "18pt text over a {plot_w}pt plot"
+            );
+        }
+    }
+
+    /// Axis maxima read off renderings of `WithChart.xlsx` with both series
+    /// scaled by one factor, one file per data maximum, the chart declaring no
+    /// `c:max`/`c:min`/`c:majorUnit` so the axis is entirely auto-scaled.
+    /// `scripts/measure_chart_axis.py` regenerates the whole table.
+    ///
+    /// Excel's own choice is known for only two of these (issue #634's export
+    /// at 17, issue #553's at 23,334); the rest are LibreOffice's, which agrees
+    /// with Excel on both of those and is the widest independent sample of the
+    /// same rule available without Excel.
+    ///
+    /// Eight entries — 0.44, 1.9, 3.2, 5.5, 8.2, 12.5, 45 and 199 — were
+    /// predicted from the rule fitted to the other thirty and only then
+    /// rendered, so they are a held-out check rather than fitted data. They
+    /// also carry the two decades the fitted set never reached, which is what
+    /// stops a table this dense from being satisfied by a lookup.
+    const MEASURED_AUTO_SCALE: [(f64, f64, f64); 38] = [
+        (0.44, 0.5, 0.05),
+        (1.9, 2.0, 0.2),
+        (3.2, 3.5, 0.5),
+        (5.5, 6.0, 1.0),
+        (6.0, 7.0, 1.0),
+        (6.3, 7.0, 1.0),
+        (7.4, 8.0, 1.0),
+        (8.0, 9.0, 1.0),
+        (8.2, 9.0, 1.0),
+        (8.6, 10.0, 1.0),
+        (9.0, 10.0, 1.0),
+        (9.7, 12.0, 2.0),
+        (12.5, 14.0, 2.0),
+        (14.0, 16.0, 2.0),
+        (17.0, 18.0, 2.0),
+        (19.0, 20.0, 2.0),
+        (21.0, 25.0, 5.0),
+        (24.0, 30.0, 5.0),
+        (31.0, 35.0, 5.0),
+        (45.0, 50.0, 5.0),
+        (46.0, 50.0, 5.0),
+        (52.0, 60.0, 10.0),
+        (63.0, 70.0, 10.0),
+        (74.0, 80.0, 10.0),
+        (78.0, 90.0, 10.0),
+        (86.0, 100.0, 10.0),
+        (97.0, 120.0, 20.0),
+        (140.0, 160.0, 20.0),
+        (199.0, 250.0, 50.0),
+        (230.0, 250.0, 50.0),
+        (460.0, 500.0, 50.0),
+        (520.0, 600.0, 100.0),
+        (740.0, 800.0, 100.0),
+        (860.0, 1000.0, 100.0),
+        (970.0, 1200.0, 200.0),
+        (1400.0, 1600.0, 200.0),
+        (2300.0, 2500.0, 500.0),
+        (23334.0, 25000.0, 5000.0),
+    ];
+
+    #[test]
+    fn nice_axis_reproduces_every_measured_auto_scale() {
+        let mut wrong: Vec<String> = Vec::new();
+        for (data_max, want_max, want_step) in MEASURED_AUTO_SCALE {
+            let got: (f64, f64) = nice_axis(data_max);
+            if (got.0 - want_max).abs() > 1e-9 || (got.1 - want_step).abs() > 1e-9 {
+                wrong.push(format!(
+                    "data max {data_max}: got {got:?}, measured ({want_max}, {want_step})"
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {} measured axes not reproduced:\n  {}",
+            wrong.len(),
+            MEASURED_AUTO_SCALE.len(),
+            wrong.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn nice_axis_scales_with_the_decimal_exponent() {
+        // The rule reads a mantissa and an exponent, so one measured maximum
+        // implies the whole decade. A rule fitted only to the sampled decades
+        // would pass the table above and fail here.
+        for exponent in [-3i32, -1, 0, 2, 5, 8] {
+            let factor: f64 = 10f64.powi(exponent);
+            for (data_max, want_max, want_step) in MEASURED_AUTO_SCALE {
+                let (got_max, got_step): (f64, f64) = nice_axis(data_max * factor);
+                let scale: f64 = (want_max * factor).abs().max(1e-12);
+                assert!(
+                    ((got_max - want_max * factor) / scale).abs() < 1e-9,
+                    "max {data_max}e{exponent}: got {got_max}, want {}",
+                    want_max * factor
+                );
+                assert!(
+                    ((got_step - want_step * factor) / scale).abs() < 1e-9,
+                    "step for {data_max}e{exponent}: got {got_step}, want {}",
+                    want_step * factor
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nice_axis_does_not_round_the_maximum_to_the_step_ladder() {
+        // Rounding the maximum itself to 1/2/5x10^n put 23,334 against a
+        // 50,000 axis, drawing every column at half the height Excel gives it
+        // (#553). Its export is one of the two entries in the table above that
+        // Excel itself produced, so keep the symptom pinned by name.
+        let (axis_max, step): (f64, f64) = nice_axis(23334.0);
+        assert_eq!((axis_max, step), (25000.0, 5000.0));
+        assert!(
+            23334.0 / axis_max > 0.9,
+            "the tallest column reaches {:.0}% of the plot; Excel's export reaches 93%",
+            23334.0 / axis_max * 100.0
+        );
+    }
+
+    #[test]
+    fn nice_axis_leaves_no_more_than_one_step_of_headroom() {
+        // The property that makes a chart readable: the tallest bar reaches
+        // within one major unit of the top, plus the twentieth of the range
+        // Excel adds before it rounds — so a maximum of 100 sits under a 120
+        // axis rather than touching a 100 one.
+        for value in [
+            1.0,
+            2.0,
+            3.7,
+            9.0,
+            23.0,
+            45.0,
+            78.0,
+            99.0,
+            100.0,
+            250.0,
+            4999.0,
+            23334.0,
+            1_000_001.0,
+        ] {
+            let (max, step) = nice_axis(value);
+
+            assert!(max >= value, "axis {max} must cover {value}");
+            let allowed: f64 = step + value / AXIS_HEADROOM_DIVISOR;
+            assert!(
+                max - value < allowed || (max - value - allowed).abs() < 1e-9,
+                "axis {max} leaves {} of headroom over {value}, more than a {step} step \
+                 plus a twentieth of the range",
+                max - value
+            );
+            assert!(
+                step > 0.0 && (max / step - (max / step).round()).abs() < 1e-9,
+                "{max} must divide into whole {step} steps"
+            );
+        }
+    }
+}

@@ -456,7 +456,9 @@ mod tests {
             ocr: true,
             ..Default::default()
         };
-        assert!(graph.plan(Format::Pdf, Format::Txt, &options).is_err());
+        let plan = graph.plan(Format::Pdf, Format::Txt, &options).unwrap();
+        assert_eq!(plan.steps[0].engine, "native-ocr");
+        assert!(plan.steps[0].ocr);
     }
 
     #[test]

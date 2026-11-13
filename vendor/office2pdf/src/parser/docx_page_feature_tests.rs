@@ -1,0 +1,3594 @@
+use super::*;
+
+// ----- US-020: Header/footer parsing tests -----
+
+fn build_docx_with_header(header_text: &str) -> Vec<u8> {
+    let header = docx_rs::Header::new().add_paragraph(
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text(header_text)),
+    );
+    let docx = docx_rs::Docx::new().header(header).add_paragraph(
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Body text")),
+    );
+    let mut cursor = Cursor::new(Vec::new());
+    docx.build().pack(&mut cursor).unwrap();
+    cursor.into_inner()
+}
+
+fn build_docx_with_footer(footer_text: &str) -> Vec<u8> {
+    let footer = docx_rs::Footer::new().add_paragraph(
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text(footer_text)),
+    );
+    let docx = docx_rs::Docx::new().footer(footer).add_paragraph(
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Body text")),
+    );
+    let mut cursor = Cursor::new(Vec::new());
+    docx.build().pack(&mut cursor).unwrap();
+    cursor.into_inner()
+}
+
+fn build_docx_with_page_number_footer() -> Vec<u8> {
+    let footer = docx_rs::Footer::new().add_paragraph(
+        docx_rs::Paragraph::new().add_run(
+            docx_rs::Run::new()
+                .add_text("Page ")
+                .add_field_char(docx_rs::FieldCharType::Begin, false)
+                .add_instr_text(docx_rs::InstrText::PAGE(docx_rs::InstrPAGE::new()))
+                .add_field_char(docx_rs::FieldCharType::Separate, false)
+                .add_text("1")
+                .add_field_char(docx_rs::FieldCharType::End, false),
+        ),
+    );
+    let docx = docx_rs::Docx::new().footer(footer).add_paragraph(
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Body text")),
+    );
+    let mut cursor = Cursor::new(Vec::new());
+    docx.build().pack(&mut cursor).unwrap();
+    cursor.into_inner()
+}
+
+/// Word writes a `w:fldChar` field across several runs — one for each of
+/// begin, the instruction, separate, the cached result and end. The field's
+/// state has to span those runs, or the cached result leaks out as static text
+/// and every page shows whatever number was saved (issue #738).
+#[test]
+fn test_page_field_split_across_runs_is_a_page_number() {
+    let footer = docx_rs::Footer::new().add_paragraph(
+        docx_rs::Paragraph::new()
+            .add_run(docx_rs::Run::new().add_field_char(docx_rs::FieldCharType::Begin, false))
+            .add_run(
+                docx_rs::Run::new()
+                    .add_instr_text(docx_rs::InstrText::PAGE(docx_rs::InstrPAGE::new())),
+            )
+            .add_run(docx_rs::Run::new().add_field_char(docx_rs::FieldCharType::Separate, false))
+            // The number cached when the document was last saved.
+            .add_run(docx_rs::Run::new().add_text("7"))
+            .add_run(docx_rs::Run::new().add_field_char(docx_rs::FieldCharType::End, false)),
+    );
+    let docx = docx_rs::Docx::new().footer(footer).add_paragraph(
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Body text")),
+    );
+    let mut cursor = Cursor::new(Vec::new());
+    docx.build().pack(&mut cursor).unwrap();
+    let data = cursor.into_inner();
+
+    let (doc, _warnings) = DocxParser.parse(&data, &ConvertOptions::default()).unwrap();
+    let page = match &doc.pages[0] {
+        Page::Flow(page) => page,
+        other => panic!("Expected FlowPage, got {other:?}"),
+    };
+    let footer = page.footer.as_ref().expect("Should have footer");
+    let elements: Vec<&crate::ir::HFInline> = footer
+        .paragraphs
+        .iter()
+        .flat_map(|paragraph| paragraph.elements.iter())
+        .collect();
+
+    assert!(
+        elements
+            .iter()
+            .any(|element| matches!(element, crate::ir::HFInline::PageNumber(_))),
+        "the split field must resolve to a page number, got {elements:?}"
+    );
+    assert!(
+        !elements.iter().any(
+            |element| matches!(element, crate::ir::HFInline::Run(run) if run.text.contains("7"))
+        ),
+        "the cached result must not survive as static text, got {elements:?}"
+    );
+}
+
+/// A field whose instruction is not one we model still has to show the text
+/// Word cached for it. Before the field state spanned runs this happened by
+/// accident — `in_field` was false again by the time the result's own run was
+/// read — so making the state span runs must not lose it.
+#[test]
+fn test_unmodelled_split_field_keeps_its_cached_text() {
+    let footer = docx_rs::Footer::new().add_paragraph(
+        docx_rs::Paragraph::new()
+            .add_run(docx_rs::Run::new().add_field_char(docx_rs::FieldCharType::Begin, false))
+            .add_run(
+                docx_rs::Run::new().add_instr_text(docx_rs::InstrText::Unsupported(
+                    " STYLEREF 1 \\s ".to_string(),
+                )),
+            )
+            .add_run(docx_rs::Run::new().add_field_char(docx_rs::FieldCharType::Separate, false))
+            .add_run(docx_rs::Run::new().add_text("Chapter Title"))
+            .add_run(docx_rs::Run::new().add_field_char(docx_rs::FieldCharType::End, false)),
+    );
+    let docx = docx_rs::Docx::new().footer(footer).add_paragraph(
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Body text")),
+    );
+    let mut cursor = Cursor::new(Vec::new());
+    docx.build().pack(&mut cursor).unwrap();
+    let data = cursor.into_inner();
+
+    let (doc, _warnings) = DocxParser.parse(&data, &ConvertOptions::default()).unwrap();
+    let page = match &doc.pages[0] {
+        Page::Flow(page) => page,
+        other => panic!("Expected FlowPage, got {other:?}"),
+    };
+    let footer = page.footer.as_ref().expect("Should have footer");
+    let has_cached_text = footer.paragraphs.iter().any(|paragraph| {
+        paragraph.elements.iter().any(
+            |element| matches!(element, crate::ir::HFInline::Run(run) if run.text.contains("Chapter Title")),
+        )
+    });
+    assert!(
+        has_cached_text,
+        "an unmodelled field must still render its cached result"
+    );
+}
+
+/// A field the paragraph never closes must not swallow the text after it.
+#[test]
+fn test_unterminated_split_field_does_not_swallow_its_text() {
+    let footer = docx_rs::Footer::new().add_paragraph(
+        docx_rs::Paragraph::new()
+            .add_run(docx_rs::Run::new().add_field_char(docx_rs::FieldCharType::Begin, false))
+            .add_run(
+                docx_rs::Run::new()
+                    .add_instr_text(docx_rs::InstrText::Unsupported(" STYLEREF 1 ".to_string())),
+            )
+            .add_run(docx_rs::Run::new().add_field_char(docx_rs::FieldCharType::Separate, false))
+            .add_run(docx_rs::Run::new().add_text("Dangling")),
+    );
+    let docx = docx_rs::Docx::new().footer(footer).add_paragraph(
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Body text")),
+    );
+    let mut cursor = Cursor::new(Vec::new());
+    docx.build().pack(&mut cursor).unwrap();
+    let data = cursor.into_inner();
+
+    let (doc, _warnings) = DocxParser.parse(&data, &ConvertOptions::default()).unwrap();
+    let page = match &doc.pages[0] {
+        Page::Flow(page) => page,
+        other => panic!("Expected FlowPage, got {other:?}"),
+    };
+    let footer = page.footer.as_ref().expect("Should have footer");
+    let has_text = footer.paragraphs.iter().any(|paragraph| {
+        paragraph.elements.iter().any(
+            |element| matches!(element, crate::ir::HFInline::Run(run) if run.text.contains("Dangling")),
+        )
+    });
+    assert!(has_text, "text inside an unclosed field must still render");
+}
+
+/// Word applies the containing run's properties to the field result, so the
+/// parsed field must carry that run's style.
+#[test]
+fn test_page_number_field_carries_its_run_style() {
+    let footer = docx_rs::Footer::new().add_paragraph(
+        docx_rs::Paragraph::new().add_run(
+            docx_rs::Run::new()
+                .size(16)
+                .color("888888")
+                .add_text("- ")
+                .add_field_char(docx_rs::FieldCharType::Begin, false)
+                .add_instr_text(docx_rs::InstrText::PAGE(docx_rs::InstrPAGE::new()))
+                .add_field_char(docx_rs::FieldCharType::Separate, false)
+                .add_field_char(docx_rs::FieldCharType::End, false),
+        ),
+    );
+    let docx = docx_rs::Docx::new().footer(footer).add_paragraph(
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Body text")),
+    );
+    let mut cursor = Cursor::new(Vec::new());
+    docx.build().pack(&mut cursor).unwrap();
+    let data = cursor.into_inner();
+
+    let parser = DocxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let flow = match &doc.pages[0] {
+        Page::Flow(flow) => flow,
+        _ => panic!("Expected FlowPage"),
+    };
+    let elements = &flow.footer.as_ref().expect("footer").paragraphs[0].elements;
+    let style = elements
+        .iter()
+        .find_map(|element| match element {
+            crate::ir::HFInline::PageNumber(style) => Some(style),
+            _ => None,
+        })
+        .expect("page number field parsed");
+    assert_eq!(style.font_size, Some(8.0), "w:sz 16 half-points is 8pt");
+    assert_eq!(style.color, Some(Color::new(0x88, 0x88, 0x88)));
+}
+
+fn build_docx_with_total_pages_footer() -> Vec<u8> {
+    let footer = docx_rs::Footer::new().add_paragraph(
+        docx_rs::Paragraph::new()
+            .add_run(docx_rs::Run::new().add_text("Total "))
+            .add_run(
+                docx_rs::Run::new()
+                    .add_field_char(docx_rs::FieldCharType::Begin, false)
+                    .add_instr_text(docx_rs::InstrText::NUMPAGES(docx_rs::InstrNUMPAGES::new()))
+                    .add_field_char(docx_rs::FieldCharType::Separate, false)
+                    .add_text("1")
+                    .add_field_char(docx_rs::FieldCharType::End, false),
+            ),
+    );
+    let docx = docx_rs::Docx::new()
+        .footer(footer)
+        .add_paragraph(docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Body")));
+    let mut cursor = Cursor::new(Vec::new());
+    docx.build().pack(&mut cursor).unwrap();
+    cursor.into_inner()
+}
+
+#[test]
+fn test_parse_docx_with_text_header() {
+    let data = build_docx_with_header("My Document Header");
+    let parser = DocxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = match &doc.pages[0] {
+        Page::Flow(p) => p,
+        _ => panic!("Expected FlowPage"),
+    };
+
+    assert!(page.header.is_some(), "FlowPage should have a header");
+    let header = page.header.as_ref().unwrap();
+    assert!(
+        !header.paragraphs.is_empty(),
+        "Header should have paragraphs"
+    );
+
+    let has_text = header.paragraphs.iter().any(|paragraph| {
+        paragraph.elements.iter().any(
+            |element| matches!(element, crate::ir::HFInline::Run(run) if run.text.contains("My Document Header")),
+        )
+    });
+    assert!(
+        has_text,
+        "Header should contain the text 'My Document Header'"
+    );
+}
+
+#[test]
+fn issue_1894_page_field_inside_header_structured_tag_is_retained() {
+    let data: &[u8] = include_bytes!(
+        "../../../../tests/fixtures/docx/libreoffice/tdf153613_sdtAfterPgBreak.docx"
+    );
+    let (doc, _warnings) = DocxParser.parse(data, &ConvertOptions::default()).unwrap();
+
+    let flow_page = match &doc.pages[0] {
+        Page::Flow(flow_page) | Page::FlowContinuous(flow_page) => flow_page,
+        other => panic!("Expected FlowPage, got {other:?}"),
+    };
+    let header = flow_page
+        .header
+        .as_ref()
+        .expect("fixture should have a header");
+    assert!(
+        header.paragraphs.iter().any(|paragraph| {
+            paragraph
+                .elements
+                .iter()
+                .any(|element| matches!(element, crate::ir::HFInline::PageNumber(_)))
+        }),
+        "the header's PAGE field inside its structured tag should be retained; got {header:#?}"
+    );
+    assert!(
+        !header.paragraphs.iter().any(|paragraph| {
+            paragraph
+                .elements
+                .iter()
+                .any(|element| matches!(element, crate::ir::HFInline::Run(run) if run.text == "2"))
+        }),
+        "the fixture's cached page number must not render as static text"
+    );
+}
+
+#[test]
+fn test_parse_docx_with_text_footer() {
+    let data = build_docx_with_footer("Footer Text");
+    let parser = DocxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = match &doc.pages[0] {
+        Page::Flow(p) => p,
+        _ => panic!("Expected FlowPage"),
+    };
+
+    assert!(page.footer.is_some(), "FlowPage should have a footer");
+    let footer = page.footer.as_ref().unwrap();
+
+    let has_text = footer.paragraphs.iter().any(|paragraph| {
+        paragraph
+            .elements
+            .iter()
+            .any(|element| matches!(element, crate::ir::HFInline::Run(run) if run.text.contains("Footer Text")))
+    });
+    assert!(has_text, "Footer should contain 'Footer Text'");
+}
+
+/// LibreOffice's public `tdf105688.docx` keeps this footer rule in an
+/// AlternateContent DrawingML anchor. The shape and its text-flow position
+/// must survive the header/footer side-channel (issue #1990).
+#[test]
+fn issue_1990_parses_the_anchored_footer_line() {
+    let fixture: &[u8] =
+        include_bytes!("../../../../tests/fixtures/docx/libreoffice/tdf105688.docx");
+    let (document, _warnings) = DocxParser
+        .parse(fixture, &ConvertOptions::default())
+        .expect("public footer-line fixture parses");
+    let page: &FlowPage = match &document.pages[1] {
+        Page::Flow(page) | Page::FlowContinuous(page) => page,
+        other => panic!("expected the fixture's second page to be a flow page, got {other:?}"),
+    };
+    let footer = page
+        .footer
+        .as_ref()
+        .expect("page two uses a default footer");
+    let line = footer
+        .shapes
+        .iter()
+        .find(|shape| matches!(shape.content, HeaderFooterShapeContent::Shape(_)))
+        .expect("the anchored footer line is retained");
+
+    assert!((line.width - 590.25).abs() < 0.01, "{}", line.width);
+    assert_eq!(line.height, 0.0);
+    assert_eq!(line.frame.horizontal_anchor, FrameAnchor::Text);
+    assert_eq!(line.frame.vertical_anchor, FrameAnchor::Text);
+    assert_eq!(line.frame.x, Some(-24.0));
+    assert!((line.frame.y.unwrap_or_default() - 12.25).abs() < 0.01);
+    assert_eq!(line.anchor_paragraph_index, Some(0));
+    let HeaderFooterShapeContent::Shape(shape) = &line.content else {
+        unreachable!("the selected shape is the DrawingML line")
+    };
+    assert!(matches!(shape.kind, crate::ir::ShapeKind::Line { .. }));
+    let stroke = shape
+        .stroke
+        .as_ref()
+        .expect("the explicit DrawingML stroke");
+    assert_eq!(stroke.color, Color::new(0x00, 0xB0, 0xF0));
+}
+
+#[test]
+fn test_parse_docx_with_page_number_in_footer() {
+    let data = build_docx_with_page_number_footer();
+    let parser = DocxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = match &doc.pages[0] {
+        Page::Flow(p) => p,
+        _ => panic!("Expected FlowPage"),
+    };
+
+    assert!(page.footer.is_some(), "Should have footer");
+    let footer = page.footer.as_ref().unwrap();
+
+    let has_page_num = footer.paragraphs.iter().any(|paragraph| {
+        paragraph
+            .elements
+            .iter()
+            .any(|element| matches!(element, crate::ir::HFInline::PageNumber(_)))
+    });
+    assert!(has_page_num, "Footer should contain a PageNumber field");
+
+    let has_text = footer.paragraphs.iter().any(|paragraph| {
+        paragraph
+            .elements
+            .iter()
+            .any(|element| matches!(element, crate::ir::HFInline::Run(run) if run.text.contains("Page ")))
+    });
+    assert!(
+        has_text,
+        "Footer should contain 'Page ' text before page number"
+    );
+}
+
+#[test]
+fn test_parse_docx_with_total_pages_in_footer() {
+    let data = build_docx_with_total_pages_footer();
+    let parser = DocxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = match &doc.pages[0] {
+        Page::Flow(p) => p,
+        _ => panic!("Expected FlowPage"),
+    };
+
+    let footer = page.footer.as_ref().expect("Should have footer");
+    let has_total_pages = footer.paragraphs.iter().any(|paragraph| {
+        paragraph
+            .elements
+            .iter()
+            .any(|element| matches!(element, crate::ir::HFInline::TotalPages(_)))
+    });
+    assert!(has_total_pages, "Footer should contain a TotalPages field");
+}
+
+#[test]
+fn test_parse_docx_multiple_sections_with_distinct_page_setup_and_headers() {
+    let first_header = docx_rs::Header::new().add_paragraph(
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Section One Header")),
+    );
+    let second_header = docx_rs::Header::new().add_paragraph(
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Section Two Header")),
+    );
+
+    let first_section = docx_rs::Section::new()
+        .page_size(docx_rs::PageSize::new().size(12240, 15840))
+        .header(first_header)
+        .add_paragraph(
+            docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Section One")),
+        );
+
+    let docx = docx_rs::Docx::new()
+        .add_section(first_section)
+        .header(second_header)
+        .page_size(15840, 12240)
+        .add_paragraph(
+            docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Section Two")),
+        );
+    let mut cursor = Cursor::new(Vec::new());
+    docx.build().pack(&mut cursor).unwrap();
+    let data = cursor.into_inner();
+
+    let parser = DocxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    assert_eq!(doc.pages.len(), 2, "Expected one FlowPage per DOCX section");
+
+    let first_page = match &doc.pages[0] {
+        Page::Flow(page) => page,
+        _ => panic!("Expected first page to be FlowPage"),
+    };
+    let second_page = match &doc.pages[1] {
+        Page::Flow(page) => page,
+        _ => panic!("Expected second page to be FlowPage"),
+    };
+
+    assert!(
+        (first_page.size.width - 612.0).abs() < 0.1,
+        "first page width should come from first section"
+    );
+    assert!(
+        (first_page.size.height - 792.0).abs() < 0.1,
+        "first page height should come from first section"
+    );
+    assert!(
+        (second_page.size.width - 792.0).abs() < 0.1,
+        "second page width should come from final section"
+    );
+    assert!(
+        (second_page.size.height - 612.0).abs() < 0.1,
+        "second page height should come from final section"
+    );
+
+    let first_header_text = first_page
+        .header
+        .as_ref()
+        .and_then(|header_footer| {
+            header_footer
+                .paragraphs
+                .iter()
+                .flat_map(|paragraph| paragraph.elements.iter())
+                .find_map(|element| match element {
+                    crate::ir::HFInline::Run(run) => Some(run.text.as_str()),
+                    _ => None,
+                })
+        })
+        .unwrap_or("");
+    assert_eq!(first_header_text, "Section One Header");
+
+    let second_header_text = second_page
+        .header
+        .as_ref()
+        .and_then(|header_footer| {
+            header_footer
+                .paragraphs
+                .iter()
+                .flat_map(|paragraph| paragraph.elements.iter())
+                .find_map(|element| match element {
+                    crate::ir::HFInline::Run(run) => Some(run.text.as_str()),
+                    _ => None,
+                })
+        })
+        .unwrap_or("");
+    assert_eq!(second_header_text, "Section Two Header");
+}
+
+#[test]
+fn test_parse_docx_with_header_and_footer() {
+    let header = docx_rs::Header::new().add_paragraph(
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Header Text")),
+    );
+    let footer = docx_rs::Footer::new().add_paragraph(
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Footer Text")),
+    );
+    let docx = docx_rs::Docx::new()
+        .header(header)
+        .footer(footer)
+        .add_paragraph(docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Body")));
+    let mut cursor = Cursor::new(Vec::new());
+    docx.build().pack(&mut cursor).unwrap();
+    let data = cursor.into_inner();
+
+    let parser = DocxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = match &doc.pages[0] {
+        Page::Flow(p) => p,
+        _ => panic!("Expected FlowPage"),
+    };
+
+    assert!(page.header.is_some(), "Should have header");
+    assert!(page.footer.is_some(), "Should have footer");
+}
+
+#[test]
+fn test_parse_docx_without_header_footer() {
+    let data = build_docx_bytes(vec![
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Just text")),
+    ]);
+    let parser = DocxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = match &doc.pages[0] {
+        Page::Flow(p) => p,
+        _ => panic!("Expected FlowPage"),
+    };
+
+    assert!(page.header.is_none(), "No header expected");
+    assert!(page.footer.is_none(), "No footer expected");
+}
+
+// ----- Page orientation tests -----
+
+#[test]
+fn test_portrait_document_width_less_than_height() {
+    let data = build_docx_bytes_with_page_setup(
+        vec![docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Portrait"))],
+        11906,
+        16838,
+        1440,
+        1440,
+        1440,
+        1440,
+    );
+    let parser = DocxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = match &doc.pages[0] {
+        Page::Flow(p) => p,
+        _ => panic!("Expected FlowPage"),
+    };
+    assert!(
+        page.size.width < page.size.height,
+        "Portrait: width ({}) should be < height ({})",
+        page.size.width,
+        page.size.height
+    );
+}
+
+#[test]
+fn test_landscape_document_width_greater_than_height() {
+    let data = build_docx_bytes_with_page_setup(
+        vec![docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Landscape"))],
+        16838,
+        11906,
+        1440,
+        1440,
+        1440,
+        1440,
+    );
+    let parser = DocxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = match &doc.pages[0] {
+        Page::Flow(p) => p,
+        _ => panic!("Expected FlowPage"),
+    };
+    assert!(
+        page.size.width > page.size.height,
+        "Landscape: width ({}) should be > height ({})",
+        page.size.width,
+        page.size.height
+    );
+    assert!(
+        (page.size.width - 841.9).abs() < 1.0,
+        "Expected width ~841.9, got {}",
+        page.size.width
+    );
+    assert!(
+        (page.size.height - 595.3).abs() < 1.0,
+        "Expected height ~595.3, got {}",
+        page.size.height
+    );
+}
+
+#[test]
+fn test_default_document_is_portrait() {
+    let data = build_docx_bytes(vec![
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Default")),
+    ]);
+    let parser = DocxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = match &doc.pages[0] {
+        Page::Flow(p) => p,
+        _ => panic!("Expected FlowPage"),
+    };
+    assert!(
+        page.size.width < page.size.height,
+        "Default should be portrait: width ({}) < height ({})",
+        page.size.width,
+        page.size.height
+    );
+}
+
+#[test]
+fn test_landscape_with_orient_attribute() {
+    let mut docx = docx_rs::Docx::new()
+        .page_size(16838, 11906)
+        .page_orient(docx_rs::PageOrientationType::Landscape)
+        .page_margin(
+            docx_rs::PageMargin::new()
+                .top(1440)
+                .bottom(1440)
+                .left(1440)
+                .right(1440),
+        );
+    docx = docx.add_paragraph(
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Landscape with orient")),
+    );
+    let buf = Vec::new();
+    let mut cursor = Cursor::new(buf);
+    docx.build().pack(&mut cursor).unwrap();
+    let data = cursor.into_inner();
+
+    let parser = DocxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = match &doc.pages[0] {
+        Page::Flow(p) => p,
+        _ => panic!("Expected FlowPage"),
+    };
+    assert!(
+        page.size.width > page.size.height,
+        "Landscape with orient: width ({}) should be > height ({})",
+        page.size.width,
+        page.size.height
+    );
+}
+
+#[test]
+fn test_extract_page_size_orient_landscape_swaps_dimensions() {
+    let page_size = docx_rs::PageSize::new()
+        .width(11906)
+        .height(16838)
+        .orient(docx_rs::PageOrientationType::Landscape);
+
+    let result = extract_page_size(&page_size);
+    assert!(
+        result.width > result.height,
+        "orient=landscape should ensure width ({}) > height ({})",
+        result.width,
+        result.height
+    );
+}
+
+#[test]
+fn test_extract_page_size_no_orient_keeps_dimensions() {
+    let page_size = docx_rs::PageSize::new().width(11906).height(16838);
+
+    let result = extract_page_size(&page_size);
+    assert!(
+        result.width < result.height,
+        "No orient: width ({}) should be < height ({})",
+        result.width,
+        result.height
+    );
+}
+
+/// Word letterhead headers declare the gap between text and rule with
+/// `w:pBdr/<side>/@w:space`, in points.
+#[test]
+fn test_parse_docx_header_paragraph_border_space() {
+    let mut paragraph =
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Manual v0.6"));
+    paragraph.property = paragraph.property.set_borders(
+        docx_rs::ParagraphBorders::with_empty().set(
+            docx_rs::ParagraphBorder::new(docx_rs::ParagraphBorderPosition::Bottom)
+                .val(docx_rs::BorderType::Single)
+                .size(4)
+                .space(4)
+                .color("CCCCCC"),
+        ),
+    );
+    let header = docx_rs::Header::new().add_paragraph(paragraph);
+    let docx = docx_rs::Docx::new().header(header).add_paragraph(
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Body text")),
+    );
+    let mut cursor = Cursor::new(Vec::new());
+    docx.build().pack(&mut cursor).unwrap();
+    let data = cursor.into_inner();
+
+    let parser = DocxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let flow = match &doc.pages[0] {
+        Page::Flow(flow) => flow,
+        _ => panic!("Expected FlowPage"),
+    };
+    let paragraph = &flow.header.as_ref().expect("header").paragraphs[0];
+
+    let border = paragraph.border.as_ref().expect("bottom rule parsed");
+    assert!(border.bottom.is_some());
+    let space = paragraph.border_space.expect("w:space parsed");
+    assert_eq!(space.bottom, 4.0);
+    assert_eq!(space.top, 0.0);
+}
+
+// ----- Document grid (`w:docGrid`) parsing tests (issue #518) -----
+
+/// A one-paragraph document whose section carries `<w:docGrid w:linePitch="360"
+/// {type_attribute}>`, written as raw XML because docx-rs's builder cannot
+/// place a `w:docGrid` on the body section.
+fn build_docx_with_doc_grid(type_attribute: &str) -> Vec<u8> {
+    use std::io::Write;
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = SimpleFileOptions::default();
+
+    zip.start_file("[Content_Types].xml", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#,
+    )
+    .unwrap();
+
+    zip.start_file("_rels/.rels", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#,
+    )
+    .unwrap();
+
+    zip.start_file("word/document.xml", opts).unwrap();
+    let document_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t xml:space="preserve">본문 한 줄</w:t></w:r></w:p>
+    <w:sectPr>
+      <w:pgSz w:w="11906" w:h="16838"/>
+      <w:docGrid w:linePitch="360"{type_attribute}/>
+    </w:sectPr>
+  </w:body>
+</w:document>"#
+    );
+    zip.write_all(document_xml.as_bytes()).unwrap();
+
+    zip.finish().unwrap().into_inner()
+}
+
+fn parse_flow_page(data: &[u8]) -> FlowPage {
+    let (doc, _warnings) = DocxParser
+        .parse(data, &ConvertOptions::default())
+        .expect("document parses");
+    match &doc.pages[0] {
+        Page::Flow(flow) => flow.clone(),
+        _ => panic!("Expected FlowPage"),
+    }
+}
+
+#[test]
+fn header_table_content_reaches_the_generated_page_header() {
+    let data: &[u8] = include_bytes!("../../../../tests/fixtures/docx/libreoffice/tdf105688.docx");
+    let (document, _warnings) = DocxParser.parse(data, &ConvertOptions::default()).unwrap();
+    let page = match &document.pages[0] {
+        Page::Flow(page) | Page::FlowContinuous(page) => page,
+        other => panic!("Expected a flow page, got {other:?}"),
+    };
+    let header = page.header.as_ref().expect("the fixture declares a header");
+    assert!(
+        header.shapes.iter().any(|element| matches!(
+            &element.content,
+            crate::ir::HeaderFooterShapeContent::Table(_)
+        )),
+        "the header table must be retained in the parsed story"
+    );
+    let first_table = header
+        .shapes
+        .iter()
+        .find(|element| {
+            matches!(
+                &element.content,
+                crate::ir::HeaderFooterShapeContent::Table(_)
+            )
+        })
+        .expect("the first section header contains its floating table");
+    assert!(
+        first_table.behind_text,
+        "header-story tables are painted before the main document story"
+    );
+    assert_eq!(
+        first_table.frame.vertical_anchor,
+        crate::ir::FrameAnchor::Page,
+        "the table anchor is resolved against the section that defines the story"
+    );
+    let crate::ir::HeaderFooterShapeContent::Table(parsed_table) = &first_table.content else {
+        unreachable!("the selected header element is a table")
+    };
+    assert_eq!(
+        first_table.frame.y,
+        Some(0.0),
+        "Word clamps the negative floating header-table position at the page top"
+    );
+    let paragraph_after_spacing: Vec<Option<f64>> = parsed_table.rows[0].cells[0]
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            crate::ir::Block::Paragraph(paragraph) => Some(paragraph.style.space_after),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        paragraph_after_spacing,
+        vec![Some(0.0); 4],
+        "TableGrid's paragraph spacing overrides docDefaults in the header cell"
+    );
+    let last_section = document
+        .pages
+        .last()
+        .expect("the fixture has a final section");
+    let last_section_header = match last_section {
+        Page::Flow(page) | Page::FlowContinuous(page) => page
+            .header
+            .as_ref()
+            .expect("the final section inherits the preceding header"),
+        other => panic!("Expected a flow page, got {other:?}"),
+    };
+    assert!(
+        last_section_header.shapes.iter().any(|element| matches!(
+            &element.content,
+            crate::ir::HeaderFooterShapeContent::Table(_)
+        )),
+        "the inherited final-section header must retain its table"
+    );
+    let last_table = last_section_header
+        .shapes
+        .iter()
+        .find(|element| {
+            matches!(
+                &element.content,
+                crate::ir::HeaderFooterShapeContent::Table(_)
+            )
+        })
+        .expect("the final section header contains the inherited floating table");
+    assert_eq!(
+        last_table.frame.vertical_anchor,
+        crate::ir::FrameAnchor::Page
+    );
+    assert_eq!(last_table.frame.y, first_table.frame.y);
+    let generated = crate::render::typst_gen::generate_typst(&document).unwrap();
+
+    assert!(
+        generated.source.contains("Xxxxxxxx"),
+        "the header table's title must be present in generated page content"
+    );
+    assert!(
+        generated.source.contains("rgb(0, 175, 240)"),
+        "the header table's declared fill must be present in generated page content"
+    );
+}
+
+/// A top-level header table sits in the story's flow, where Word stacks its
+/// rows with the story's paragraphs, unless a `w:tblpPr` with a positioning
+/// attribute lifts it out. Word ignores an empty `w:tblpPr` (issue #2250).
+#[test]
+fn a_header_table_flows_in_its_story_unless_tblppr_positions_it() {
+    const STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
+    for (positioning, flows_in_story) in [
+        ("", true),
+        ("<w:tblpPr/>", true),
+        (r#"<w:tblpPr w:tblpY="200"/>"#, false),
+        (
+            r#"<w:tblpPr w:vertAnchor="page" w:tblpYSpec="top"/>"#,
+            false,
+        ),
+    ] {
+        let header_xml: String = format!(
+            r#"<w:tbl><w:tblPr>{positioning}<w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="4000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p/>"#
+        );
+        let page: FlowPage =
+            parse_flow_page(&build_docx_with_raw_header_styles(STYLES, &header_xml));
+        let header = page.header.as_ref().expect("the section declares a header");
+        let tables: Vec<bool> = header
+            .shapes
+            .iter()
+            .filter(|shape| matches!(shape.content, crate::ir::HeaderFooterShapeContent::Table(_)))
+            .map(|shape| shape.flows_in_story)
+            .collect();
+        assert_eq!(
+            tables,
+            vec![flows_in_story],
+            "a header table with `{positioning}` must flow in its story: {flows_in_story}"
+        );
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn floating_picture_in_header_table_obeys_paragraph_vertical_anchor() {
+    let data: &[u8] = include_bytes!("../../../../tests/fixtures/docx/libreoffice/tdf105688.docx");
+    let (document, _warnings) = DocxParser.parse(data, &ConvertOptions::default()).unwrap();
+    assert_eq!(document.pages.len(), 2, "the fixture spans two pages");
+    let generated = crate::render::typst_gen::generate_typst(&document).unwrap();
+    let glyph_runs =
+        crate::render::pdf::compiled_text_runs_with_images(&generated.source, &generated.images, 0)
+            .expect("the header table text compiles");
+    let first_title_run = glyph_runs
+        .iter()
+        .filter(|run| run.text == "Xxxxxxxx")
+        .min_by(|left, right| left.left_pt.total_cmp(&right.left_pt))
+        .expect("the header title is present");
+    let first_title_run_x: f64 = first_title_run.left_pt;
+    assert!(
+        (first_title_run_x - 21.84).abs() < 0.5,
+        "anchoring the picture must not shift the paragraph text, got x={first_title_run_x:.2}pt"
+    );
+
+    let mut first_picture_top_pt: Option<f64> = None;
+    for page_index in 0..document.pages.len() {
+        let page_runs = crate::render::pdf::compiled_text_runs_with_images(
+            &generated.source,
+            &generated.images,
+            page_index,
+        )
+        .expect("the header table text compiles");
+        let title_run = page_runs
+            .iter()
+            .filter(|run| run.text == "Xxxxxxxx")
+            .min_by(|left, right| left.left_pt.total_cmp(&right.left_pt))
+            .expect("the repeated header title is present");
+        let images = crate::render::pdf::compiled_image_boxes(
+            &generated.source,
+            &generated.images,
+            page_index,
+        )
+        .expect("the header table compiles");
+        let [picture] = images.as_slice() else {
+            panic!("page {page_index} should paint its one header picture, got {images:?}");
+        };
+        let top_pt: f64 = picture
+            .corners
+            .iter()
+            .map(|corner| corner.1)
+            .fold(f64::INFINITY, f64::min);
+
+        // A host may substitute Cambria and move the header row, so assert
+        // placement against this render's anchor line rather than a fixed
+        // page y. The issue's ignored anchor left the picture more than 32pt
+        // above this line.
+        let baseline_distance_pt: f64 = title_run.baseline_pt - top_pt;
+        assert!(
+            (0.0..title_run.font_size_pt).contains(&baseline_distance_pt),
+            "page {page_index} header picture should remain within one title-font size of its anchor line, got y={top_pt:.2}pt and baseline={:.2}pt",
+            title_run.baseline_pt
+        );
+        if let Some(first_top_pt) = first_picture_top_pt {
+            assert!(
+                (top_pt - first_top_pt).abs() < 0.5,
+                "the repeated header picture should keep the same y on every page, got {top_pt:.2}pt vs {first_top_pt:.2}pt"
+            );
+        } else {
+            first_picture_top_pt = Some(top_pt);
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn paragraph_anchored_header_picture_tracks_paragraph_spacing() {
+    let data: &[u8] = include_bytes!("../../../../tests/fixtures/docx/libreoffice/tdf105688.docx");
+    let (document, _warnings) = DocxParser.parse(data, &ConvertOptions::default()).unwrap();
+
+    fn first_title_and_picture_y(document: &Document) -> (f64, f64) {
+        let generated = crate::render::typst_gen::generate_typst(document).unwrap();
+        let runs = crate::render::pdf::compiled_text_runs_with_images(
+            &generated.source,
+            &generated.images,
+            0,
+        )
+        .unwrap();
+        let title_baseline: f64 = runs
+            .iter()
+            .filter(|run| run.text == "Xxxxxxxx" && run.left_pt < 100.0)
+            .map(|run| run.baseline_pt)
+            .fold(f64::INFINITY, f64::min);
+        let images =
+            crate::render::pdf::compiled_image_boxes(&generated.source, &generated.images, 0)
+                .unwrap();
+        let picture_top: f64 = images[0]
+            .corners
+            .iter()
+            .map(|corner| corner.1)
+            .fold(f64::INFINITY, f64::min);
+        (title_baseline, picture_top)
+    }
+
+    let before: (f64, f64) = first_title_and_picture_y(&document);
+    let mut spaced_document: Document = document.clone();
+    let page = match &mut spaced_document.pages[0] {
+        Page::Flow(page) | Page::FlowContinuous(page) => page,
+        other => panic!("Expected a flow page, got {other:?}"),
+    };
+    let header_table = page
+        .header
+        .as_mut()
+        .unwrap()
+        .shapes
+        .iter_mut()
+        .find_map(|shape| match &mut shape.content {
+            crate::ir::HeaderFooterShapeContent::Table(table) => Some(table),
+            crate::ir::HeaderFooterShapeContent::Shape(_)
+            | crate::ir::HeaderFooterShapeContent::Picture(_) => None,
+        })
+        .unwrap();
+    let title_paragraph = header_table
+        .rows
+        .iter_mut()
+        .flat_map(|row| row.cells.iter_mut())
+        .flat_map(|cell| cell.content.iter_mut())
+        .find_map(|block| match block {
+            Block::Paragraph(paragraph)
+                if paragraph
+                    .runs
+                    .iter()
+                    .any(|run| run.text.contains("Xxxxxxxx")) =>
+            {
+                Some(paragraph)
+            }
+            _ => None,
+        })
+        .unwrap();
+    title_paragraph.style.space_before = Some(12.0);
+
+    let after: (f64, f64) = first_title_and_picture_y(&spaced_document);
+    let text_shift: f64 = after.0 - before.0;
+    let image_shift: f64 = after.1 - before.1;
+    assert!(
+        text_shift > 1.0,
+        "the paragraph spacing should move its title, got {text_shift:.2}pt"
+    );
+    assert!(
+        (image_shift - text_shift).abs() < 0.5,
+        "the paragraph-anchored image should follow its title by the same amount, text moved {text_shift:.2}pt and image moved {image_shift:.2}pt"
+    );
+}
+
+#[test]
+fn floating_body_table_respects_its_page_and_margin_anchors() {
+    let data: &[u8] = include_bytes!("../../../../tests/fixtures/docx/libreoffice/tdf105688.docx");
+    let (mut document, _warnings) = DocxParser.parse(data, &ConvertOptions::default()).unwrap();
+    let first_page = match &mut document.pages[0] {
+        Page::Flow(page) | Page::FlowContinuous(page) => page,
+        other => panic!("Expected a flow page, got {other:?}"),
+    };
+    first_page.header = None;
+    first_page.footer = None;
+    first_page.first_header = None;
+    first_page.first_footer = None;
+    first_page
+        .content
+        .retain(|block| matches!(block, crate::ir::Block::FloatingTable(_)));
+    let floating_table = first_page
+        .content
+        .iter()
+        .find_map(|block| match block {
+            crate::ir::Block::FloatingTable(table) => Some(table),
+            _ => None,
+        })
+        .expect("the target body table must retain its floating frame");
+    assert_eq!(
+        floating_table.frame.horizontal_anchor,
+        crate::ir::FrameAnchor::Text
+    );
+    assert_eq!(
+        floating_table.frame.vertical_anchor,
+        crate::ir::FrameAnchor::Text
+    );
+    assert!(
+        (floating_table.frame.x.expect("resolved x") + 53.875).abs() < 0.01,
+        "center alignment against the page margins must resolve to x=-53.875pt, got {:?}",
+        floating_table.frame.x
+    );
+    assert!(
+        (floating_table.frame.y.expect("resolved y") + 26.15).abs() < 0.01,
+        "the page-relative y anchor must resolve to y=-26.15pt from the text area, got {:?}",
+        floating_table.frame.y
+    );
+    let table_width_pt: f64 = floating_table.table.column_widths.iter().sum();
+    assert!(
+        (table_width_pt - 611.75).abs() < 0.01,
+        "the declared grid must stay 611.75pt wide, got {table_width_pt}pt"
+    );
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        document.pages.truncate(1);
+        let generated = crate::render::typst_gen::generate_typst(&document).unwrap();
+        let runs = crate::render::pdf::compiled_text_runs(&generated.source, 0).unwrap();
+        let quote = runs
+            .iter()
+            .find(|run| run.text.starts_with('“'))
+            .expect("the floating table's quote is rendered on page one");
+
+        assert!(
+            (quote.left_pt - 223.92).abs() < 0.25,
+            "the centered, over-wide table should start at the page-centered cell position, got {}pt",
+            quote.left_pt
+        );
+    }
+}
+
+#[test]
+fn right_aligned_anchored_text_box_retains_its_margin_reference() {
+    let data: &[u8] = include_bytes!("../../../../tests/fixtures/docx/libreoffice/tdf105688.docx");
+    let (document, _warnings) = DocxParser.parse(data, &ConvertOptions::default()).unwrap();
+    let text_box = document
+        .pages
+        .iter()
+        .filter_map(|page| match page {
+            Page::Flow(page) | Page::FlowContinuous(page) => Some(&page.content),
+            _ => None,
+        })
+        .flatten()
+        .find_map(|block| match block {
+            Block::FloatingTextBox(text_box) if (text_box.width - 156.25).abs() < 0.01 => {
+                Some(text_box)
+            }
+            _ => None,
+        })
+        .expect("the fixture's 156.25pt anchored text box should be in the flow");
+
+    assert_eq!(text_box.horizontal_align, Some(crate::ir::FrameAlign::End));
+    assert_eq!(text_box.horizontal_anchor, crate::ir::FrameAnchor::Margin);
+}
+
+#[test]
+fn page_anchored_text_box_retains_its_vertical_offset_and_extent() {
+    let data: &[u8] = include_bytes!("../../../../tests/fixtures/docx/libreoffice/tdf105688.docx");
+    let (document, _warnings) = DocxParser.parse(data, &ConvertOptions::default()).unwrap();
+    let text_box = document
+        .pages
+        .iter()
+        .filter_map(|page| match page {
+            Page::Flow(page) | Page::FlowContinuous(page) => Some(&page.content),
+            _ => None,
+        })
+        .flatten()
+        .find_map(|block| match block {
+            Block::FloatingTextBox(text_box)
+                if text_box.horizontal_align == Some(crate::ir::FrameAlign::End) =>
+            {
+                Some(text_box)
+            }
+            _ => None,
+        })
+        .expect("the fixture's page-anchored text box should be in the flow");
+
+    assert!((text_box.height - 248.8).abs() < 0.01);
+    assert!(
+        (text_box.offset_y - 204.144).abs() < 0.01,
+        "2592624 EMU should convert to 204.144pt, got {}pt",
+        text_box.offset_y
+    );
+    assert_eq!(text_box.vertical_anchor, crate::ir::FrameAnchor::Page);
+    assert_eq!(text_box.vertical_position_align, None);
+    assert_eq!(text_box.fill, Some(crate::ir::Color::white()));
+    let stroke = text_box
+        .stroke
+        .as_ref()
+        .expect("the floating shape should retain its outline");
+    assert!((stroke.width - 0.75).abs() < 0.01);
+    assert_eq!(stroke.color, crate::ir::Color::new(0, 176, 240));
+}
+
+#[test]
+fn anchored_text_box_quote_uses_the_word_left_cell_seat() {
+    let data: &[u8] = include_bytes!("../../../../tests/fixtures/docx/libreoffice/tdf105688.docx");
+    let (mut document, _warnings) = DocxParser.parse(data, &ConvertOptions::default()).unwrap();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let (
+            text_box,
+            text_box_top_pt,
+            text_box_height_pt,
+            table_padding,
+            paragraph_indent,
+            _line_spacing,
+            _quote_run_sizes,
+        ) = {
+            let page = match &document.pages[1] {
+                Page::Flow(page) | Page::FlowContinuous(page) => page,
+                other => panic!("Expected a flow page, got {other:?}"),
+            };
+            let text_box = page
+                .content
+                .iter()
+                .find_map(|block| match block {
+                    Block::FloatingTextBox(text_box) => Some(text_box),
+                    _ => None,
+                })
+                .expect("page two contains the anchored text box");
+            let table = text_box
+                .content
+                .iter()
+                .find_map(|block| match block {
+                    Block::Table(table) => Some(table),
+                    _ => None,
+                })
+                .expect("the text box contains its pull-quote table");
+            let quote_paragraph = table
+                .rows
+                .iter()
+                .flat_map(|row| row.cells.iter())
+                .flat_map(|cell| cell.content.iter())
+                .find_map(|block| match block {
+                    Block::Paragraph(paragraph)
+                        if paragraph.runs.iter().any(|run| run.text.starts_with('“')) =>
+                    {
+                        Some(paragraph)
+                    }
+                    _ => None,
+                })
+                .expect("the table contains the quote paragraph");
+            let quote_run_sizes: Vec<(String, Option<f64>, Option<String>)> = quote_paragraph
+                .runs
+                .iter()
+                .map(|run| {
+                    (
+                        run.text.clone(),
+                        run.style.font_size,
+                        run.style.font_family.clone(),
+                    )
+                })
+                .collect();
+            (
+                text_box.clone(),
+                text_box.offset_y,
+                text_box.height,
+                table.default_cell_padding,
+                quote_paragraph.style.indent_left,
+                quote_paragraph.style.line_spacing,
+                quote_run_sizes,
+            )
+        };
+        assert_eq!(
+            table_padding,
+            Some(crate::ir::Insets {
+                top: 7.2,
+                right: 7.2,
+                bottom: 7.2,
+                left: 0.0,
+            }),
+            "only the anchored table's direct left margin should be omitted"
+        );
+        assert_eq!(
+            paragraph_indent,
+            Some(4.5),
+            "the paragraph's independent left indent must remain applied"
+        );
+
+        let mut document_without_text_box: crate::ir::Document = document.clone();
+        let page = match &mut document_without_text_box.pages[1] {
+            Page::Flow(page) | Page::FlowContinuous(page) => page,
+            other => panic!("Expected a flow page, got {other:?}"),
+        };
+        let content_count_before_removal: usize = page.content.len();
+        page.content.retain(|block| {
+            !matches!(
+                block,
+                Block::FloatingTextBox(text_box)
+                    if (text_box.offset_y - text_box_top_pt).abs() < 0.01
+            )
+        });
+        assert_eq!(
+            page.content.len() + 1,
+            content_count_before_removal,
+            "the comparison document should omit only the target page-anchored text box"
+        );
+
+        let target_page_header_runs = |candidate: &crate::ir::Document| {
+            let generated = crate::render::typst_gen::generate_typst(candidate).unwrap();
+            let runs = crate::render::pdf::compiled_text_runs_with_images(
+                &generated.source,
+                &generated.images,
+                1,
+            )
+            .unwrap();
+            let mut header_runs: Vec<(String, f64)> = runs
+                .into_iter()
+                .filter(|run| run.left_pt < 50.0 && run.baseline_pt < 80.0)
+                .map(|run| (run.text, run.baseline_pt))
+                .collect();
+            header_runs.sort_by(|left, right| left.1.total_cmp(&right.1));
+            header_runs
+        };
+        let header_runs_with_text_box: Vec<(String, f64)> = target_page_header_runs(&document);
+        let header_runs_without_text_box: Vec<(String, f64)> =
+            target_page_header_runs(&document_without_text_box);
+        assert_eq!(
+            header_runs_with_text_box.len(),
+            2,
+            "the target page's header should contain two runs: {header_runs_with_text_box:?}"
+        );
+        assert_eq!(
+            header_runs_without_text_box.len(),
+            2,
+            "the control document should keep both target-page header runs: {header_runs_without_text_box:?}"
+        );
+        for (with_text_box, without_text_box) in header_runs_with_text_box
+            .iter()
+            .zip(&header_runs_without_text_box)
+        {
+            assert_eq!(
+                with_text_box.0, without_text_box.0,
+                "the anchored text box must not change header content"
+            );
+            assert!(
+                (with_text_box.1 - without_text_box.1).abs() <= 0.1,
+                "the anchored text box must not move the target-page header baseline: with={with_text_box:?}, without={without_text_box:?}"
+            );
+        }
+
+        let page = match &mut document.pages[1] {
+            Page::Flow(page) | Page::FlowContinuous(page) => page,
+            other => panic!("Expected a flow page, got {other:?}"),
+        };
+        page.first_header = None;
+        page.first_footer = None;
+        page.header = None;
+        page.footer = None;
+        page.content = vec![Block::FloatingTextBox(text_box)];
+        document.pages.remove(0);
+
+        let generated = crate::render::typst_gen::generate_typst(&document).unwrap();
+        let runs = crate::render::pdf::compiled_text_runs_with_images(
+            &generated.source,
+            &generated.images,
+            0,
+        )
+        .unwrap();
+        let quote = runs
+            .iter()
+            .find(|run| run.text.starts_with('“'))
+            .expect("the anchored text box quote should render on page two");
+
+        assert!(
+            (quote.left_pt - 424.59).abs() < 0.25,
+            "the quote should retain its paragraph indent without the table-level left inset, got {}pt",
+            quote.left_pt
+        );
+        let baseline_gap_pt: f64 = quote.baseline_pt - text_box_top_pt;
+        let _line_box_settings: Vec<&str> = generated
+            .source
+            .lines()
+            .filter(|line| line.contains("top-edge:") || line.contains("bottom-edge:"))
+            .collect();
+        assert!(
+            baseline_gap_pt > 0.0 && baseline_gap_pt < text_box_height_pt,
+            "the first line should remain inside the page-anchored box, got {baseline_gap_pt:.5}pt for {quote:?}"
+        );
+        // The native reference was exported with Word using Segoe UI. A
+        // substituted face has different baseline metrics, so its gap cannot
+        // be compared to that absolute native position.
+        #[cfg(target_os = "macos")]
+        if quote.family == "Segoe UI" {
+            assert!(
+                (baseline_gap_pt - 23.62).abs() <= 1.0,
+                "the first line in the page-anchored box should match Word's 23.62pt baseline gap within 1pt, got {baseline_gap_pt:.5}pt for {quote:?}; exact spacing={:?}, quote run styles={_quote_run_sizes:?}, generated line-box settings={_line_box_settings:?}",
+                _line_spacing
+            );
+        }
+    }
+}
+
+#[test]
+fn an_unpositioned_docx_body_table_remains_in_text_flow() {
+    let paragraph =
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("An ordinary body table"));
+    let table = docx_rs::Table::new(vec![docx_rs::TableRow::new(vec![
+        docx_rs::TableCell::new().add_paragraph(paragraph),
+    ])])
+    .set_grid(vec![3600]);
+    let docx = docx_rs::Docx::new().add_table(table);
+    let mut cursor = Cursor::new(Vec::new());
+    docx.build().pack(&mut cursor).unwrap();
+    let (document, _warnings) = DocxParser
+        .parse(&cursor.into_inner(), &ConvertOptions::default())
+        .unwrap();
+    let page = match &document.pages[0] {
+        Page::Flow(page) | Page::FlowContinuous(page) => page,
+        other => panic!("Expected a flow page, got {other:?}"),
+    };
+    let table_block = page
+        .content
+        .iter()
+        .find(|block| {
+            matches!(
+                block,
+                crate::ir::Block::Table(_) | crate::ir::Block::FloatingTable(_)
+            )
+        })
+        .expect("the ordinary body table is present");
+
+    assert!(
+        matches!(table_block, crate::ir::Block::Table(_)),
+        "a table without positioned-table properties must remain in document flow"
+    );
+}
+
+#[test]
+fn doc_grid_without_a_type_declares_a_pitch_that_does_not_snap() {
+    // Word writes a bare `<w:docGrid w:linePitch="360"/>` into ordinary Korean
+    // documents. `w:type` then takes its default value `default`, which is
+    // ECMA-376's name for *no* grid, and Word lays the file out with none —
+    // every Korean fixture in the business corpus is like this and none of
+    // their line advances is a multiple of 18pt (issue #518).
+    let page = parse_flow_page(&build_docx_with_doc_grid(""));
+
+    assert_eq!(
+        page.line_grid_pitch,
+        Some(18.0),
+        "the declared pitch is still read: it marks an East Asian edition"
+    );
+    assert!(
+        !page.line_grid_snaps_lines,
+        "a `default` grid must not snap lines to that pitch"
+    );
+}
+
+#[test]
+fn doc_grid_typed_lines_snaps_lines_to_the_pitch() {
+    // Triangulation: the author turning the grid on is what makes it real.
+    for grid_type in ["lines", "linesAndChars", "snapToChars"] {
+        let page = parse_flow_page(&build_docx_with_doc_grid(&format!(
+            r#" w:type="{grid_type}""#
+        )));
+
+        assert_eq!(page.line_grid_pitch, Some(18.0));
+        assert!(
+            page.line_grid_snaps_lines,
+            "w:type=\"{grid_type}\" snaps lines to the grid"
+        );
+    }
+}
+
+#[test]
+fn a_section_without_a_doc_grid_has_no_pitch_at_all() {
+    let docx = docx_rs::Docx::new()
+        .add_paragraph(docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Body")));
+    let mut cursor = Cursor::new(Vec::new());
+    docx.build().pack(&mut cursor).unwrap();
+
+    let page = parse_flow_page(&cursor.into_inner());
+
+    assert_eq!(page.line_grid_pitch, None);
+    assert!(!page.line_grid_snaps_lines);
+}
+
+// ----- Body paragraph `w:pBdr w:space` parsing (issue #520) -----
+
+/// A one-paragraph document whose only paragraph carries a bottom rule with
+/// the given `w:space`, in points.
+fn build_docx_with_paragraph_rule(space: Option<usize>) -> Vec<u8> {
+    let mut border = docx_rs::ParagraphBorder::new(docx_rs::ParagraphBorderPosition::Bottom)
+        .val(docx_rs::BorderType::Double)
+        .size(8)
+        .color("000000");
+    if let Some(space) = space {
+        border = border.space(space);
+    }
+    let mut paragraph =
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Letterhead"));
+    paragraph.property = paragraph
+        .property
+        .set_borders(docx_rs::ParagraphBorders::with_empty().set(border));
+
+    let docx = docx_rs::Docx::new().add_paragraph(paragraph);
+    let mut cursor = Cursor::new(Vec::new());
+    docx.build().pack(&mut cursor).unwrap();
+    cursor.into_inner()
+}
+
+fn first_body_paragraph_style(data: &[u8]) -> ParagraphStyle {
+    let (doc, _warnings) = DocxParser
+        .parse(data, &ConvertOptions::default())
+        .expect("document parses");
+    let flow = match &doc.pages[0] {
+        Page::Flow(flow) => flow,
+        _ => panic!("Expected FlowPage"),
+    };
+    match &flow.content[0] {
+        Block::Paragraph(paragraph) => paragraph.style.clone(),
+        other => panic!("Expected a paragraph, got {other:?}"),
+    }
+}
+
+#[test]
+fn body_paragraph_rule_carries_its_declared_space() {
+    // The gap between a paragraph's text and its rule is the paragraph's own
+    // `w:space`, in points. Substituting a fixed 4pt displaced everything
+    // below a bordered paragraph by the difference (issue #520).
+    let style = first_body_paragraph_style(&build_docx_with_paragraph_rule(Some(8)));
+
+    let space = style.border_space.expect("w:space parsed");
+    assert_eq!(space.bottom, 8.0);
+    assert_eq!((space.top, space.left, space.right), (0.0, 0.0, 0.0));
+}
+
+#[test]
+fn a_rule_without_w_space_yields_no_gap() {
+    // Triangulation: the attribute's own default is 0, so an omitted `w:space`
+    // must not resurrect a house value.
+    let style = first_body_paragraph_style(&build_docx_with_paragraph_rule(None));
+
+    assert!(style.border.is_some(), "the rule itself is still parsed");
+    assert_eq!(style.border_space.map(|space| space.bottom), Some(0.0));
+}
+
+#[test]
+fn a_paragraph_without_a_rule_has_no_border_space() {
+    let docx = docx_rs::Docx::new()
+        .add_paragraph(docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Body")));
+    let mut cursor = Cursor::new(Vec::new());
+    docx.build().pack(&mut cursor).unwrap();
+
+    let style = first_body_paragraph_style(&cursor.into_inner());
+
+    assert!(style.border.is_none());
+    assert!(style.border_space.is_none());
+}
+
+// ----- Word's East Asian/Latin auto space (issue #521) -----
+
+/// The in-text marker the parser places at such a boundary. Duplicated from
+/// the parser so the test pins the wire format rather than the constant.
+const AUTO_SPACE_MARKER: char = '\u{E001}';
+
+/// A one-paragraph document whose only run holds `text`, optionally aligned.
+fn build_docx_with_korean_text_aligned(
+    text: &str,
+    alignment: Option<docx_rs::AlignmentType>,
+) -> Vec<u8> {
+    let mut paragraph = docx_rs::Paragraph::new().add_run(
+        docx_rs::Run::new()
+            .add_text(text)
+            .fonts(docx_rs::RunFonts::new().east_asia("Malgun Gothic"))
+            .size(21),
+    );
+    if let Some(alignment) = alignment {
+        paragraph = paragraph.align(alignment);
+    }
+    let docx = docx_rs::Docx::new().add_paragraph(paragraph);
+    let mut cursor = Cursor::new(Vec::new());
+    docx.build().pack(&mut cursor).unwrap();
+    cursor.into_inner()
+}
+
+/// The same document, left to Word's default alignment.
+fn build_docx_with_korean_text(text: &str) -> Vec<u8> {
+    build_docx_with_korean_text_aligned(text, None)
+}
+
+fn first_paragraph_text(data: &[u8]) -> String {
+    let (doc, _warnings) = DocxParser
+        .parse(data, &ConvertOptions::default())
+        .expect("document parses");
+    let flow = match &doc.pages[0] {
+        Page::Flow(flow) => flow,
+        _ => panic!("Expected FlowPage"),
+    };
+    match &flow.content[0] {
+        Block::Paragraph(paragraph) => paragraph.runs.iter().map(|run| run.text.as_str()).collect(),
+        other => panic!("Expected a paragraph, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_boundary_between_east_asian_text_and_a_number_carries_the_auto_space() {
+    // Word inserts a quarter em where East Asian text meets a Latin letter or
+    // digit with no literal space between, on both sides of the island. A
+    // native export measures 2.625pt at 10.5pt and 2.375pt at 9.5pt, and our
+    // output was that much narrower at every such boundary (issue #521).
+    let text = first_paragraph_text(&build_docx_with_korean_text("2026년 제3자"));
+
+    assert_eq!(
+        text,
+        format!("2026{AUTO_SPACE_MARKER}년 제{AUTO_SPACE_MARKER}3{AUTO_SPACE_MARKER}자"),
+        "both sides of a digit island widen, and only boundaries without a \
+         literal space do"
+    );
+}
+
+#[test]
+fn a_boundary_that_already_has_a_space_gets_nothing() {
+    // Triangulation: Word adds nothing where the author already typed a space,
+    // which is why `은 2026` measures the same in the GT as in our output.
+    let text = first_paragraph_text(&build_docx_with_korean_text("유효기간은 2026"));
+
+    assert!(
+        !text.contains(AUTO_SPACE_MARKER),
+        "a literal space already separates the two scripts: {text:?}"
+    );
+}
+
+#[test]
+fn an_aligned_paragraph_widens_exactly_like_an_unaligned_one() {
+    // The #1053 one-factor probe patched only `w:jc` in a Normal-defining
+    // package and exported each variant through native Word: left, centred,
+    // justified and right all measure +2.588pt at every boundary of an
+    // unstretched line. Alignment is not part of the predicate.
+    let expected = format!("2026{AUTO_SPACE_MARKER}년 제{AUTO_SPACE_MARKER}3{AUTO_SPACE_MARKER}자");
+
+    for alignment in [
+        docx_rs::AlignmentType::Both,
+        docx_rs::AlignmentType::Center,
+        docx_rs::AlignmentType::Right,
+    ] {
+        let text = first_paragraph_text(&build_docx_with_korean_text_aligned(
+            "2026년 제3자",
+            Some(alignment),
+        ));
+
+        assert_eq!(
+            text, expected,
+            "{alignment:?} takes the same quarter em as an unaligned paragraph"
+        );
+    }
+}
+
+#[test]
+fn an_aligned_paragraph_stays_flush_without_a_defined_default_style() {
+    // Triangulation on the other factor: alignment does not *grant* the space
+    // either. In a corpus-shaped package — no default style defined — Word
+    // draws a centred or justified line flush, which is why 02_contract_ko's
+    // centred date line (issue #728) and its justified body are flush in the
+    // GT. Only the style resolution decides (issue #732).
+    for alignment in ["center", "both"] {
+        let body = format!(
+            r#"<w:p><w:pPr><w:jc w:val="{alignment}"/></w:pPr>{}</w:p>"#,
+            korean_run_xml("2026년 제3자")
+        );
+        let text = first_paragraph_text(&build_docx_with_raw_styles(CORPUS_SHAPED_STYLES, &body));
+
+        assert_eq!(
+            text, "2026년 제3자",
+            "a bare {alignment} paragraph keeps the boundaries the author typed"
+        );
+    }
+}
+
+#[test]
+fn latin_only_and_east_asian_only_text_are_untouched() {
+    // Triangulation on both sides of the predicate: the rule needs one of each
+    // script, so neither a pure Latin run nor a pure Korean one may widen.
+    for text in ["Version 2026 release 3", "계약서를 작성하여 보관한다"] {
+        let parsed = first_paragraph_text(&build_docx_with_korean_text(text));
+        assert!(
+            !parsed.contains(AUTO_SPACE_MARKER),
+            "single-script text needs no auto space: {parsed:?}"
+        );
+    }
+}
+
+#[test]
+fn cjk_punctuation_is_not_a_boundary() {
+    // `is_east_asian_text` is deliberately narrower than the renderer's
+    // `is_cjk_like`: CJK punctuation and the fullwidth forms are already
+    // full-width, and Word adds nothing beside them.
+    let text = first_paragraph_text(&build_docx_with_korean_text("、2026"));
+
+    assert!(
+        !text.contains(AUTO_SPACE_MARKER),
+        "an ideographic comma is already full-width: {text:?}"
+    );
+}
+
+// ----- The trigger is a defined paragraph style (issues #627, #732) -----
+
+/// A minimal package whose `word/styles.xml` is under the test's control,
+/// written as raw XML because docx-rs always writes a `Normal` definition
+/// into the styles part it builds — and whether the default paragraph style
+/// is *defined at all* is exactly the factor these tests vary (issue #732).
+///
+/// Shared with the style tests, which vary `w:docDefaults/w:rPrDefault/w:rFonts`
+/// the same way (issue #1196).
+pub(super) fn build_docx_with_raw_styles(styles_xml: &str, body_xml: &str) -> Vec<u8> {
+    use std::io::Write;
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = SimpleFileOptions::default();
+
+    zip.start_file("[Content_Types].xml", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+</Types>"#,
+    )
+    .unwrap();
+
+    zip.start_file("_rels/.rels", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#,
+    )
+    .unwrap();
+
+    zip.start_file("word/_rels/document.xml.rels", opts)
+        .unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"#,
+    )
+    .unwrap();
+
+    zip.start_file("word/styles.xml", opts).unwrap();
+    zip.write_all(styles_xml.as_bytes()).unwrap();
+
+    zip.start_file("word/document.xml", opts).unwrap();
+    let document_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    {body_xml}
+    <w:sectPr>
+      <w:pgSz w:w="11906" w:h="16838"/>
+      <w:docGrid w:linePitch="360"/>
+    </w:sectPr>
+  </w:body>
+</w:document>"#
+    );
+    zip.write_all(document_xml.as_bytes()).unwrap();
+
+    zip.finish().unwrap().into_inner()
+}
+
+/// The styles part every Korean business mock ships: document defaults plus a
+/// `ListParagraph` definition, and — decisively — no `Normal` (issue #732).
+const CORPUS_SHAPED_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:docDefaults>
+    <w:rPrDefault><w:rPr><w:rFonts w:ascii="Malgun Gothic" w:cs="Malgun Gothic" w:eastAsia="Malgun Gothic" w:hAnsi="Malgun Gothic"/><w:sz w:val="21"/><w:szCs w:val="21"/></w:rPr></w:rPrDefault>
+    <w:pPrDefault/>
+  </w:docDefaults>
+  <w:style w:type="paragraph" w:styleId="ListParagraph"><w:name w:val="List Paragraph"/><w:basedOn w:val="Normal"/><w:qFormat/></w:style>
+</w:styles>"#;
+
+/// The same styles part with an explicit default paragraph style added — the
+/// one factor #521's probe package differed by. Deliberately not named
+/// `Normal`, so the test isolates the `w:default="1"` arm of the scan.
+const DEFAULT_STYLE_DEFINING_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:docDefaults>
+    <w:rPrDefault><w:rPr><w:rFonts w:ascii="Malgun Gothic" w:cs="Malgun Gothic" w:eastAsia="Malgun Gothic" w:hAnsi="Malgun Gothic"/><w:sz w:val="21"/><w:szCs w:val="21"/></w:rPr></w:rPrDefault>
+    <w:pPrDefault/>
+  </w:docDefaults>
+  <w:style w:type="paragraph" w:styleId="Standard" w:default="1"><w:name w:val="Normal"/></w:style>
+  <w:style w:type="paragraph" w:styleId="ListParagraph"><w:name w:val="List Paragraph"/><w:basedOn w:val="Normal"/><w:qFormat/></w:style>
+</w:styles>"#;
+
+/// A run in the corpus mocks' shape: explicit Malgun Gothic, 9.5pt.
+fn korean_run_xml(text: &str) -> String {
+    format!(
+        r#"<w:r><w:rPr><w:rFonts w:ascii="Malgun Gothic" w:cs="Malgun Gothic" w:eastAsia="Malgun Gothic" w:hAnsi="Malgun Gothic"/><w:sz w:val="19"/><w:szCs w:val="19"/></w:rPr><w:t xml:space="preserve">{text}</w:t></w:r>"#
+    )
+}
+
+/// `text` inside `nesting` levels of single-cell table, as raw body XML.
+fn nested_cell_body_xml(text: &str, nesting: usize) -> String {
+    let mut body = format!("<w:p>{}</w:p>", korean_run_xml(text));
+    for _ in 0..nesting {
+        body = format!(
+            "<w:tbl><w:tblPr><w:tblW w:type=\"dxa\" w:w=\"9026\"/></w:tblPr>\
+             <w:tblGrid><w:gridCol w:w=\"9026\"/></w:tblGrid>\
+             <w:tr><w:tc><w:tcPr><w:tcW w:type=\"dxa\" w:w=\"9026\"/></w:tcPr>{body}</w:tc></w:tr></w:tbl>"
+        );
+    }
+    // A table may not end the body, so Word always writes a paragraph after it.
+    body.push_str("<w:p/>");
+    body
+}
+
+#[test]
+fn a_bare_paragraph_stays_flush_without_a_defined_default_style() {
+    // The plain-body rule of issue #732, settled by a one-factor probe: in a
+    // package that defines no default paragraph style — the shape of every
+    // Korean business mock — native Word draws every digit-Hangul boundary of
+    // a bare paragraph flush (06_official_letter_ko `1→부` is -0.06pt), and
+    // adding only a default-style definition to the same bytes flips every one
+    // of them to +0.25em. Word's own built-in Korean Normal carries the
+    // suppression; a defined style replaces it.
+    let text = first_paragraph_text(&build_docx_with_raw_styles(
+        CORPUS_SHAPED_STYLES,
+        &format!("<w:p>{}</w:p>", korean_run_xml("체크리스트 1부.")),
+    ));
+
+    assert_eq!(
+        text, "체크리스트 1부.",
+        "a bare paragraph keeps the boundaries the author typed"
+    );
+}
+
+#[test]
+fn a_bare_paragraph_widens_when_a_default_style_is_defined() {
+    // The other side of the same factor: #521's probe package defined its
+    // `Normal` explicitly, and native Word gave its bare paragraphs the full
+    // 0.25em at every boundary — 2.62pt at 10.5pt, 2.37pt at 9.5pt. Only the
+    // styles part differs from the fixture above.
+    let text = first_paragraph_text(&build_docx_with_raw_styles(
+        DEFAULT_STYLE_DEFINING_STYLES,
+        &format!("<w:p>{}</w:p>", korean_run_xml("체크리스트 1부.")),
+    ));
+
+    assert_eq!(
+        text,
+        format!("체크리스트 1{AUTO_SPACE_MARKER}부."),
+        "a defined default style reactivates the auto space"
+    );
+}
+
+#[test]
+fn a_list_styled_paragraph_widens_without_numbering() {
+    // #521's first survey read the corpus split as a `w:numPr` correlation;
+    // the probe shows the style is the real trigger: a `ListParagraph`-styled
+    // paragraph with no numbering at all takes the full 0.25em in the same
+    // package whose bare paragraphs are flush (case H, issue #732). This is
+    // why 02/03's list items widen while 06's plain body does not.
+    let body = format!(
+        r#"<w:p><w:pPr><w:pStyle w:val="ListParagraph"/></w:pPr>{}</w:p>"#,
+        korean_run_xml("2026년 8월")
+    );
+    let text = first_paragraph_text(&build_docx_with_raw_styles(CORPUS_SHAPED_STYLES, &body));
+
+    assert_eq!(
+        text,
+        format!("2026{AUTO_SPACE_MARKER}년 8{AUTO_SPACE_MARKER}월"),
+        "a defined, referenced style reactivates the auto space"
+    );
+}
+
+/// The same run `build_docx_with_korean_text` produces, wrapped in `nesting`
+/// levels of single-cell table so a cell inside a cell can be exercised too.
+fn build_docx_with_korean_text_in_table_cell(text: &str, nesting: usize) -> Vec<u8> {
+    let paragraph = docx_rs::Paragraph::new().add_run(
+        docx_rs::Run::new()
+            .add_text(text)
+            .fonts(docx_rs::RunFonts::new().east_asia("Malgun Gothic"))
+            .size(21),
+    );
+    let mut table = docx_rs::Table::new(vec![docx_rs::TableRow::new(vec![
+        docx_rs::TableCell::new().add_paragraph(paragraph),
+    ])])
+    .set_grid(vec![4000]);
+    for _ in 1..nesting {
+        table = docx_rs::Table::new(vec![docx_rs::TableRow::new(vec![
+            docx_rs::TableCell::new().add_table(table),
+        ])])
+        .set_grid(vec![4000]);
+    }
+    let docx = docx_rs::Docx::new().add_table(table);
+    let mut cursor = Cursor::new(Vec::new());
+    docx.build().pack(&mut cursor).unwrap();
+    cursor.into_inner()
+}
+
+/// The run text of the first paragraph in the innermost cell, descending
+/// through however many nested tables stand in the way.
+fn innermost_cell_paragraph_text(data: &[u8]) -> String {
+    let (doc, _warnings) = DocxParser
+        .parse(data, &ConvertOptions::default())
+        .expect("document parses");
+    let flow = match &doc.pages[0] {
+        Page::Flow(flow) => flow,
+        other => panic!("Expected FlowPage, got {other:?}"),
+    };
+    fn descend(blocks: &[Block]) -> Option<String> {
+        blocks.iter().find_map(|block| match block {
+            Block::Table(table) => descend(&table.rows[0].cells[0].content),
+            Block::Paragraph(paragraph) => {
+                Some(paragraph.runs.iter().map(|run| run.text.as_str()).collect())
+            }
+            _ => None,
+        })
+    }
+    descend(&flow.content).expect("a paragraph inside the innermost cell")
+}
+
+#[test]
+fn a_table_cell_gets_no_auto_space_at_a_digit_hangul_boundary() {
+    // In 10_research_report_ko's month column every digit-Hangul boundary is
+    // flush (-0.056pt) in the native export while ours opened 2.366pt, taking
+    // the cell text from Word's 48.60pt to 53.25pt (+9.6%) and rendering
+    // `2024년 1월` as `2024 년 1 월` (issue #627). #627 read this as a cell
+    // rule; the #732 probe shows it is the same style rule as the body: those
+    // cell paragraphs are bare, and the corpus defines no default style.
+    let text = innermost_cell_paragraph_text(&build_docx_with_raw_styles(
+        CORPUS_SHAPED_STYLES,
+        &nested_cell_body_xml("2024년 1월", 1),
+    ));
+
+    assert_eq!(
+        text, "2024년 1월",
+        "cell text keeps the boundaries the author typed"
+    );
+}
+
+#[test]
+fn a_body_paragraph_is_left_exactly_as_it_was() {
+    // docx-rs writes a `Normal` definition into every styles part it builds,
+    // so this document is in #521's-probe territory, not the corpus's: its
+    // probe defined `Normal` too, and native Word widened its bare paragraphs
+    // at every boundary (issue #732). The assertion is unchanged from when it
+    // pinned today's emission — what changed is that the emission is now known
+    // to be what Word does to this document.
+    let text = first_paragraph_text(&build_docx_with_korean_text("2024년 1월"));
+
+    assert_eq!(
+        text,
+        format!("2024{AUTO_SPACE_MARKER}년 1{AUTO_SPACE_MARKER}월"),
+        "a document whose builder defines Normal keeps the auto space"
+    );
+}
+
+#[test]
+fn a_table_cell_widens_when_a_default_style_is_defined() {
+    // #521's probe put the same sentence in a table cell of its
+    // Normal-defining package and native Word widened every boundary exactly
+    // as in the body (cases I/J: 2.62pt at 10.5pt, 2.37pt at 9.5pt). The cell
+    // is not a suppressor — the undefined default style is, and this docx-rs
+    // package defines one (issue #732).
+    let text =
+        innermost_cell_paragraph_text(&build_docx_with_korean_text_in_table_cell("2024년 1월", 1));
+
+    assert_eq!(
+        text,
+        format!("2024{AUTO_SPACE_MARKER}년 1{AUTO_SPACE_MARKER}월"),
+        "a defined default style reactivates the auto space in cells too"
+    );
+}
+
+#[test]
+fn a_numbered_list_paragraph_keeps_the_auto_space() {
+    // The corpus GT's positive case: the `w:pStyle="ListParagraph"` + `w:numPr`
+    // paragraphs of 02 and 03 widen (8.41/8.40pt, matched by us today). The
+    // #732 probe shows the referenced style — not the numbering — carries
+    // this, so a numbered item must keep widening under the style predicate.
+    let abstract_num = docx_rs::AbstractNumbering::new(0).add_level(docx_rs::Level::new(
+        0,
+        docx_rs::Start::new(1),
+        docx_rs::NumberFormat::new("decimal"),
+        docx_rs::LevelText::new("%1."),
+        docx_rs::LevelJc::new("left"),
+    ));
+    let data = build_docx_with_numbering(
+        vec![abstract_num],
+        vec![docx_rs::Numbering::new(1, 0)],
+        vec![
+            docx_rs::Paragraph::new()
+                .add_run(
+                    docx_rs::Run::new()
+                        .add_text("2024년 1월")
+                        .fonts(docx_rs::RunFonts::new().east_asia("Malgun Gothic"))
+                        .size(21),
+                )
+                .style("ListParagraph")
+                .numbering(docx_rs::NumberingId::new(1), docx_rs::IndentLevel::new(0)),
+        ],
+    );
+
+    let (doc, _warnings) = DocxParser
+        .parse(&data, &ConvertOptions::default())
+        .expect("document parses");
+    let flow = match &doc.pages[0] {
+        Page::Flow(flow) => flow,
+        other => panic!("Expected FlowPage, got {other:?}"),
+    };
+    let text: String = flow
+        .content
+        .iter()
+        .find_map(|block| match block {
+            Block::List(list) => Some(
+                list.items[0]
+                    .content
+                    .iter()
+                    .flat_map(|paragraph| paragraph.runs.iter().map(|run| run.text.as_str()))
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .expect("a list block");
+
+    assert_eq!(
+        text,
+        format!("2024{AUTO_SPACE_MARKER}년 1{AUTO_SPACE_MARKER}월"),
+        "a numbered list item is body text and still widens"
+    );
+}
+
+#[test]
+fn a_cell_inside_a_cell_is_still_a_cell() {
+    // Triangulation on depth: the style rule reaches a nested table's bare
+    // cell paragraphs the same way it reaches the outer table's.
+    let text = innermost_cell_paragraph_text(&build_docx_with_raw_styles(
+        CORPUS_SHAPED_STYLES,
+        &nested_cell_body_xml("2024년 1월", 2),
+    ));
+
+    assert_eq!(
+        text, "2024년 1월",
+        "a nested cell's bare paragraph stays flush too"
+    );
+}
+
+// ----- `w:titlePg` selects the first-page stories (issue #846) -----
+
+/// Every run's text in a header or footer story, concatenated.
+fn header_footer_text(story: &crate::ir::HeaderFooter) -> String {
+    story
+        .paragraphs
+        .iter()
+        .flat_map(|paragraph| paragraph.elements.iter())
+        .filter_map(|element| match element {
+            crate::ir::HFInline::Run(run) => Some(run.text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn build_docx_with_title_page(title_pg: bool) -> Vec<u8> {
+    let default_header = docx_rs::Header::new().add_paragraph(
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Every other page")),
+    );
+    let first_header = docx_rs::Header::new().add_paragraph(
+        docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Cover banner")),
+    );
+    let docx = docx_rs::Docx::new()
+        .header(default_header)
+        .first_header(first_header)
+        .add_paragraph(
+            docx_rs::Paragraph::new().add_run(docx_rs::Run::new().add_text("Body text")),
+        );
+    let docx = if title_pg { docx.title_pg() } else { docx };
+    let mut cursor = Cursor::new(Vec::new());
+    docx.build().pack(&mut cursor).unwrap();
+    cursor.into_inner()
+}
+
+#[test]
+fn title_pg_keeps_the_first_page_header_apart_from_the_rest() {
+    let page = parse_flow_page(&build_docx_with_title_page(true));
+
+    let first = page
+        .first_header
+        .as_ref()
+        .expect("titlePg must resolve a first-page header");
+    assert!(
+        header_footer_text(first).contains("Cover banner"),
+        "the first page takes the `first` story, got {:?}",
+        header_footer_text(first)
+    );
+    let rest = page
+        .header
+        .as_ref()
+        .expect("the remaining pages keep the default header");
+    assert!(
+        header_footer_text(rest).contains("Every other page"),
+        "pages after the first keep the default story, got {:?}",
+        header_footer_text(rest)
+    );
+}
+
+#[test]
+fn a_first_header_without_title_pg_is_not_used() {
+    // Triangulation: Word only honours the `first` story when `w:titlePg` asks
+    // for it, so its mere presence must not split the section.
+    //
+    // Written as raw XML because `docx_rs`'s `first_header` sets `title_pg`
+    // for you — its sibling is named `first_header_without_title_pg` precisely
+    // because the two are separable in the format even though that builder
+    // couples them.
+    let package = |title_pg: bool| {
+        build_docx_with_section_stories(
+            &format!(
+                r#"<w:p><w:r><w:t>Body text</w:t></w:r></w:p>{}"#,
+                section_properties_xml(&[("headerReference", "first", "rIdCover")], title_pg)
+            ),
+            &[("rIdCover", "header", "Cover banner")],
+        )
+    };
+
+    let declared = parse_flow_page(&package(true));
+    assert_eq!(
+        declared
+            .first_header
+            .as_ref()
+            .map(header_footer_text)
+            .as_deref(),
+        Some("Cover banner"),
+        "titlePg with a first story resolves it"
+    );
+
+    let undeclared = parse_flow_page(&package(false));
+    assert!(
+        undeclared.first_header.is_none(),
+        "a first story without titlePg is not a first-page story"
+    );
+}
+
+#[test]
+fn a_title_page_header_is_emitted_as_a_per_page_choice() {
+    // The two stories become one `header:` value that asks which page it is
+    // on, rather than the section committing to a single story (issue #846).
+    let data = build_docx_with_title_page(true);
+    let (document, _warnings) = DocxParser
+        .parse(&data, &ConvertOptions::default())
+        .expect("document parses");
+    let source = crate::internal::generate_typst(&document)
+        .expect("document generates")
+        .source;
+
+    assert!(
+        source.contains("header: context { if here().page() =="),
+        "the header must choose per page, got:\n{source}"
+    );
+    assert!(
+        source.contains("query(<o2p-sec-0>).first().location().page()"),
+        "the choice resolves the section's own first page, got:\n{source}"
+    );
+    assert!(
+        source.contains("#metadata(none) <o2p-sec-0>"),
+        "the section must label its first page, got:\n{source}"
+    );
+    let cover = source.find("Cover banner").expect("first story present");
+    let rest = source
+        .find("Every other page")
+        .expect("default story present");
+    assert!(
+        cover < rest,
+        "the first-page story is the `if` branch and the default the `else`"
+    );
+}
+
+#[test]
+fn a_section_with_only_a_first_page_header_still_emits_it() {
+    // A `w:titlePg` section may declare just the `first` story, meaning later
+    // pages carry no header at all. The page-setup shortcut used to ask only
+    // about the default stories and would have dropped this one (issue #846).
+    let data = build_docx_with_title_page(true);
+    let (mut document, _warnings) = DocxParser
+        .parse(&data, &ConvertOptions::default())
+        .expect("document parses");
+    if let Some(crate::ir::Page::Flow(page)) = document.pages.first_mut() {
+        page.header = None;
+        page.footer = None;
+    }
+    let source = crate::internal::generate_typst(&document)
+        .expect("document generates")
+        .source;
+    assert!(
+        source.contains("Cover only") || source.contains("Cover banner"),
+        "a first-only header must still reach the page setup, got:\n{source}"
+    );
+}
+
+// ----- A `w:titlePg` page without its own `first` story (issue #2224) -----
+
+/// A package whose `document.xml` body is written verbatim, with one header or
+/// footer part per `(relationship id, "header" | "footer", story text)` and one
+/// story paragraph per line of that text.
+///
+/// Raw XML because docx-rs's builder can neither close a section mid-body nor
+/// set `w:titlePg` without also stating a `first` story.
+fn build_docx_with_section_stories(body_xml: &str, stories: &[(&str, &str, &str)]) -> Vec<u8> {
+    use std::io::Write;
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = SimpleFileOptions::default();
+
+    let overrides: String = stories
+        .iter()
+        .map(|(id, kind, _)| {
+            format!(
+                r#"<Override PartName="/word/{id}.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.{kind}+xml"/>"#
+            )
+        })
+        .collect();
+    zip.start_file("[Content_Types].xml", opts).unwrap();
+    zip.write_all(
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  {overrides}
+</Types>"#
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+
+    zip.start_file("_rels/.rels", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#,
+    )
+    .unwrap();
+
+    let relationships: String = stories
+        .iter()
+        .map(|(id, kind, _)| {
+            format!(
+                r#"<Relationship Id="{id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/{kind}" Target="{id}.xml"/>"#
+            )
+        })
+        .collect();
+    zip.start_file("word/_rels/document.xml.rels", opts)
+        .unwrap();
+    zip.write_all(
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{relationships}</Relationships>"#
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+
+    for (id, kind, text) in stories {
+        let root: &str = if *kind == "header" { "hdr" } else { "ftr" };
+        let paragraphs: String = text
+            .split('\n')
+            .map(|line| format!("<w:p><w:r><w:t>{line}</w:t></w:r></w:p>"))
+            .collect();
+        zip.start_file(format!("word/{id}.xml"), opts).unwrap();
+        zip.write_all(
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:{root} xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{paragraphs}</w:{root}>"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    }
+
+    zip.start_file("word/document.xml", opts).unwrap();
+    zip.write_all(
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:body>{body_xml}</w:body>
+</w:document>"#
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+
+    zip.finish().unwrap().into_inner()
+}
+
+/// A section's `w:sectPr`: its story references, then `w:titlePg` if asked.
+fn section_properties_xml(references: &[(&str, &str, &str)], title_pg: bool) -> String {
+    let references: String = references
+        .iter()
+        .map(|(element, story_type, id)| {
+            format!(r#"<w:{element} w:type="{story_type}" r:id="{id}"/>"#)
+        })
+        .collect();
+    let title_pg: &str = if title_pg { "<w:titlePg/>" } else { "" };
+    format!(
+        r#"<w:sectPr>{references}<w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/>{title_pg}</w:sectPr>"#
+    )
+}
+
+/// Every section's flow page, in document order.
+fn parse_flow_pages(data: &[u8]) -> Vec<FlowPage> {
+    let (doc, _warnings) = DocxParser
+        .parse(data, &ConvertOptions::default())
+        .expect("document parses");
+    doc.pages
+        .iter()
+        .map(|page| match page {
+            Page::Flow(flow) | Page::FlowContinuous(flow) => flow.clone(),
+            other => panic!("expected a flow page, got {other:?}"),
+        })
+        .collect()
+}
+
+/// The concatenated text of every run the compiled document places on a page.
+#[cfg(not(target_arch = "wasm32"))]
+fn compiled_page_text(data: &[u8], page_index: usize) -> String {
+    let (document, _warnings) = DocxParser
+        .parse(data, &ConvertOptions::default())
+        .expect("document parses");
+    let source = crate::internal::generate_typst(&document)
+        .expect("document generates")
+        .source;
+    crate::render::pdf::compiled_text_runs(&source, page_index)
+        .expect("document compiles")
+        .into_iter()
+        .map(|run| run.text)
+        .collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_title_page_without_a_first_story_prints_neither_running_story_on_page_one() {
+    // Word's references for a one-section document with `w:titlePg` and only
+    // `default` references leave page one's header and footer blank and print
+    // them from page two on (docxide-pdf `k4_regulations_synthesis_document`,
+    // `mongolian_human_rights_law`). Page one used to take the default story.
+    let section = section_properties_xml(
+        &[
+            ("headerReference", "default", "rIdHead"),
+            ("footerReference", "default", "rIdFoot"),
+        ],
+        true,
+    );
+    let data = build_docx_with_section_stories(
+        &format!(
+            r#"<w:p><w:r><w:t>Cover page</w:t></w:r></w:p>
+<w:p><w:r><w:br w:type="page"/><w:t>Second page</w:t></w:r></w:p>{section}"#
+        ),
+        &[
+            ("rIdHead", "header", "Running head"),
+            ("rIdFoot", "footer", "Running foot"),
+        ],
+    );
+
+    let page_one = compiled_page_text(&data, 0);
+    assert!(page_one.contains("Cover page"), "page one: {page_one:?}");
+    assert!(
+        !page_one.contains("Running head") && !page_one.contains("Running foot"),
+        "a title page with no first story prints no running story, got {page_one:?}"
+    );
+    let page_two = compiled_page_text(&data, 1);
+    assert!(
+        page_two.contains("Running head") && page_two.contains("Running foot"),
+        "later pages keep the default stories, got {page_two:?}"
+    );
+}
+
+#[test]
+fn a_title_page_without_a_first_story_resolves_a_blank_one() {
+    // The parser side of the rule above: `w:titlePg` with no `first`
+    // reference anywhere in the chain is a first-page story with no content,
+    // which is not the same as having no first-page story at all.
+    let section = section_properties_xml(
+        &[
+            ("headerReference", "default", "rIdHead"),
+            ("footerReference", "default", "rIdFoot"),
+        ],
+        true,
+    );
+    let data = build_docx_with_section_stories(
+        &format!(r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p>{section}"#),
+        &[
+            ("rIdHead", "header", "Running head"),
+            ("rIdFoot", "footer", "Running foot"),
+        ],
+    );
+
+    let page = parse_flow_page(&data);
+    for (name, story) in [
+        ("header", page.first_header.as_ref()),
+        ("footer", page.first_footer.as_ref()),
+    ] {
+        let story = story.unwrap_or_else(|| panic!("titlePg must resolve a first {name}"));
+        assert!(
+            story.paragraphs.is_empty() && story.shapes.is_empty(),
+            "the first {name} is blank, got {:?}",
+            header_footer_text(story)
+        );
+    }
+    assert_eq!(
+        page.header.as_ref().map(header_footer_text).as_deref(),
+        Some("Running head")
+    );
+    assert_eq!(
+        page.footer.as_ref().map(header_footer_text).as_deref(),
+        Some("Running foot")
+    );
+
+    // Without `w:titlePg` nothing changes: every page takes the default.
+    let section = section_properties_xml(
+        &[
+            ("headerReference", "default", "rIdHead"),
+            ("footerReference", "default", "rIdFoot"),
+        ],
+        false,
+    );
+    let data = build_docx_with_section_stories(
+        &format!(r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p>{section}"#),
+        &[
+            ("rIdHead", "header", "Running head"),
+            ("rIdFoot", "footer", "Running foot"),
+        ],
+    );
+    let page = parse_flow_page(&data);
+    assert!(page.first_header.is_none() && page.first_footer.is_none());
+}
+
+#[test]
+fn a_title_page_section_links_its_first_stories_to_the_previous_section() {
+    // ECMA-376 links each header/footer type to the previous section's story
+    // of the same type when a section omits it, and Word's references for
+    // docxide-pdf `cont-first-*` show the inherited `first` header on the
+    // second section's first page (issue #2254). So a later title-page section
+    // without `first` references takes the earlier section's, and only the
+    // first section in a chain without one falls to a blank story.
+    let stories: &[(&str, &str, &str)] = &[
+        ("rIdCoverHead", "header", "Cover head"),
+        ("rIdCoverFoot", "footer", "Cover foot"),
+        ("rIdHead", "header", "Running head"),
+        ("rIdFoot", "footer", "Running foot"),
+        ("rIdOwnHead", "header", "Own cover head"),
+    ];
+    let defaults = [
+        ("headerReference", "default", "rIdHead"),
+        ("footerReference", "default", "rIdFoot"),
+    ];
+    let with_cover = section_properties_xml(
+        &[
+            ("headerReference", "first", "rIdCoverHead"),
+            ("footerReference", "first", "rIdCoverFoot"),
+            defaults[0],
+            defaults[1],
+        ],
+        true,
+    );
+    let two_sections = |first_section: &str, second_section: &str| {
+        build_docx_with_section_stories(
+            &format!(
+                r#"<w:p><w:pPr>{first_section}</w:pPr><w:r><w:t>One</w:t></w:r></w:p>
+<w:p><w:r><w:t>Two</w:t></w:r></w:p>{second_section}"#
+            ),
+            stories,
+        )
+    };
+    let first_texts = |page: &FlowPage| {
+        (
+            page.first_header.as_ref().map(header_footer_text),
+            page.first_footer.as_ref().map(header_footer_text),
+        )
+    };
+
+    // No references of its own: both first stories come from section one.
+    let pages = parse_flow_pages(&two_sections(
+        &with_cover,
+        &section_properties_xml(&[], true),
+    ));
+    assert_eq!(
+        first_texts(&pages[1]),
+        (
+            Some("Cover head".to_string()),
+            Some("Cover foot".to_string())
+        )
+    );
+
+    // Only the default references: the omitted `first` types still link.
+    let pages = parse_flow_pages(&two_sections(
+        &with_cover,
+        &section_properties_xml(&defaults, true),
+    ));
+    assert_eq!(
+        first_texts(&pages[1]),
+        (
+            Some("Cover head".to_string()),
+            Some("Cover foot".to_string())
+        )
+    );
+
+    // A stated `first` header wins over the link; the omitted footer links.
+    let pages = parse_flow_pages(&two_sections(
+        &with_cover,
+        &section_properties_xml(&[("headerReference", "first", "rIdOwnHead")], true),
+    ));
+    assert_eq!(
+        first_texts(&pages[1]),
+        (
+            Some("Own cover head".to_string()),
+            Some("Cover foot".to_string())
+        )
+    );
+
+    // Nothing earlier to link to: section two's first page is blank.
+    let pages = parse_flow_pages(&two_sections(
+        &section_properties_xml(&defaults, true),
+        &section_properties_xml(&defaults, true),
+    ));
+    assert_eq!(
+        first_texts(&pages[1]),
+        (Some(String::new()), Some(String::new()))
+    );
+
+    // The link runs through sections that do not show their first stories: a
+    // section without `w:titlePg` still passes on the one it states, and one
+    // with no references passes on what it linked to.
+    let without_title_pg = section_properties_xml(
+        &[
+            ("headerReference", "first", "rIdCoverHead"),
+            ("footerReference", "first", "rIdCoverFoot"),
+            defaults[0],
+            defaults[1],
+        ],
+        false,
+    );
+    let pages = parse_flow_pages(&build_docx_with_section_stories(
+        &format!(
+            r#"<w:p><w:pPr>{without_title_pg}</w:pPr><w:r><w:t>One</w:t></w:r></w:p>
+<w:p><w:pPr>{}</w:pPr><w:r><w:t>Two</w:t></w:r></w:p>
+<w:p><w:r><w:t>Three</w:t></w:r></w:p>{}"#,
+            section_properties_xml(&[], false),
+            section_properties_xml(&[], true),
+        ),
+        stories,
+    ));
+    assert_eq!(first_texts(&pages[0]), (None, None));
+    assert_eq!(first_texts(&pages[1]), (None, None));
+    assert_eq!(
+        first_texts(&pages[2]),
+        (
+            Some("Cover head".to_string()),
+            Some("Cover foot".to_string())
+        )
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_continuous_sections_later_pages_leave_its_first_story_out_of_the_margin() {
+    // A continuous section sets its page up again after each page break it
+    // holds. That page is never the section's first, so it shows the default
+    // header, and the body starts under that story alone. A linked first story
+    // taller than its band used to lower the body there too, once a title-page
+    // section without its own `first` reference linked one (issue #2224).
+    let continuous_section = |title_pg: bool| {
+        section_properties_xml(&[], title_pg)
+            .replace("<w:sectPr>", r#"<w:sectPr><w:type w:val="continuous"/>"#)
+    };
+    let package = |title_pg: bool| {
+        build_docx_with_section_stories(
+            &format!(
+                r#"<w:p><w:pPr>{}</w:pPr><w:r><w:t>Cover body</w:t></w:r></w:p>
+<w:p><w:r><w:t>Before the break</w:t></w:r></w:p>
+<w:p><w:r><w:br w:type="page"/><w:t>After the break</w:t></w:r></w:p>{}"#,
+                section_properties_xml(
+                    &[
+                        ("headerReference", "first", "rIdTall"),
+                        ("headerReference", "default", "rIdHead"),
+                    ],
+                    true,
+                ),
+                continuous_section(title_pg),
+            ),
+            &[
+                (
+                    "rIdTall",
+                    "header",
+                    "Cover one\nCover two\nCover three\nCover four\nCover five",
+                ),
+                ("rIdHead", "header", "Running head"),
+            ],
+        )
+    };
+    let after_break_baseline = |title_pg: bool| {
+        let (document, _warnings) = DocxParser
+            .parse(&package(title_pg), &ConvertOptions::default())
+            .expect("document parses");
+        let source = crate::internal::generate_typst(&document)
+            .expect("document generates")
+            .source;
+        let runs = crate::render::pdf::compiled_text_runs(&source, 1).expect("document compiles");
+        assert!(
+            runs.iter().any(|run| run.text.contains("Running head")),
+            "the continuation page shows the default header, got {runs:?}"
+        );
+        runs.iter()
+            .find(|run| run.text.contains("After the break"))
+            .map(|run| run.baseline_pt)
+            .unwrap_or_else(|| panic!("no body line on the continuation page: {runs:?}"))
+    };
+
+    let linked = after_break_baseline(true);
+    let control = after_break_baseline(false);
+    assert!(
+        (linked - control).abs() < 0.01,
+        "the linked first story moved the continuation page's body from \
+         {control}pt to {linked}pt"
+    );
+}
+
+// ----- A continuous section's first page is where its first line lands (issue #2254) -----
+
+/// A two-section package on A4 with 72pt margins, whose 697.9pt body holds 43
+/// exact 16pt lines. Section one states the cover and running stories and
+/// `w:titlePg`, and ends with its `lines`-th line. The continuous second
+/// section closes with `second_section` and holds `continued` lines. The
+/// cover stories, and any `rIdOwnCover` the second section states, carry
+/// their names as text. The body declares Times New Roman, which resolves
+/// through Liberation Serif or Tinos where the native face is absent: an
+/// exact line keeps its height only for a declared face whose metrics resolve.
+fn continuous_title_page_package(
+    lines: usize,
+    continued: &[&str],
+    second_section: &str,
+) -> Vec<u8> {
+    let spacing = r#"<w:spacing w:before="0" w:after="0" w:line="320" w:lineRule="exact"/>"#;
+    let font = r#"<w:rPr><w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman"/></w:rPr>"#;
+    let first_section = section_properties_xml(
+        &[
+            ("headerReference", "first", "rIdCoverHead"),
+            ("footerReference", "first", "rIdCoverFoot"),
+            ("headerReference", "default", "rIdHead"),
+            ("footerReference", "default", "rIdFoot"),
+        ],
+        true,
+    );
+    let mut body = String::new();
+    for line in 1..=lines {
+        let mark: &str = if line == lines { &first_section } else { "" };
+        body.push_str(&format!(
+            r#"<w:p><w:pPr>{spacing}{mark}</w:pPr><w:r>{font}<w:t>Line {line}</w:t></w:r></w:p>"#
+        ));
+    }
+    for text in continued {
+        body.push_str(&format!(
+            r#"<w:p><w:pPr>{spacing}</w:pPr><w:r>{font}<w:t>{text}</w:t></w:r></w:p>"#
+        ));
+    }
+    body.push_str(
+        &second_section.replace("<w:sectPr>", r#"<w:sectPr><w:type w:val="continuous"/>"#),
+    );
+    build_docx_with_section_stories(
+        &body,
+        &[
+            ("rIdCoverHead", "header", "Cover head"),
+            ("rIdCoverFoot", "footer", "Cover foot"),
+            ("rIdHead", "header", "Running head"),
+            ("rIdFoot", "footer", "Running foot"),
+            ("rIdOwnCover", "header", "Own cover head"),
+        ],
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_continuous_title_page_section_shows_its_first_stories_where_its_first_line_lands() {
+    // Word's references for docxide-pdf `cont-first-*` give a continuous
+    // `w:titlePg` section's first-page stories to the page its first line
+    // lands on. When that line no longer fits under the previous section,
+    // the next page is the section's first page; when it fits, the shared
+    // page belongs to the previous section and later pages print the
+    // default stories. Our pages used to consult only the first section.
+    let linked = section_properties_xml(&[], true);
+    let opening = ["Opening line", "Second line", "Third line"];
+
+    // The opening line does not fit under 43 lines: page two is the second
+    // section's first page, and page three is not.
+    let data = continuous_title_page_package(43, &opening, &linked);
+    let page_two = compiled_page_text(&data, 1);
+    assert!(
+        page_two.contains("Opening line")
+            && page_two.contains("Cover head")
+            && page_two.contains("Cover foot"),
+        "page two opens the second section and takes its first stories, got {page_two:?}"
+    );
+    assert!(
+        !page_two.contains("Running head") && !page_two.contains("Running foot"),
+        "page two prints no default story, got {page_two:?}"
+    );
+    let data = continuous_title_page_package(
+        43,
+        &opening
+            .iter()
+            .copied()
+            .chain((1..=43).map(|_| "Filler"))
+            .collect::<Vec<_>>(),
+        &linked,
+    );
+    let page_three = compiled_page_text(&data, 2);
+    assert!(
+        page_three.contains("Running head") && page_three.contains("Running foot"),
+        "page three is not the second section's first page, got {page_three:?}"
+    );
+
+    // Under 42 lines the opening line fits, so page one is the second
+    // section's first page too, and page two, where its third line lands,
+    // takes the default stories.
+    let data = continuous_title_page_package(42, &opening, &linked);
+    let page_two = compiled_page_text(&data, 1);
+    assert!(
+        page_two.contains("Third line")
+            && page_two.contains("Running head")
+            && page_two.contains("Running foot")
+            && !page_two.contains("Cover"),
+        "a section that began on page one shows its default stories on page two, got {page_two:?}"
+    );
+
+    // Without `w:titlePg` the section has no first page of its own.
+    let data = continuous_title_page_package(43, &opening, &section_properties_xml(&[], false));
+    let page_two = compiled_page_text(&data, 1);
+    assert!(
+        page_two.contains("Running head") && !page_two.contains("Cover"),
+        "a section without w:titlePg prints its default stories, got {page_two:?}"
+    );
+
+    // A first story the section states itself is the one its first page shows,
+    // while the omitted footer still links to section one's.
+    let own_cover = section_properties_xml(&[("headerReference", "first", "rIdOwnCover")], true);
+    let data = continuous_title_page_package(43, &opening, &own_cover);
+    let page_two = compiled_page_text(&data, 1);
+    assert!(
+        page_two.contains("Own cover head") && page_two.contains("Cover foot"),
+        "the second section's first page shows its own first header, got {page_two:?}"
+    );
+
+    // A page the two sections share belongs to the first one: page one shows
+    // its cover story, not the second section's, and so does a later shared
+    // page show its default story.
+    let data = continuous_title_page_package(42, &opening, &own_cover);
+    let page_one = compiled_page_text(&data, 0);
+    assert!(
+        page_one.contains("Opening line")
+            && page_one.contains("Cover head")
+            && !page_one.contains("Own cover head"),
+        "the shared page keeps section one's first header, got {page_one:?}"
+    );
+    let page_two = compiled_page_text(&data, 1);
+    assert!(
+        page_two.contains("Running head") && !page_two.contains("Cover"),
+        "page two is neither section's first page, got {page_two:?}"
+    );
+    let data = continuous_title_page_package(53, &opening, &own_cover);
+    let page_two = compiled_page_text(&data, 1);
+    assert!(
+        page_two.contains("Line 53")
+            && page_two.contains("Opening line")
+            && page_two.contains("Running head")
+            && !page_two.contains("Cover"),
+        "a section beginning mid-page leaves that page to section one, got {page_two:?}"
+    );
+}
+
+// ----- Hangul wrap follows the same defined-style trigger (issue #833) -----
+
+/// A pure-Hangul sentence — no digit/Latin boundary, so the auto-space pass
+/// leaves it byte-identical and the assertions below see only the wrap frames.
+const HANGUL_WRAP_SENTENCE: &str = "본 계약은 갑과 을이";
+
+/// Framing puts each multi-syllable eojeol alone inside a bracket pair
+/// (`…#box(…)[#text(…)[계약은]]…`), where the unframed sentence emits as one
+/// span (`[본 계약은 갑과 을이]`) — so this substring appears iff framed.
+const FRAMED_EOJEOL: &str = "[계약은]";
+
+/// End-to-end: package bytes through the parser and the Typst generator, so
+/// the assertion sees the frames a paragraph would actually wrap with.
+fn typst_source_for(styles_xml: &str, body_xml: &str) -> String {
+    let (doc, _warnings) = DocxParser
+        .parse(
+            &build_docx_with_raw_styles(styles_xml, body_xml),
+            &ConvertOptions::default(),
+        )
+        .expect("document parses");
+    crate::internal::generate_typst(&doc)
+        .expect("document generates")
+        .source
+}
+
+#[test]
+fn a_bare_hangul_paragraph_gets_no_eojeol_frames_without_a_defined_default_style() {
+    // The #833 probe series: the report's bare 9pt note breaks `표시되어야`
+    // after `표` in native Word (GT line 1 ends at 523.68pt), and so does the
+    // same text at 10.5pt, without italic, and without its final stop — while
+    // re-exporting the same bytes plus only a default-style definition keeps
+    // the eojeol whole with `표` declined at 524.1pt of a 524.45pt measure.
+    // Word's built-in Korean Normal breaks Hangul at character level; every
+    // paragraph #626 measured as eojeol-whole is `ListParagraph`-styled.
+    let source = typst_source_for(
+        CORPUS_SHAPED_STYLES,
+        &format!("<w:p>{}</w:p>", korean_run_xml(HANGUL_WRAP_SENTENCE)),
+    );
+
+    assert!(
+        source.contains(HANGUL_WRAP_SENTENCE),
+        "a bare paragraph keeps syllable-level break opportunities: {source}"
+    );
+    assert!(
+        !source.contains(FRAMED_EOJEOL),
+        "no eojeol frame may reach a bare paragraph: {source}"
+    );
+}
+
+#[test]
+fn a_style_referencing_hangul_paragraph_keeps_its_eojeol_frames() {
+    // Probe F2: `w:pStyle="ListParagraph"` alone — no numbering — keeps
+    // `정함을` whole with 24.85pt to spare, in the same package whose bare
+    // control breaks mid-word. Probe F7 measures the same for `Heading6`, so
+    // the trigger is any resolvable style, not the list machinery.
+    let body = format!(
+        r#"<w:p><w:pPr><w:pStyle w:val="ListParagraph"/></w:pPr>{}</w:p>"#,
+        korean_run_xml(HANGUL_WRAP_SENTENCE)
+    );
+    let source = typst_source_for(CORPUS_SHAPED_STYLES, &body);
+
+    assert!(
+        source.contains(FRAMED_EOJEOL),
+        "a defined, referenced style keeps each eojeol whole: {source}"
+    );
+}
+
+#[test]
+fn a_bare_hangul_paragraph_keeps_its_eojeol_frames_when_a_default_style_is_defined() {
+    // Probe G1: adding only a default-style definition to the report package
+    // flips its bare note paragraph from breaking after `표` to keeping
+    // `표시되어야` whole — the leg every real Word-authored document is on,
+    // since Word always writes a `Normal` definition.
+    let source = typst_source_for(
+        DEFAULT_STYLE_DEFINING_STYLES,
+        &format!("<w:p>{}</w:p>", korean_run_xml(HANGUL_WRAP_SENTENCE)),
+    );
+
+    assert!(
+        source.contains(FRAMED_EOJEOL),
+        "a defined default style keeps each eojeol whole: {source}"
+    );
+}
+
+#[test]
+fn an_unresolvable_pstyle_gets_no_eojeol_frames() {
+    // Probe F8: a `w:pStyle` naming a style the document never defines wraps
+    // exactly like the bare control — mid-word — so resolution, not the mere
+    // presence of the reference, is what replaces the built-in Korean Normal.
+    let body = format!(
+        r#"<w:p><w:pPr><w:pStyle w:val="NoSuchStyle"/></w:pPr>{}</w:p>"#,
+        korean_run_xml(HANGUL_WRAP_SENTENCE)
+    );
+    let source = typst_source_for(CORPUS_SHAPED_STYLES, &body);
+
+    assert!(
+        !source.contains(FRAMED_EOJEOL),
+        "an unresolvable style reference is the same as no style: {source}"
+    );
+}
+
+#[test]
+fn a_bare_cell_hangul_paragraph_gets_no_eojeol_frames_without_a_defined_default_style() {
+    // Probe H2: a bare cell paragraph in the no-default-style package breaks
+    // `목적으로` after `목` at the cell's own measure — the cell follows the
+    // same style rule as the body, as it does for the auto space (#627, #732).
+    let source = typst_source_for(
+        CORPUS_SHAPED_STYLES,
+        &nested_cell_body_xml(HANGUL_WRAP_SENTENCE, 1),
+    );
+
+    assert!(
+        source.contains(HANGUL_WRAP_SENTENCE),
+        "a bare cell paragraph keeps syllable-level break opportunities: {source}"
+    );
+    assert!(
+        !source.contains(FRAMED_EOJEOL),
+        "no eojeol frame may reach a bare cell paragraph: {source}"
+    );
+}
+
+#[test]
+fn an_explicit_word_wrap_keeps_eojeol_frames_on_a_bare_paragraph() {
+    // Direct formatting outranks the style chain it overrides (issue #730's
+    // `w:val="0"` is checked first for the same reason), so an explicit
+    // `w:wordWrap w:val="1"` restores word-level wrapping even where the
+    // built-in Korean Normal would break characters.
+    let body = format!(
+        r#"<w:p><w:pPr><w:wordWrap w:val="1"/></w:pPr>{}</w:p>"#,
+        korean_run_xml(HANGUL_WRAP_SENTENCE)
+    );
+    let source = typst_source_for(CORPUS_SHAPED_STYLES, &body);
+
+    assert!(
+        source.contains(FRAMED_EOJEOL),
+        "an explicit word-level wrap request keeps the frames: {source}"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_header_tab_before_a_centre_stop_centres_its_text_on_that_stop() {
+    // Word's Header style declares a centre and a right stop, and a centred
+    // running head is typed as `<tab>Title`, which Word saves as one run. The
+    // tab advances to the centre stop, the first one past the pen. Header
+    // tabs were matched against running-head shapes instead, and a lone tab
+    // with a right stop last went to the right margin (issue #1821). The same
+    // paragraph in the body is the reference: both must land on one x.
+    let centred_head = || {
+        docx_rs::Paragraph::new()
+            .add_tab(
+                docx_rs::Tab::new()
+                    .val(docx_rs::TabValueType::Center)
+                    .pos(4153),
+            )
+            .add_tab(
+                docx_rs::Tab::new()
+                    .val(docx_rs::TabValueType::Right)
+                    .pos(8306),
+            )
+            .add_run(docx_rs::Run::new().add_tab().add_text("{Title}"))
+    };
+    let docx = docx_rs::Docx::new()
+        .header(docx_rs::Header::new().add_paragraph(centred_head()))
+        .add_paragraph(centred_head());
+    let mut cursor = Cursor::new(Vec::new());
+    docx.build().pack(&mut cursor).unwrap();
+    let data: Vec<u8> = cursor.into_inner();
+
+    let left_margin: f64 = parse_flow_page(&data).margins.left;
+    let (document, _warnings) = DocxParser
+        .parse(&data, &ConvertOptions::default())
+        .expect("document parses");
+    let source: String = crate::internal::generate_typst(&document)
+        .expect("document generates")
+        .source;
+    let mut placed: Vec<(f64, f64)> = crate::render::pdf::compiled_text_runs(&source, 0)
+        .unwrap()
+        .into_iter()
+        .filter(|run| run.text == "{Title}")
+        .map(|run| (run.baseline_pt, run.left_pt))
+        .collect();
+    placed.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let [(_, header_x), (_, body_x)] = placed[..] else {
+        panic!("expected the title in the header and in the body, got {placed:?}");
+    };
+
+    let centre_stop: f64 = left_margin + 4153.0 / 20.0;
+    assert!(
+        (centre_stop - 40.0..centre_stop).contains(&body_x),
+        "the body centres the title on the {centre_stop}pt stop: {body_x}pt"
+    );
+    assert!(
+        (header_x - body_x).abs() < 0.01,
+        "the header title starts at {header_x}pt, the body's at {body_x}pt"
+    );
+}
+
+/// A package whose section references one header part, with both the styles
+/// part and the header part written out verbatim.
+fn build_docx_with_raw_header_styles(styles_xml: &str, header_xml: &str) -> Vec<u8> {
+    use std::io::Write;
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = SimpleFileOptions::default();
+
+    zip.start_file("[Content_Types].xml", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+  <Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>
+</Types>"#,
+    )
+    .unwrap();
+
+    zip.start_file("_rels/.rels", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#,
+    )
+    .unwrap();
+
+    zip.start_file("word/_rels/document.xml.rels", opts)
+        .unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+  <Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>
+</Relationships>"#,
+    )
+    .unwrap();
+
+    zip.start_file("word/styles.xml", opts).unwrap();
+    zip.write_all(styles_xml.as_bytes()).unwrap();
+
+    zip.start_file("word/header1.xml", opts).unwrap();
+    zip.write_all(
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{header_xml}</w:hdr>"#
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+
+    zip.start_file("word/document.xml", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:body>
+    <w:p><w:r><w:t>Body text under the running head.</w:t></w:r></w:p>
+    <w:sectPr>
+      <w:headerReference w:type="default" r:id="rId9"/>
+      <w:pgSz w:w="11906" w:h="16838"/>
+      <w:pgMar w:top="1440" w:right="1800" w:bottom="1440" w:left="1800" w:header="851" w:footer="992" w:gutter="0"/>
+    </w:sectPr>
+  </w:body>
+</w:document>"#,
+    )
+    .unwrap();
+
+    zip.finish().unwrap().into_inner()
+}
+
+/// zh-CN Word's built-in Header style: centred, ruled off with a bottom
+/// border, centre and right stops, 9pt.
+const ZH_HEADER_STYLE_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:sz w:val="21"/></w:rPr></w:rPrDefault><w:pPrDefault/></w:docDefaults>
+  <w:style w:type="paragraph" w:default="1" w:styleId="a"><w:name w:val="Normal"/></w:style>
+  <w:style w:type="paragraph" w:styleId="a3"><w:name w:val="header"/><w:basedOn w:val="a"/>
+    <w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr>
+      <w:tabs><w:tab w:val="center" w:pos="4153"/><w:tab w:val="right" w:pos="8306"/></w:tabs>
+      <w:jc w:val="center"/></w:pPr>
+    <w:rPr><w:sz w:val="18"/></w:rPr></w:style>
+</w:styles>"#;
+
+/// The same document with no Header style: the paragraph states every one of
+/// those properties itself.
+const NO_HEADER_STYLE_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:sz w:val="21"/></w:rPr></w:rPrDefault><w:pPrDefault/></w:docDefaults>
+  <w:style w:type="paragraph" w:default="1" w:styleId="a"><w:name w:val="Normal"/></w:style>
+</w:styles>"#;
+
+#[test]
+fn a_header_paragraph_resolves_its_paragraph_style() {
+    // zh-CN Word's built-in Header style carries the centring, the rule, the
+    // running-head stops and the 9pt size. A header paragraph that states
+    // only `w:pStyle` was given none of them, because `convert_hf_paragraph`
+    // resolved no style at all (issue #1822).
+    let data = build_docx_with_raw_header_styles(
+        ZH_HEADER_STYLE_STYLES,
+        r#"<w:p><w:pPr><w:pStyle w:val="a3"/></w:pPr><w:r><w:t>Quarterly Report</w:t></w:r></w:p>"#,
+    );
+    let page = parse_flow_page(&data);
+    let header = page.header.as_ref().expect("default header");
+    let paragraph = &header.paragraphs[0];
+
+    assert_eq!(
+        paragraph.style.alignment,
+        Some(Alignment::Center),
+        "the Header style's w:jc must reach the paragraph"
+    );
+    assert_eq!(
+        paragraph.style.tab_stops.as_deref().map(<[_]>::len),
+        Some(2),
+        "the Header style's centre and right stops must reach the paragraph"
+    );
+    assert!(
+        paragraph
+            .border
+            .as_ref()
+            .and_then(|border| border.bottom.as_ref())
+            .is_some(),
+        "the Header style's bottom rule must reach the paragraph"
+    );
+    let size: Option<f64> = paragraph.elements.iter().find_map(|element| match element {
+        HFInline::Run(run) => run.style.font_size,
+        _ => None,
+    });
+    assert_eq!(
+        size,
+        Some(9.0),
+        "the Header style's w:sz must reach the run"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_style_defined_header_renders_like_the_same_header_stated_directly() {
+    // Whatever a header paragraph inherits has to place its text where the
+    // same properties place it when stated on the paragraph, or the style is
+    // being resolved somewhere other than the body's merge (issue #1822).
+    let styled: Vec<u8> = build_docx_with_raw_header_styles(
+        ZH_HEADER_STYLE_STYLES,
+        r#"<w:p><w:pPr><w:pStyle w:val="a3"/></w:pPr><w:r><w:tab/><w:t>Quarterly Report</w:t></w:r></w:p>"#,
+    );
+    let direct: Vec<u8> = build_docx_with_raw_header_styles(
+        NO_HEADER_STYLE_STYLES,
+        r#"<w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr>
+             <w:tabs><w:tab w:val="center" w:pos="4153"/><w:tab w:val="right" w:pos="8306"/></w:tabs>
+             <w:jc w:val="center"/></w:pPr>
+           <w:r><w:rPr><w:sz w:val="18"/></w:rPr><w:tab/><w:t>Quarterly Report</w:t></w:r></w:p>"#,
+    );
+
+    let placement = |data: &[u8]| -> (f64, usize) {
+        let (document, _warnings) = DocxParser
+            .parse(data, &ConvertOptions::default())
+            .expect("document parses");
+        let source: String = crate::internal::generate_typst(&document)
+            .expect("document generates")
+            .source;
+        let left: f64 = crate::render::pdf::compiled_text_runs(&source, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|run| run.text.contains("Quarterly"))
+            .map(|run| run.left_pt)
+            .fold(f64::INFINITY, f64::min);
+        (left, source.matches("line(length: 100%").count())
+    };
+    let (styled_x, styled_rules) = placement(&styled);
+    let (direct_x, direct_rules) = placement(&direct);
+
+    assert!(
+        direct_x.is_finite() && styled_x.is_finite(),
+        "both headers must render their text"
+    );
+    assert!(
+        (styled_x - direct_x).abs() < 0.01,
+        "the style-defined header starts at {styled_x}pt, the direct one at {direct_x}pt"
+    );
+    assert_eq!(
+        styled_rules, direct_rules,
+        "both headers must draw the same number of rules"
+    );
+}
+
+/// A Times New Roman document whose Normal style is 12pt and whose Header style
+/// adds nothing to it, as in Word's older built-in template.
+const TIMES_HEADER_STYLE_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman"/></w:rPr></w:rPrDefault><w:pPrDefault/></w:docDefaults>
+  <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:rPr><w:sz w:val="24"/></w:rPr></w:style>
+  <w:style w:type="paragraph" w:styleId="Header"><w:name w:val="header"/><w:basedOn w:val="Normal"/></w:style>
+</w:styles>"#;
+
+#[test]
+fn an_empty_header_paragraph_keeps_its_paragraph_mark_style() {
+    // Word gives an empty paragraph one line sized from its paragraph mark,
+    // and the mark resolves through the same cascade a run does: `w:pPr/w:rPr`
+    // over the paragraph style over `w:rPrDefault` (issue #2056). The body
+    // parser has kept it since #1700; the header parser kept nothing, so an
+    // empty header line had no face to measure.
+    let data = build_docx_with_raw_header_styles(
+        TIMES_HEADER_STYLE_STYLES,
+        r#"<w:p><w:pPr><w:pStyle w:val="Header"/></w:pPr><w:r><w:t>Running head</w:t></w:r></w:p>
+           <w:p><w:pPr><w:pStyle w:val="Header"/><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:sz w:val="22"/></w:rPr></w:pPr></w:p>
+           <w:p><w:pPr><w:pStyle w:val="Header"/></w:pPr></w:p>"#,
+    );
+    let page = parse_flow_page(&data);
+    let header = page.header.as_ref().expect("default header");
+    let mark = |index: usize| -> (Option<String>, Option<f64>) {
+        let style = header.paragraphs[index]
+            .style
+            .paragraph_mark_text_style
+            .as_deref()
+            .expect("an empty header paragraph keeps its mark style");
+        (style.font_family.clone(), style.font_size)
+    };
+
+    assert_eq!(
+        mark(1),
+        (Some("Arial".to_string()), Some(11.0)),
+        "the mark's own w:rPr outranks the Header style"
+    );
+    assert_eq!(
+        mark(2),
+        (Some("Times New Roman".to_string()), Some(12.0)),
+        "a bare mark takes the Header style's 12pt and the document's face"
+    );
+}
+
+/// A Times New Roman header of three lines over one empty paragraph whose mark
+/// is `mark_size_half_points`; the first body baseline below it.
+#[cfg(not(target_arch = "wasm32"))]
+fn body_baseline_below_trailing_empty_header_paragraph(mark_size_half_points: u32) -> f64 {
+    let data = build_docx_with_raw_header_styles(
+        TIMES_HEADER_STYLE_STYLES,
+        &format!(
+            r#"<w:p><w:pPr><w:pStyle w:val="Header"/></w:pPr><w:r><w:t>Line one</w:t></w:r></w:p>
+               <w:p><w:pPr><w:pStyle w:val="Header"/></w:pPr><w:r><w:t>Line two</w:t></w:r></w:p>
+               <w:p><w:pPr><w:pStyle w:val="Header"/></w:pPr><w:r><w:t>Line three</w:t></w:r></w:p>
+               <w:p><w:pPr><w:pStyle w:val="Header"/><w:rPr><w:sz w:val="{mark_size_half_points}"/></w:rPr></w:pPr></w:p>"#
+        ),
+    );
+    let (document, _warnings) = DocxParser
+        .parse(&data, &ConvertOptions::default())
+        .expect("document parses");
+    let source: String = crate::internal::generate_typst(&document)
+        .expect("document generates")
+        .source;
+    crate::render::pdf::compiled_text_runs(&source, 0)
+        .unwrap()
+        .into_iter()
+        .find(|run| run.text.contains("Body"))
+        .expect("the body's first line is placed")
+        .baseline_pt
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_trailing_empty_header_paragraph_lowers_the_body_by_its_mark_line() {
+    // `w:header` 42.55pt plus three 12pt Times lines already overflows the
+    // 72pt margin, so the empty paragraph below them sets how far the body
+    // moves: Word's line for the mark's own size (issue #2056).
+    let Some((_, _, pitch_em)) = crate::render::pdf::font_line_metrics_em("Times New Roman") else {
+        return; // the face is unavailable on this runner
+    };
+    let (small_line_pt, large_line_pt) = (10.0 * pitch_em, 20.0 * pitch_em);
+    let small_mark_body_pt: f64 = body_baseline_below_trailing_empty_header_paragraph(20);
+    let large_mark_body_pt: f64 = body_baseline_below_trailing_empty_header_paragraph(40);
+
+    assert!(
+        (large_mark_body_pt - small_mark_body_pt - (large_line_pt - small_line_pt)).abs() < 0.01,
+        "a 20pt empty mark must start the body {}pt below a 10pt one, got \
+         {small_mark_body_pt}pt and {large_mark_body_pt}pt",
+        large_line_pt - small_line_pt
+    );
+}
+
+#[test]
+fn a_multi_line_footer_border_keeps_its_double_rule() {
+    // `FancyFoot.docx` rules its footer off with `thinThickSmallGap`, one of
+    // Word's multi-line border types. Header and footer borders used to be
+    // read by a second extractor that mapped those types to the double rule
+    // while the paragraph one did not; both now share the paragraph
+    // extractor, so the list has to live there (issue #1822).
+    let data = include_bytes!("../../../../tests/fixtures/docx/FancyFoot.docx");
+    let page = parse_flow_page(data);
+    let footer = page.footer.as_ref().expect("default footer");
+    let top = footer
+        .paragraphs
+        .iter()
+        .find_map(|paragraph| paragraph.border.as_ref().and_then(|b| b.top.as_ref()))
+        .expect("the footer paragraph rules itself off along its top edge");
+
+    assert_eq!(top.style, BorderLineStyle::Double);
+    assert_eq!(top.width, 3.0, "w:sz=24 eighths of a point");
+    assert_eq!(top.color, Color::new(0x62, 0x24, 0x23));
+}
+
+/// A package whose header holds two paragraphs, the first optionally ruled off
+/// with `w:pBdr/w:bottom` at `space` points. `w:header` is 851 twips (42.55pt)
+/// under a 72pt top margin, and everything is Arial 10.5pt.
+fn build_docx_with_ruled_header(space: Option<usize>) -> Vec<u8> {
+    let border = space.map_or(String::new(), |space| {
+        format!(
+            r#"<w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="{space}" w:color="auto"/></w:pBdr></w:pPr>"#
+        )
+    });
+    build_docx_with_raw_header_styles(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:sz w:val="21"/></w:rPr></w:rPrDefault><w:pPrDefault/></w:docDefaults>
+  <w:style w:type="paragraph" w:default="1" w:styleId="a"><w:name w:val="Normal"/></w:style>
+</w:styles>"#,
+        &format!(
+            r#"<w:p>{border}<w:r><w:t>Header line one</w:t></w:r></w:p>
+               <w:p><w:r><w:t>Header line two</w:t></w:r></w:p>"#
+        ),
+    )
+}
+
+/// The baselines of the two header lines, in points from the page top.
+#[cfg(not(target_arch = "wasm32"))]
+fn ruled_header_baselines(space: Option<usize>) -> (f64, f64) {
+    let data: Vec<u8> = build_docx_with_ruled_header(space);
+    let (document, _warnings) = DocxParser
+        .parse(&data, &ConvertOptions::default())
+        .expect("document parses");
+    let source: String = crate::internal::generate_typst(&document)
+        .expect("document generates")
+        .source;
+    let runs = crate::render::pdf::compiled_text_runs(&source, 0).unwrap();
+    let find = |needle: &str| -> f64 {
+        runs.iter()
+            .find(|run| run.text.contains(needle))
+            .unwrap_or_else(|| panic!("header line {needle} must render: {runs:?}"))
+            .baseline_pt
+    };
+    (find("one"), find("two"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_header_rule_hangs_below_its_line_without_moving_it() {
+    // Measured on native Word 16.113.1 with this package (issue #1824). Word
+    // seats the ruled line where an unruled one sits, hangs the rule below the
+    // line's bottom edge, and starts the next paragraph under the rule, so the
+    // story advances by the line plus the rule and its `w:space`. Word's
+    // second baseline: 64.56pt bare, 65.28pt at `w:space="0"` and with no
+    // `w:space` at all, 66.24pt at `w:space="1"`, 73.20pt at `w:space="8"` —
+    // the bare line plus the rule's own 0.75pt (`w:sz="6"`) plus the gap.
+    //
+    // The story used to join its paragraphs with a line break, which a ruled
+    // paragraph's block-level stack split into two Typst paragraphs with the
+    // default paragraph gap between them: the second line landed 20.32pt low,
+    // on the first body line, while the taller measured story clamped away the
+    // band shift and lifted the first line 2.49pt.
+    let (bare_first, bare_second) = ruled_header_baselines(None);
+    let (zero_first, zero_second) = ruled_header_baselines(Some(0));
+    let (ruled_first, ruled_second) = ruled_header_baselines(Some(1));
+    let (wide_first, wide_second) = ruled_header_baselines(Some(8));
+    let thickness: f64 = 0.75;
+
+    for (label, first) in [
+        ("w:space=0", zero_first),
+        ("w:space=1", ruled_first),
+        ("w:space=8", wide_first),
+    ] {
+        assert!(
+            (first - bare_first).abs() < 0.01,
+            "{label}: the rule must not move the line it belongs to, {first}pt against an unruled {bare_first}pt"
+        );
+    }
+    for (label, second, reserved) in [
+        ("no w:space", zero_second, thickness),
+        ("w:space=1", ruled_second, thickness + 1.0),
+        ("w:space=8", wide_second, thickness + 8.0),
+    ] {
+        assert!(
+            ((second - bare_second) - reserved).abs() < 0.05,
+            "{label}: the rule pushes the next line down {}pt, Word reserves {reserved}pt",
+            second - bare_second
+        );
+    }
+    // Both stories land on Word's own seat: 52.40pt against 52.56pt and
+    // 66.22pt against 66.24pt, inside the 0.24pt grid the export quantises to.
+    // They used to sit a whole line gap high — 52.06pt at this 10.5pt Arial —
+    // because the header seat omitted it (issue #1640).
+    let export_grid_pt: f64 = 0.24;
+    assert!(
+        (ruled_first - 52.56).abs() < export_grid_pt
+            && (ruled_second - 66.24).abs() < export_grid_pt,
+        "the ruled header lines sit at {ruled_first}pt and {ruled_second}pt, native Word at 52.56pt and 66.24pt"
+    );
+}
+
+const FRAME_TEST_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:docDefaults>
+    <w:rPrDefault><w:rPr><w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman"/></w:rPr></w:rPrDefault>
+    <w:pPrDefault/>
+  </w:docDefaults>
+</w:styles>"#;
+
+/// The body flow's paragraphs across every section, as their text: an empty
+/// paragraph, which the renderer lays out as a blank line, shows as `""`.
+fn body_flow_paragraph_texts(body_xml: &str) -> Vec<String> {
+    let data: Vec<u8> = build_docx_with_raw_styles(FRAME_TEST_STYLES, body_xml);
+    let (doc, _warnings) = DocxParser
+        .parse(&data, &ConvertOptions::default())
+        .expect("document parses");
+    doc.pages
+        .iter()
+        .filter_map(|page| match page {
+            Page::Flow(flow) | Page::FlowContinuous(flow) => Some(&flow.content),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|block| match block {
+            Block::Paragraph(paragraph) => Some(
+                paragraph
+                    .runs
+                    .iter()
+                    .map(|run| run.text.as_str())
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An empty paragraph in a `w:framePr` frame of its own, between two lines.
+/// The mark carries a 14pt `w:rPr` and an empty run, as docxide-pdf's
+/// `empty-frame-control` does, and optionally the section properties that
+/// make it its section's last paragraph.
+fn empty_frame_paragraph_body(frame_xml: &str, section_xml: &str) -> String {
+    format!(
+        r#"<w:p><w:r><w:t>Before</w:t></w:r></w:p>
+<w:p><w:pPr>{frame_xml}<w:rPr><w:sz w:val="28"/></w:rPr>{section_xml}</w:pPr><w:r><w:rPr><w:sz w:val="28"/></w:rPr></w:r></w:p>
+<w:p><w:r><w:t>After</w:t></w:r></w:p>"#
+    )
+}
+
+/// Word lifts a paragraph whose `w:framePr` positions it out of the body flow
+/// into a frame, so an empty one paints nothing and leaves no line behind.
+/// Word's exports of docxide-pdf's `empty-frame-control` and
+/// `cont-first-first-fits` advance the next text as if the paragraph were
+/// absent, whether or not it also ends a section (issue #2161).
+#[test]
+fn an_empty_positioned_frame_paragraph_leaves_no_body_line() {
+    let positioning_frames: [&str; 3] = [
+        r#"<w:framePr w:w="4659" w:wrap="auto" w:hAnchor="text" w:x="1701"/>"#,
+        r#"<w:framePr w:wrap="around" w:vAnchor="page" w:hAnchor="page" w:x="8000" w:y="2000"/>"#,
+        r#"<w:framePr w:w="2000" w:hAnchor="margin" w:xAlign="right"/>"#,
+    ];
+    let section_marks: [&str; 2] = [
+        "",
+        r#"<w:sectPr><w:type w:val="continuous"/><w:pgSz w:w="11906" w:h="16838"/></w:sectPr>"#,
+    ];
+    for frame_xml in positioning_frames {
+        for section_xml in section_marks {
+            assert_eq!(
+                body_flow_paragraph_texts(&empty_frame_paragraph_body(frame_xml, section_xml)),
+                ["Before", "After"],
+                "an empty paragraph in {frame_xml} {section_xml} must not take a body line"
+            );
+        }
+    }
+}
+
+/// Adjacent paragraphs with an identical `w:framePr` share one frame. When
+/// none of them shows anything, Word gives the group no body lines at all:
+/// its exports of docxide-pdf's `empty-margin-frame-14-*` cases set the text
+/// after two or three such paragraphs, empty, space-only or with a hidden
+/// mark, and the last one ending the section, one line below the table
+/// before them, as if they were absent (issue #2231).
+#[test]
+fn a_group_of_framed_paragraphs_that_shows_nothing_leaves_no_body_lines() {
+    let positioning_frames: [&str; 3] = [
+        r#"<w:framePr w:w="4659" w:wrap="auto" w:hAnchor="text" w:x="1701"/>"#,
+        r#"<w:framePr w:wrap="around" w:vAnchor="page" w:hAnchor="page" w:x="8000" w:y="2000"/>"#,
+        r#"<w:framePr w:w="2000" w:hAnchor="margin" w:xAlign="right"/>"#,
+    ];
+    let section_mark: &str =
+        r#"<w:sectPr><w:type w:val="continuous"/><w:pgSz w:w="11906" w:h="16838"/></w:sectPr>"#;
+    for frame_xml in positioning_frames {
+        let empty: String = format!(r#"<w:p><w:pPr>{frame_xml}</w:pPr></w:p>"#);
+        let space_only: String = format!(
+            r#"<w:p><w:pPr>{frame_xml}</w:pPr><w:r><w:t xml:space="preserve"> </w:t></w:r></w:p>"#
+        );
+        let hidden_mark: String =
+            format!(r#"<w:p><w:pPr>{frame_xml}<w:rPr><w:vanish/></w:rPr></w:pPr></w:p>"#);
+        let section_end: String = format!(r#"<w:p><w:pPr>{frame_xml}{section_mark}</w:pPr></w:p>"#);
+        let groups: [(&str, String); 4] = [
+            ("two empty", format!("{empty}{empty}")),
+            (
+                "three empty ending a section",
+                format!("{empty}{empty}{section_end}"),
+            ),
+            (
+                "space-only ending a section",
+                format!("{space_only}{space_only}{section_end}"),
+            ),
+            (
+                "hidden marks",
+                format!("{hidden_mark}{hidden_mark}{hidden_mark}"),
+            ),
+        ];
+        for (label, group) in groups {
+            let body: String = format!(
+                r#"<w:p><w:r><w:t>Before</w:t></w:r></w:p>{group}<w:p><w:r><w:t>After</w:t></w:r></w:p>"#
+            );
+            assert_eq!(
+                body_flow_paragraph_texts(&body),
+                ["Before", "After"],
+                "{label} paragraphs in {frame_xml} must not take body lines"
+            );
+        }
+    }
+}
+
+/// The frames Word does not lift out of the flow keep the empty paragraph's
+/// line: one stating only its wrap, an inline one, one that keeps text off
+/// its sides, and one with a stated height. So does an empty paragraph inside
+/// a frame it shares with paragraphs that show text, where it is a line of
+/// the frame's own text.
+#[test]
+fn an_empty_paragraph_keeps_its_line_when_its_frame_stays_in_the_flow() {
+    let in_flow_frames: [&str; 5] = [
+        r#"<w:framePr w:wrap="auto"/>"#,
+        r#"<w:framePr w:w="4659" w:wrap="auto" w:hAnchor="text" w:x="1701" w:yAlign="inline"/>"#,
+        r#"<w:framePr w:w="4659" w:wrap="notBeside" w:hAnchor="text" w:x="1701"/>"#,
+        r#"<w:framePr w:w="4659" w:wrap="none" w:hAnchor="text" w:x="1701"/>"#,
+        r#"<w:framePr w:w="4659" w:h="600" w:hRule="exact" w:wrap="auto" w:hAnchor="text" w:x="1701"/>"#,
+    ];
+    for frame_xml in in_flow_frames {
+        assert_eq!(
+            body_flow_paragraph_texts(&empty_frame_paragraph_body(frame_xml, "")),
+            ["Before", "", "After"],
+            "an empty paragraph in {frame_xml} must keep its line"
+        );
+    }
+
+    let shared_frame: &str = r#"<w:framePr w:w="4659" w:wrap="auto" w:hAnchor="text" w:x="1701"/>"#;
+    let shared_frame_body: String = format!(
+        r#"<w:p><w:pPr>{shared_frame}</w:pPr><w:r><w:t>Street</w:t></w:r></w:p>
+<w:p><w:pPr>{shared_frame}</w:pPr></w:p>
+<w:p><w:pPr>{shared_frame}</w:pPr><w:r><w:t>City</w:t></w:r></w:p>"#
+    );
+    assert_eq!(
+        body_flow_paragraph_texts(&shared_frame_body),
+        ["Street", "", "City"],
+        "an empty paragraph sharing its frame with its neighbours is one of the frame's lines"
+    );
+    // The frame is the whole run of paragraphs that carry it, so text two
+    // paragraphs away still makes the empty ones its lines.
+    let distant_text_body: String = format!(
+        r#"<w:p><w:pPr>{shared_frame}</w:pPr></w:p>
+<w:p><w:pPr>{shared_frame}</w:pPr></w:p>
+<w:p><w:pPr>{shared_frame}</w:pPr><w:r><w:t>City</w:t></w:r></w:p>"#
+    );
+    assert_eq!(
+        body_flow_paragraph_texts(&distant_text_body),
+        ["", "", "City"],
+        "empty paragraphs sharing a frame with text further along are the frame's lines"
+    );
+
+    // A table whose cell paragraphs carry the frame sits in it too, so an
+    // empty paragraph beside it with the same `w:framePr` is a line of that
+    // framed table's frame, on either side.
+    let framed_table: String = format!(
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid><w:tr><w:tc><w:p><w:pPr>{shared_frame}</w:pPr><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#
+    );
+    let empty_framed: String = format!(r#"<w:p><w:pPr>{shared_frame}</w:pPr></w:p>"#);
+    assert_eq!(
+        body_flow_paragraph_texts(&format!(
+            r#"{framed_table}{empty_framed}<w:p><w:r><w:t>After</w:t></w:r></w:p>"#
+        )),
+        ["", "After"],
+        "an empty paragraph after a table in its frame is one of the frame's lines"
+    );
+    assert_eq!(
+        body_flow_paragraph_texts(&format!(
+            r#"<w:p><w:r><w:t>Before</w:t></w:r></w:p>{empty_framed}{framed_table}"#
+        )),
+        ["Before", ""],
+        "an empty paragraph before a table in its frame is one of the frame's lines"
+    );
+}

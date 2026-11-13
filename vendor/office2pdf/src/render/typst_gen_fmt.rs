@@ -1,0 +1,183 @@
+//! Canonical Typst value formatters shared by the codegen modules.
+//!
+//! New color literals and stroke values in generated Typst source should be
+//! built with these helpers so the output stays uniform and golden tests
+//! don't drift on formatting details.
+
+use crate::ir::{BorderLineStyle, BorderSide, Color, LineCap, LineJoin};
+
+/// Format a Typst `rgb(r, g, b)` color literal.
+pub(super) fn rgb(color: &Color) -> String {
+    format!("rgb({}, {}, {})", color.r, color.g, color.b)
+}
+
+/// Format a Typst `rgb(r, g, b, a)` color literal with an alpha channel.
+pub(super) fn rgb_with_alpha(color: &Color, alpha: u8) -> String {
+    format!("rgb({}, {}, {}, {})", color.r, color.g, color.b, alpha)
+}
+
+/// Format a stroke value: `Wpt + rgb(...)` for plain styles, a
+/// `(paint: ..., thickness: ..., dash: "...")` dict for patterned ones.
+///
+/// `double_is_plain` preserves an existing divergence: table borders render
+/// `Double` as a plain stroke, while shape strokes send it through the dash
+/// dict (where it maps to `dash: "solid"`). Unifying that is a visible-output
+/// change and belongs in its own visually-verified fix.
+pub(super) fn stroke_value(side: &BorderSide, double_is_plain: bool) -> String {
+    let is_plain = match side.style {
+        BorderLineStyle::Solid | BorderLineStyle::None => true,
+        BorderLineStyle::Double => double_is_plain,
+        _ => false,
+    };
+    if is_plain {
+        format!("{}pt + {}", format_f64(side.width), rgb(&side.color))
+    } else {
+        format!(
+            "(paint: {}, thickness: {}pt, dash: \"{}\")",
+            rgb(&side.color),
+            format_f64(side.width),
+            super::border_line_style_to_typst(side.style),
+        )
+    }
+}
+
+/// The dash array for a DrawingML stroke, in points, scaled by the line width.
+///
+/// The `a:prstDash` presets are rhythms in multiples of the line width `w`,
+/// not absolute lengths, so a thin line takes a proportionally short dash.
+/// Typst's named patterns carry fixed point lengths instead, which made a
+/// 0.5pt stroke's `dash` period 6.0pt against GT's 3.5pt (issue #678).
+///
+/// Every multiple below was read off a rendered PDF's `d` operator rather than
+/// quoted from a specification: a deck with one 2pt line per preset, rendered
+/// by LibreOffice 24.2.7.2, emits `2.01256 w` and arrays whose entries divide
+/// by that width to exact integers.
+///
+/// | preset | measured array ÷ w |
+/// | --- | --- |
+/// | `dot` | 1, 3 |
+/// | `sysDot` | 1, 1 |
+/// | `dash` | 4, 3 |
+/// | `sysDash` | 3, 1 |
+/// | `lgDash` | 8, 3 |
+/// | `dashDot` | 4, 3, 1, 3 |
+/// | `sysDashDot` | 3, 1, 1, 1 |
+/// | `lgDashDot` | 8, 3, 1, 3 |
+/// | `lgDashDotDot` | 8, 3, 1, 3, 1, 3 |
+/// | `sysDashDotDot` | 3, 1, 1, 1, 1, 1 |
+///
+/// LibreOffice is a second implementation, not PowerPoint; what it pins down
+/// is the ratio each preset name denotes, which is the part `BorderLineStyle`
+/// has to carry. The `dash` and `dashDot` rows agree with the earlier direct
+/// GT measurement in #678.
+///
+/// Scoped to DrawingML strokes: Word table borders and Excel cell borders
+/// share `BorderLineStyle` but not this rule, so they keep the named patterns.
+/// `DashDotDot` is theirs alone — no preset maps to it — and has no array.
+pub(super) fn drawingml_dash_array_pt(style: BorderLineStyle, width_pt: f64) -> Option<Vec<f64>> {
+    let w = if width_pt > 0.0 {
+        width_pt
+    } else {
+        return None;
+    };
+    let multiples: &[f64] = match style {
+        BorderLineStyle::Dotted => &[1.0, 3.0],
+        BorderLineStyle::SystemDot => &[1.0, 1.0],
+        BorderLineStyle::Dashed => &[4.0, 3.0],
+        BorderLineStyle::SystemDash => &[3.0, 1.0],
+        BorderLineStyle::LargeDash => &[8.0, 3.0],
+        BorderLineStyle::DashDot => &[4.0, 3.0, 1.0, 3.0],
+        BorderLineStyle::SystemDashDot => &[3.0, 1.0, 1.0, 1.0],
+        BorderLineStyle::LargeDashDot => &[8.0, 3.0, 1.0, 3.0],
+        BorderLineStyle::LargeDashDotDot => &[8.0, 3.0, 1.0, 3.0, 1.0, 3.0],
+        BorderLineStyle::SystemDashDotDot => &[3.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        BorderLineStyle::DashDotDot
+        | BorderLineStyle::Solid
+        | BorderLineStyle::Double
+        | BorderLineStyle::None => return None,
+    };
+    Some(multiples.iter().map(|m| m * w).collect())
+}
+
+/// The Typst `join` keyword for a DrawingML corner join.
+fn drawingml_join_name(join: LineJoin) -> &'static str {
+    match join {
+        LineJoin::Round => "round",
+        LineJoin::Bevel => "bevel",
+        LineJoin::Miter => "miter",
+    }
+}
+
+/// The Typst `cap` keyword for a DrawingML end geometry, or `None` for the one
+/// value Typst already defaults to.
+///
+/// Flat is both DrawingML's `cap` default and Typst's stroke default, so leaving
+/// the key off spells it exactly. Writing it anyway would restate every
+/// existing DrawingML stroke for no rendered difference (issue #1682).
+fn drawingml_cap_name(cap: LineCap) -> Option<&'static str> {
+    match cap {
+        LineCap::Flat => None,
+        LineCap::Round => Some("round"),
+        LineCap::Square => Some("square"),
+    }
+}
+
+/// A DrawingML stroke value, using width-proportional dashes where the style
+/// has a dash rhythm (issue #678), always naming the corner join (#1090), and
+/// naming the end geometry whenever it is not flat (#1682).
+///
+/// The join has to be written out even when it is DrawingML's own default,
+/// because Typst's stroke default is the opposite one: an `a:ln` with no
+/// `a:round`, `a:bevel` or `a:miter` child joins round, and leaving the key off
+/// mitered every outlined shape's corners. That forces the dictionary form on
+/// solid strokes too, which used to take the `Wpt + rgb(...)` shorthand.
+///
+/// The cap is the mirror image: DrawingML and Typst agree on flat ends, so only
+/// `cap="rnd"` and `cap="sq"` need a key. A native macOS PowerPoint export of a
+/// 3.5pt straight connector traces PDF `linecap="0,0,0"` with no `cap` and with
+/// `cap="flat"`, `1,1,1` with `cap="rnd"` and `2,2,2` with `cap="sq"`, so the
+/// extension past each endpoint is the renderer's own half-width — PowerPoint
+/// emits the PDF cap operator rather than baking the geometry into a path.
+pub(super) fn drawingml_stroke_value_with_paint(side: &BorderSide, paint: &str) -> String {
+    let mut parts: Vec<String> = vec![
+        format!("paint: {paint}"),
+        format!("thickness: {}pt", format_f64(side.width)),
+    ];
+    if let Some(array) = drawingml_dash_array_pt(side.style, side.width) {
+        let lengths: Vec<String> = array
+            .iter()
+            .map(|len| format!("{}pt", format_f64(*len)))
+            .collect();
+        parts.push(format!("dash: ({})", lengths.join(", ")));
+    } else if !matches!(side.style, BorderLineStyle::Solid | BorderLineStyle::None) {
+        // Styles with no rhythm of their own — `Double`, and any dashed style
+        // whose width scales the array to nothing — keep the named pattern
+        // `stroke_value` would have given them.
+        parts.push(format!(
+            "dash: \"{}\"",
+            super::border_line_style_to_typst(side.style)
+        ));
+    }
+    parts.push(format!("join: \"{}\"", drawingml_join_name(side.join)));
+    if let Some(cap) = drawingml_cap_name(side.cap) {
+        parts.push(format!("cap: \"{cap}\""));
+    }
+    format!("({})", parts.join(", "))
+}
+
+pub(super) fn drawingml_stroke_value(side: &BorderSide) -> String {
+    drawingml_stroke_value_with_paint(side, &rgb(&side.color))
+}
+
+/// Format a float without a trailing `.0` on integral values.
+pub(super) fn format_f64(v: f64) -> String {
+    if v.fract() == 0.0 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v}")
+    }
+}
+
+#[cfg(test)]
+#[path = "typst_gen_fmt_tests.rs"]
+mod tests;

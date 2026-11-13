@@ -18,6 +18,8 @@ use std::path::Path;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Route {
     Document,
+    OfficePdf,
+    PdfImage,
     PdfTable,
     Workbook,
     Structured,
@@ -66,6 +68,25 @@ impl NativeEngine {
             return Some((
                 Route::PdfTable,
                 Support::new(60, "text/table heuristic; layout is approximate"),
+            ));
+        }
+
+        // OOXML to PDF through Typst. This outranks LibreOffice (cost 6) on
+        // ties, and the native document/workbook route is a fallback if the
+        // richer renderer rejects a file.
+        if to == Format::Pdf && matches!(from, Format::Docx | Format::Pptx | Format::Xlsx) {
+            return Some((
+                Route::OfficePdf,
+                Support::new(6, "native Office renderer (Typst layout)").layout(),
+            ));
+        }
+
+        // PDF page rasterization. Poppler/Ghostscript remain optional for
+        // unsupported PDF features and vector SVG output.
+        if from == Format::Pdf && matches!(to, Format::Jpg | Format::Png | Format::Tiff) {
+            return Some((
+                Route::PdfImage,
+                Support::new(10, "native PDF page rasterizer").layout(),
             ));
         }
 
@@ -259,6 +280,28 @@ impl Engine for NativeEngine {
             Route::Document | Route::Email => {
                 let document = read_document(ctx.input, ctx.from, ctx.options)?;
                 write_document(ctx.output, &document, ctx.to, ctx.options)?;
+            }
+            Route::OfficePdf => {
+                if let Err(error) =
+                    crate::office::office_to_pdf(ctx.input, ctx.output, ctx.from, ctx.options)
+                {
+                    tracing::warn!(
+                        engine = "office2pdf",
+                        from = %ctx.from,
+                        error = %error,
+                        "native Office renderer failed; falling back to the structural model"
+                    );
+                    if ctx.from == Format::Xlsx {
+                        let workbook = data::read_workbook(ctx.input, ctx.from, ctx.options)?;
+                        data::write_workbook(ctx.output, &workbook, ctx.to, ctx.options)?;
+                    } else {
+                        let document = read_document(ctx.input, ctx.from, ctx.options)?;
+                        write_document(ctx.output, &document, ctx.to, ctx.options)?;
+                    }
+                }
+            }
+            Route::PdfImage => {
+                crate::pdf_raster::pdf_to_image(ctx.input, ctx.output, ctx.to, ctx.options)?;
             }
             Route::PdfTable => {
                 let workbook = data::pdf_table_workbook(ctx.input, ctx.options)?;

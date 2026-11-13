@@ -1,0 +1,1061 @@
+use crate::parser::xml_util::OOXML_XML_VERSION;
+use std::collections::{HashMap, HashSet};
+
+use crate::ir::{
+    Color, DocumentLanguage, Ligatures, PairKerning, ParagraphStyle, TabStop, TextStyle,
+};
+
+use super::{
+    ThemeFonts, WORD_UNSTATED_FONT_SIZE_PT, extract_doc_default_paragraph_style,
+    extract_doc_default_text_style_with_theme, extract_paragraph_style, extract_run_style,
+    extract_tab_stop_overrides, pair_kerning_from_half_points, resolve_theme_font_family,
+};
+
+/// The `w:kern` thresholds a document states outside its runs, read from the
+/// raw `word/styles.xml`.
+///
+/// Read from the raw part for the reason `extract_default_tab_stop_pt` reads
+/// `w:defaultTabStop` from raw `word/settings.xml`: the docx-rs fork
+/// has no field for the element, so waiting on its parse would report every
+/// document as unkerned — including the 21 tracked fixtures that do state
+/// `w:kern`, 9 of them as `<w:kern w:val="2"/>` in `w:docDefaults`, which asks
+/// Word to kern everything (issue #628 review).
+///
+/// Covers the two levels a stated threshold actually reaches text from:
+/// `w:docDefaults/w:rPrDefault/w:rPr/w:kern`, and each named style's
+/// `w:rPr/w:kern`.
+///
+/// TODO(direct run `w:kern` in `word/document.xml` is not read): docx-rs drops
+/// the element from `RunProperty`, and the only way to reattach it without
+/// re-implementing run parsing is a positional cursor over `<w:r>` elements,
+/// the shape `SmallCapsContext` uses. That cursor cannot be trusted here: the
+/// scan counts runs the conversion never consumes — `w:del` runs, which
+/// `flatten_tracked_changes` drops, and text-box runs, which convert through
+/// their own path — so a document mixing those with a direct `w:kern` would
+/// hand the threshold to the wrong run. A document whose runs state `w:kern`
+/// therefore takes its style's answer, not the run's. The only tracked fixture
+/// with direct run `w:kern` states `w:val="0"`, which is what the absent
+/// `w:docDefaults` element already resolves to, so nothing in the corpus
+/// changes. Reading it properly needs the element parsed upstream.
+#[derive(Debug, Clone)]
+pub(super) struct PairKerningRules {
+    /// `w:docDefaults/w:rPrDefault/w:rPr/w:kern`. Absence here is a decision,
+    /// not inheritance: Word ships with font kerning off, which is why the
+    /// English mocks — none of which state the element — set every glyph at
+    /// its nominal advance.
+    document_default: PairKerning,
+    /// `w:style/w:rPr/w:kern`, keyed by `w:styleId`. A style that states
+    /// nothing is absent from the map and inherits.
+    by_style_id: HashMap<String, PairKerning>,
+}
+
+impl Default for PairKerningRules {
+    fn default() -> Self {
+        Self {
+            document_default: PairKerning::Never,
+            by_style_id: HashMap::new(),
+        }
+    }
+}
+
+impl PairKerningRules {
+    pub(super) fn from_styles_xml(xml: Option<&str>) -> Self {
+        let Some(xml) = xml else {
+            return Self::default();
+        };
+        Self::scan(xml)
+    }
+
+    /// The decision every run inherits when neither its style nor its own
+    /// properties state one.
+    pub(super) fn document_default(&self) -> PairKerning {
+        self.document_default
+    }
+
+    /// What a named style states, or `None` when it states nothing and its
+    /// runs inherit the document default.
+    pub(super) fn for_style(&self, style_id: &str) -> Option<PairKerning> {
+        self.by_style_id.get(style_id).copied()
+    }
+
+    fn scan(xml: &str) -> Self {
+        let stated = scan_styles_run_property(xml, b"kern", |element, decoder| {
+            read_val_attribute(element, decoder).map(pair_kerning_from_half_points)
+        });
+        Self {
+            document_default: stated.document_default.unwrap_or(PairKerning::Never),
+            by_style_id: stated.by_style_id,
+        }
+    }
+}
+
+/// The `w14:ligatures` values a document states outside its runs, read from
+/// the raw `word/styles.xml` for the reason `PairKerningRules` reads `w:kern`
+/// there: the docx-rs fork has no field for the element (issue #2205).
+///
+/// A body run's own value comes from `RunScanContext` instead, which
+/// checks each run's text before handing a value out.
+///
+/// TODO(header, footer and note runs' own `w14:ligatures` are not read): those
+/// stories convert outside the paragraph cursor `RunScanContext` rides on,
+/// so their runs take the answer their styles resolve to.
+#[derive(Debug, Clone, Default)]
+pub(super) struct LigatureRules {
+    /// `w:docDefaults/w:rPrDefault/w:rPr/w14:ligatures`. Absence is Word's own
+    /// answer, no ligatures: docxide case8 states nothing, and Word draws the
+    /// `ffi` of `officia` as three glyphs in a face that has the ligature.
+    document_default: Ligatures,
+    /// `w:style/w:rPr/w14:ligatures`, keyed by `w:styleId`. A style that
+    /// states nothing is absent from the map and inherits.
+    by_style_id: HashMap<String, Ligatures>,
+}
+
+impl LigatureRules {
+    pub(super) fn from_styles_xml(xml: Option<&str>) -> Self {
+        let Some(xml) = xml else {
+            return Self::default();
+        };
+        let stated = scan_styles_run_property(xml, b"ligatures", |element, decoder| {
+            read_val_text(element, decoder).and_then(|value| parse_ligatures_value(&value))
+        });
+        Self {
+            document_default: stated.document_default.unwrap_or(Ligatures::NONE),
+            by_style_id: stated.by_style_id,
+        }
+    }
+
+    /// The ligatures every run inherits when no style states any.
+    pub(super) fn document_default(&self) -> Ligatures {
+        self.document_default
+    }
+
+    /// What a named style states, or `None` when it states nothing.
+    pub(super) fn for_style(&self, style_id: &str) -> Option<Ligatures> {
+        self.by_style_id.get(style_id).copied()
+    }
+}
+
+/// Read an `ST_Ligatures` value: `none`, `all`, or the classes it switches on
+/// named once each in the fixed order standard, contextual, historical,
+/// discretional — `standardContextual`, `historicalDiscretional`, and so on.
+/// Anything else is not a value Word writes and states nothing.
+pub(super) fn parse_ligatures_value(value: &str) -> Option<Ligatures> {
+    match value {
+        "none" => return Some(Ligatures::NONE),
+        "all" => {
+            return Some(Ligatures {
+                standard: true,
+                contextual: true,
+                historical: true,
+                discretional: true,
+            });
+        }
+        _ => {}
+    }
+    let mut ligatures = Ligatures::NONE;
+    let mut rest: &str = value;
+    let classes: [(&str, &str, &mut bool); 4] = [
+        ("standard", "Standard", &mut ligatures.standard),
+        ("contextual", "Contextual", &mut ligatures.contextual),
+        ("historical", "Historical", &mut ligatures.historical),
+        ("discretional", "Discretional", &mut ligatures.discretional),
+    ];
+    for (leading, following, is_on) in classes {
+        // The first class named is lower camel case, the rest capitalised.
+        let name: &str = if rest.len() == value.len() {
+            leading
+        } else {
+            following
+        };
+        if let Some(remainder) = rest.strip_prefix(name) {
+            *is_on = true;
+            rest = remainder;
+        }
+    }
+    (rest.is_empty() && ligatures != Ligatures::NONE).then_some(ligatures)
+}
+
+/// What `word/styles.xml` states for one run property outside the runs.
+struct StatedInStyles<T> {
+    /// `w:docDefaults/w:rPrDefault/w:rPr`.
+    document_default: Option<T>,
+    /// Each named style's `w:rPr`, keyed by `w:styleId`.
+    by_style_id: HashMap<String, T>,
+}
+
+/// Read the run property whose element has `local_name` from the two levels
+/// a value reaches text from without a run stating it:
+/// `w:docDefaults/w:rPrDefault/w:rPr` and each named style's `w:rPr`.
+/// `parse` returns `None` for a value that states nothing.
+fn scan_styles_run_property<T>(
+    xml: &str,
+    local_name: &[u8],
+    parse: impl Fn(&quick_xml::events::BytesStart<'_>, quick_xml::Decoder) -> Option<T>,
+) -> StatedInStyles<T> {
+    use quick_xml::events::Event;
+
+    let mut stated = StatedInStyles {
+        document_default: None,
+        by_style_id: HashMap::new(),
+    };
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut in_doc_defaults: bool = false;
+    let mut in_run_property_default: bool = false;
+    // `w:pPr` never carries a `w:rPr` in a style definition (the schema gives
+    // styles `CT_PPrGeneral`, which has no run properties), but a malformed
+    // part must not be allowed to plant a value either.
+    let mut in_paragraph_property: bool = false;
+    let mut current_style_id: Option<String> = None;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element) | Event::Empty(element)) => {
+                match element.local_name().as_ref() {
+                    b"docDefaults" => in_doc_defaults = true,
+                    b"rPrDefault" => in_run_property_default = true,
+                    b"pPr" => in_paragraph_property = true,
+                    b"style" => {
+                        current_style_id = element
+                            .attributes()
+                            .flatten()
+                            .find(|attribute| attribute.key.local_name().as_ref() == b"styleId")
+                            .and_then(|attribute| {
+                                attribute
+                                    .decoded_and_normalized_value(
+                                        OOXML_XML_VERSION,
+                                        reader.decoder(),
+                                    )
+                                    .ok()
+                                    .map(|value| value.into_owned())
+                            });
+                    }
+                    name if name == local_name && !in_paragraph_property => {
+                        let Some(value) = parse(&element, reader.decoder()) else {
+                            continue;
+                        };
+                        if in_doc_defaults && in_run_property_default {
+                            stated.document_default = Some(value);
+                        } else if let Some(style_id) = current_style_id.as_ref() {
+                            stated.by_style_id.insert(style_id.clone(), value);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(element)) => match element.local_name().as_ref() {
+                b"docDefaults" => in_doc_defaults = false,
+                b"rPrDefault" => in_run_property_default = false,
+                b"pPr" => in_paragraph_property = false,
+                b"style" => current_style_id = None,
+                _ => {}
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+
+    stated
+}
+
+/// `w:val` of an element, decoded but not interpreted.
+fn read_val_text(
+    element: &quick_xml::events::BytesStart<'_>,
+    decoder: quick_xml::Decoder,
+) -> Option<String> {
+    element
+        .attributes()
+        .flatten()
+        .find(|attribute| attribute.key.local_name().as_ref() == b"val")
+        .and_then(|attribute| {
+            attribute
+                .decoded_and_normalized_value(OOXML_XML_VERSION, decoder)
+                .ok()
+                .map(|value| value.into_owned())
+        })
+}
+
+/// `w:val` of an element, as the number `w:kern` states it in: half-points.
+fn read_val_attribute(
+    element: &quick_xml::events::BytesStart<'_>,
+    decoder: quick_xml::Decoder,
+) -> Option<f64> {
+    read_val_text(element, decoder).and_then(|value| value.trim().parse::<f64>().ok())
+}
+
+/// Resolved style formatting extracted from a document style definition.
+/// Contains text and paragraph formatting along with an optional heading level.
+pub(super) struct ResolvedStyle {
+    pub(super) text: TextStyle,
+    pub(super) paragraph: ParagraphStyle,
+    /// Whether this paragraph style chain, excluding `w:docDefaults`, states
+    /// `w:spacing/@w:after` itself. Table-style spacing can override document
+    /// defaults, but a named paragraph style keeps its own value.
+    pub(super) paragraph_space_after_is_explicit: bool,
+    pub(super) paragraph_tab_overrides: Option<Vec<TabStopOverride>>,
+    /// Heading level from outline_lvl (0 = Heading 1, 1 = Heading 2, ..., 5 = Heading 6).
+    pub(super) heading_level: Option<usize>,
+    /// Whether a heading definition in this style's hierarchy supplies its
+    /// own run formatting. Word does not layer a synthesized heading weight on
+    /// top of such a document-defined treatment merely because `w:b` is
+    /// absent (issue #1457).
+    pub(super) heading_has_document_run_formatting: bool,
+    /// Whether `text.font_size` is `WORD_UNSTATED_FONT_SIZE_PT`, filled in
+    /// because neither this chain nor `w:docDefaults` states a `w:sz`. The
+    /// synthesized heading size still replaces it, as it did when the size
+    /// was left unset (issue #2234).
+    pub(super) font_size_is_unstated_default: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum TabStopOverride {
+    Set(TabStop),
+    Clear(f64),
+}
+
+/// Map from style_id → resolved formatting.
+pub(super) type StyleMap = HashMap<String, ResolvedStyle>;
+
+/// Synthetic style ID used for document-level default text properties.
+pub(super) const DOC_DEFAULT_STYLE_ID: &str = "__office2pdf_doc_defaults";
+
+pub(super) fn scan_default_paragraph_style_id(styles_xml: &str) -> Option<String> {
+    use quick_xml::events::Event;
+
+    let mut reader = quick_xml::Reader::from_str(styles_xml);
+    reader.config_mut().trim_text(true);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element) | Event::Empty(element))
+                if element.local_name().as_ref() == b"style" =>
+            {
+                let mut style_type = None;
+                let mut is_default = false;
+                let mut style_id = None;
+                for attribute in element.attributes().flatten() {
+                    let value = attribute
+                        .decoded_and_normalized_value(OOXML_XML_VERSION, reader.decoder())
+                        .ok()
+                        .map(|value| value.into_owned());
+                    match attribute.key.local_name().as_ref() {
+                        b"type" => style_type = value,
+                        b"default" => is_default = matches!(value.as_deref(), Some("1" | "true")),
+                        b"styleId" => style_id = value,
+                        _ => {}
+                    }
+                }
+                if style_type.as_deref() == Some("paragraph") && is_default {
+                    return style_id;
+                }
+            }
+            Ok(Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+    }
+}
+
+/// The language body text is written in: `w:lang/@w:val` on the default
+/// paragraph style's run properties, else on
+/// `w:docDefaults/w:rPrDefault/w:rPr`. Read from the raw part because docx-rs
+/// has no field for `w:lang`.
+///
+/// Only `w:val` is read. It is the language of Latin-script text; `w:eastAsia`
+/// and `w:bidi` name the languages of the other script classes, which Typst
+/// cannot set alongside it.
+pub(super) fn scan_default_language(
+    styles_xml: &str,
+    default_paragraph_style_id: &str,
+) -> Option<DocumentLanguage> {
+    use quick_xml::events::Event;
+
+    let mut reader = quick_xml::Reader::from_str(styles_xml);
+    reader.config_mut().trim_text(true);
+    let mut path: Vec<Vec<u8>> = Vec::new();
+    let mut in_default_paragraph_style = false;
+    let mut doc_defaults_tag: Option<String> = None;
+    let mut default_style_tag: Option<String> = None;
+    loop {
+        match reader.read_event() {
+            Ok(event @ (Event::Start(_) | Event::Empty(_))) => {
+                let has_children: bool = matches!(event, Event::Start(_));
+                let (Event::Start(element) | Event::Empty(element)) = event else {
+                    unreachable!("matched above");
+                };
+                match element.local_name().as_ref() {
+                    b"style" if path.iter().map(Vec::as_slice).eq([b"styles".as_slice()]) => {
+                        let mut style_type: Option<String> = None;
+                        let mut style_id: Option<String> = None;
+                        for attribute in element.attributes().flatten() {
+                            let value = attribute
+                                .decoded_and_normalized_value(OOXML_XML_VERSION, reader.decoder())
+                                .ok()
+                                .map(|value| value.into_owned());
+                            match attribute.key.local_name().as_ref() {
+                                b"type" => style_type = value,
+                                b"styleId" => style_id = value,
+                                _ => {}
+                            }
+                        }
+                        in_default_paragraph_style = has_children
+                            && style_type.as_deref() == Some("paragraph")
+                            && style_id.as_deref() == Some(default_paragraph_style_id);
+                    }
+                    b"lang" => {
+                        // Historical rPrChange properties and paragraph-mark
+                        // formatting do not describe the current body text.
+                        let is_document_default: bool = path.iter().map(Vec::as_slice).eq([
+                            b"styles".as_slice(),
+                            b"docDefaults",
+                            b"rPrDefault",
+                            b"rPr",
+                        ]);
+                        let is_style_default: bool = in_default_paragraph_style
+                            && path.iter().map(Vec::as_slice).eq([
+                                b"styles".as_slice(),
+                                b"style",
+                                b"rPr",
+                            ]);
+                        let tag: Option<String> =
+                            crate::parser::xml_util::get_attr_str(&element, b"val");
+                        if is_style_default {
+                            default_style_tag = tag;
+                        } else if is_document_default {
+                            doc_defaults_tag = tag;
+                        }
+                    }
+                    _ => {}
+                }
+                if has_children {
+                    path.push(element.local_name().as_ref().to_vec());
+                }
+            }
+            Ok(Event::End(_)) => {
+                if path
+                    .iter()
+                    .map(Vec::as_slice)
+                    .eq([b"styles".as_slice(), b"style"])
+                {
+                    in_default_paragraph_style = false;
+                }
+                path.pop();
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    default_style_tag
+        .as_deref()
+        .and_then(DocumentLanguage::from_office_tag)
+        .or_else(|| {
+            doc_defaults_tag
+                .as_deref()
+                .and_then(DocumentLanguage::from_office_tag)
+        })
+}
+
+/// Whether the document explicitly defines its default paragraph style —
+/// either a paragraph style flagged `w:default="1"` (how Word writes it) or
+/// one whose id is `Normal` without the flag (how docx-rs writes it).
+///
+/// This is the factor that decides Word's East Asian/Latin auto space for
+/// bare paragraphs: Word's own built-in Korean `Normal` suppresses the space,
+/// and any explicit definition replaces that built-in, restoring the spec
+/// default of on. Measured on one-factor native exports — the same bytes flip
+/// every bare-paragraph, cell and justified boundary between flush and
+/// +0.25em on exactly this difference (issue #732).
+pub(super) fn scan_defines_default_paragraph_style(styles_xml: &str) -> bool {
+    use quick_xml::events::Event;
+
+    let mut reader = quick_xml::Reader::from_str(styles_xml);
+    reader.config_mut().trim_text(true);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element) | Event::Empty(element))
+                if element.local_name().as_ref() == b"style" =>
+            {
+                let mut style_type = None;
+                let mut is_default = false;
+                let mut style_id = None;
+                for attribute in element.attributes().flatten() {
+                    let value = attribute
+                        .decoded_and_normalized_value(OOXML_XML_VERSION, reader.decoder())
+                        .ok()
+                        .map(|value| value.into_owned());
+                    match attribute.key.local_name().as_ref() {
+                        b"type" => style_type = value,
+                        b"default" => is_default = matches!(value.as_deref(), Some("1" | "true")),
+                        b"styleId" => style_id = value,
+                        _ => {}
+                    }
+                }
+                if style_type.as_deref() == Some("paragraph")
+                    && (is_default || style_id.as_deref() == Some("Normal"))
+                {
+                    return true;
+                }
+            }
+            Ok(Event::Eof) | Err(_) => return false,
+            _ => {}
+        }
+    }
+}
+
+/// Whether `w:docDefaults` declares a `w:pPrDefault` — the document taking
+/// over its own paragraph defaults.
+///
+/// This is the factor that decides the `w:spacing w:after` a paragraph gets
+/// when neither it nor its style hierarchy states one. Without the element,
+/// Word's built-in `Normal` supplies 8pt; with it, the unstated value falls to
+/// the spec's zero. Measured on one-factor native exports of a package that
+/// states no `w:spacing` anywhere: `<w:pPrDefault/>`, `<w:pPrDefault><w:pPr/>`,
+/// and a `w:pPr` carrying only `w:before` each pull the page up by the same
+/// 24pt over three paragraph gaps that an explicit `w:after="0"` does, while a
+/// `Normal` style carrying its own `w:pPr` leaves the export untouched
+/// (issue #1085).
+///
+/// Read from the raw part because docx-rs models the absent element and one
+/// holding an empty `w:pPr` identically — the same reason `PairKerningRules`
+/// reads `w:kern` there (issue #628).
+pub(super) fn scan_declares_paragraph_property_defaults(styles_xml: &str) -> bool {
+    use quick_xml::events::Event;
+
+    let mut reader = quick_xml::Reader::from_str(styles_xml);
+    reader.config_mut().trim_text(true);
+    // `w:pPrDefault` is only a document default inside `w:docDefaults`; the
+    // scope guard keeps a stray element elsewhere in a malformed part from
+    // silencing the built-in gap.
+    let mut in_doc_defaults: bool = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) if element.local_name().as_ref() == b"docDefaults" => {
+                in_doc_defaults = true;
+            }
+            Ok(Event::End(element)) if element.local_name().as_ref() == b"docDefaults" => {
+                in_doc_defaults = false;
+            }
+            Ok(Event::Start(element) | Event::Empty(element))
+                if in_doc_defaults && element.local_name().as_ref() == b"pPrDefault" =>
+            {
+                return true;
+            }
+            Ok(Event::Eof) | Err(_) => return false,
+            _ => {}
+        }
+    }
+}
+
+use crate::defaults::HEADING_FONT_SIZES;
+
+/// Build a map from style ID → resolved formatting by extracting formatting
+/// from each style's run_property and paragraph_property.
+pub(super) fn build_style_map(
+    styles: &docx_rs::Styles,
+    theme_fonts: &ThemeFonts,
+    default_paragraph_style_id: Option<&str>,
+    paragraph_backgrounds: &HashMap<String, Color>,
+    style_word_wraps: &HashMap<String, bool>,
+    pair_kerning: &PairKerningRules,
+    ligatures: &LigatureRules,
+) -> StyleMap {
+    let mut map = StyleMap::new();
+    let (default_text, font_size_is_unstated_default): (TextStyle, bool) =
+        doc_default_text_style(styles, theme_fonts, pair_kerning, ligatures);
+    let default_paragraph: ParagraphStyle = extract_doc_default_paragraph_style(styles);
+
+    map.insert(
+        DOC_DEFAULT_STYLE_ID.to_string(),
+        ResolvedStyle {
+            text: default_text.clone(),
+            paragraph: default_paragraph.clone(),
+            paragraph_space_after_is_explicit: false,
+            paragraph_tab_overrides: None,
+            heading_level: None,
+            heading_has_document_run_formatting: false,
+            font_size_is_unstated_default,
+        },
+    );
+
+    let styles_by_id: HashMap<&str, &docx_rs::Style> = styles
+        .styles
+        .iter()
+        .map(|style| (style.style_id.as_str(), style))
+        .collect();
+    for style in &styles.styles {
+        if !matches!(
+            style.style_type,
+            docx_rs::StyleType::Paragraph | docx_rs::StyleType::Character
+        ) {
+            continue;
+        }
+
+        let chain = based_on_chain(style, &styles_by_id);
+        let is_paragraph = style.style_type == docx_rs::StyleType::Paragraph;
+        let mut resolved = ResolvedStyle {
+            // Paragraph styles start at document defaults. Character styles
+            // deliberately do not: applying a character style must overlay
+            // only what that style hierarchy states (issue #176).
+            text: if is_paragraph {
+                default_text.clone()
+            } else {
+                TextStyle::default()
+            },
+            paragraph: if is_paragraph {
+                default_paragraph.clone()
+            } else {
+                ParagraphStyle::default()
+            },
+            paragraph_space_after_is_explicit: false,
+            paragraph_tab_overrides: None,
+            heading_level: None,
+            heading_has_document_run_formatting: false,
+            font_size_is_unstated_default: is_paragraph && font_size_is_unstated_default,
+        };
+
+        for definition in chain.into_iter().rev() {
+            merge_style_definition(
+                &mut resolved,
+                definition,
+                theme_fonts,
+                paragraph_backgrounds,
+                style_word_wraps,
+                pair_kerning,
+                ligatures,
+            );
+        }
+        map.insert(style.style_id.clone(), resolved);
+    }
+
+    // Paragraphs without an explicit pStyle inherit the default paragraph
+    // style (w:default="1", normally "Normal"), not just the bare document
+    // defaults — fold it into the synthetic doc-default entry so its spacing,
+    // line spacing, and text properties survive the cascade (issue #288).
+    if let Some(style_id) = default_paragraph_style_id
+        && let Some(default_style) = map.get(style_id)
+    {
+        let merged = ResolvedStyle {
+            text: default_style.text.clone(),
+            paragraph: default_style.paragraph.clone(),
+            paragraph_space_after_is_explicit: default_style.paragraph_space_after_is_explicit,
+            paragraph_tab_overrides: default_style.paragraph_tab_overrides.clone(),
+            heading_level: None,
+            heading_has_document_run_formatting: false,
+            font_size_is_unstated_default: default_style.font_size_is_unstated_default,
+        };
+        map.insert(DOC_DEFAULT_STYLE_ID.to_string(), merged);
+    }
+
+    map
+}
+
+/// Each paragraph style's `w:framePr`: its own, or else that of its nearest
+/// `w:basedOn` ancestor that states one, as docxide-pdf's style inheritance
+/// takes it. A paragraph's own `w:framePr` then overrides it attribute by
+/// attribute ([`effective_frame_property`]).
+///
+/// FIXME(unprobed style chain merge): no Word reference shows whether a
+/// derived style's `w:framePr` merges with its base style's attribute by
+/// attribute or replaces it.
+pub(super) fn paragraph_style_frames(
+    styles: &docx_rs::Styles,
+) -> HashMap<String, docx_rs::FrameProperty> {
+    let styles_by_id: HashMap<&str, &docx_rs::Style> = styles
+        .styles
+        .iter()
+        .map(|style| (style.style_id.as_str(), style))
+        .collect();
+    styles
+        .styles
+        .iter()
+        .filter(|style| style.style_type == docx_rs::StyleType::Paragraph)
+        .filter_map(|style| {
+            let frame: &docx_rs::FrameProperty =
+                based_on_chain(style, &styles_by_id)
+                    .into_iter()
+                    .find_map(|definition| definition.paragraph_property.frame_property.as_ref())?;
+            Some((style.style_id.clone(), frame.clone()))
+        })
+        .collect()
+}
+
+/// The `w:framePr` a paragraph with `property` sits in: `style_frame`, its
+/// paragraph style's, with each attribute the paragraph states itself in
+/// place of the style's, as docxide-pdf's `parse_frame_props` merges them.
+/// Word's export of docxide-pdf's scraped
+/// `massachusetts_community_sanitation` draws its letterhead lines in one
+/// frame though only the first states `w:hAnchor` and `w:hSpace` itself; the
+/// others take them from their style (issue #2231).
+///
+/// A frame that states nothing but its `w:wrap` places nothing: Word flows
+/// such a paragraph as a plain one, as docxide-pdf notes for a `Normal`
+/// style's `<w:framePr w:wrap="auto"/>`.
+pub(super) fn effective_frame_property(
+    property: &docx_rs::ParagraphProperty,
+    style_frame: Option<&docx_rs::FrameProperty>,
+) -> Option<docx_rs::FrameProperty> {
+    let own: Option<&docx_rs::FrameProperty> = property.frame_property.as_ref();
+    let frame: docx_rs::FrameProperty = match (own, style_frame) {
+        (None, None) => return None,
+        (Some(own), None) => own.clone(),
+        (None, Some(style)) => style.clone(),
+        (Some(own), Some(style)) => docx_rs::FrameProperty {
+            h: own.h.or(style.h),
+            h_rule: own.h_rule.clone().or_else(|| style.h_rule.clone()),
+            h_anchor: own.h_anchor.clone().or_else(|| style.h_anchor.clone()),
+            h_space: own.h_space.or(style.h_space),
+            v_anchor: own.v_anchor.clone().or_else(|| style.v_anchor.clone()),
+            v_space: own.v_space.or(style.v_space),
+            w: own.w.or(style.w),
+            wrap: own.wrap.clone().or_else(|| style.wrap.clone()),
+            x: own.x.or(style.x),
+            x_align: own.x_align.clone().or_else(|| style.x_align.clone()),
+            y: own.y.or(style.y),
+            y_align: own.y_align.clone().or_else(|| style.y_align.clone()),
+        },
+    };
+    let places_something: bool = docx_rs::FrameProperty {
+        wrap: None,
+        ..frame.clone()
+    } != docx_rs::FrameProperty::default();
+    places_something.then_some(frame)
+}
+
+/// The style and its same-type ancestors, from child to root.
+///
+/// A cycle invalidates the whole parent chain for this style. Dropping the
+/// chain is deterministic regardless of declaration order and safer than
+/// partially inheriting a different subset depending on which cycle member
+/// happened to be resolved first (issue #1453).
+fn based_on_chain<'a>(
+    style: &'a docx_rs::Style,
+    styles_by_id: &HashMap<&str, &'a docx_rs::Style>,
+) -> Vec<&'a docx_rs::Style> {
+    let mut chain = vec![style];
+    let mut seen = HashSet::from([style.style_id.as_str()]);
+    let mut current = style;
+    while let Some(parent_id) = based_on_id(current) {
+        let Some(parent) = styles_by_id.get(parent_id.as_str()).copied() else {
+            break;
+        };
+        if parent.style_type != style.style_type {
+            break;
+        }
+        if !seen.insert(parent.style_id.as_str()) {
+            return vec![style];
+        }
+        chain.push(parent);
+        current = parent;
+    }
+    chain
+}
+
+fn based_on_id(style: &docx_rs::Style) -> Option<String> {
+    style
+        .based_on
+        .as_ref()
+        .and_then(|based_on| serde_json::to_value(based_on).ok())
+        .and_then(|value| value.as_str().map(str::to_string))
+}
+
+fn merge_style_definition(
+    resolved: &mut ResolvedStyle,
+    style: &docx_rs::Style,
+    theme_fonts: &ThemeFonts,
+    paragraph_backgrounds: &HashMap<String, Color>,
+    style_word_wraps: &HashMap<String, bool>,
+    pair_kerning: &PairKerningRules,
+    ligatures: &LigatureRules,
+) {
+    let mut own_text = extract_run_style(&style.run_property);
+    if own_text.font_family.is_none()
+        && let Ok(run_property_json) = serde_json::to_value(&style.run_property)
+    {
+        own_text.font_family = resolve_theme_font_family(&run_property_json, theme_fonts);
+    }
+    // Capture provenance before adding the raw pair-kerning and ligature
+    // overlays below. Each is metadata read from the same rPr, but neither may
+    // by itself make an otherwise unformatted heading definition look like a
+    // complete document-defined text treatment.
+    let has_document_run_formatting = TextStyle {
+        pair_kerning: None,
+        ligatures: None,
+        ..own_text.clone()
+    } != TextStyle::default();
+    // `None` means "states nothing", so the parent decision survives.
+    own_text.pair_kerning = pair_kerning.for_style(&style.style_id);
+    own_text.ligatures = ligatures.for_style(&style.style_id);
+    resolved.font_size_is_unstated_default &= own_text.font_size.is_none();
+    resolved.text.merge_from(&own_text);
+
+    if style.style_type != docx_rs::StyleType::Paragraph {
+        return;
+    }
+
+    let mut own_paragraph = extract_paragraph_style(&style.paragraph_property);
+    resolved.paragraph_space_after_is_explicit |= own_paragraph.space_after.is_some();
+    own_paragraph.background = paragraph_backgrounds.get(&style.style_id).copied();
+    // From raw styles.xml because published docx-rs does not parse the field
+    // (issue #1041).
+    own_paragraph.word_wrap = style_word_wraps.get(&style.style_id).copied();
+    let own_tab_overrides = extract_tab_stop_overrides(&style.paragraph_property.tabs);
+    resolved.paragraph =
+        merge_paragraph_style(&own_paragraph, own_tab_overrides.as_deref(), Some(resolved));
+    // The merge above resolves clears and replacements against the inherited
+    // list, so descendants consume one concrete list rather than replaying a
+    // parent's raw operations.
+    resolved.paragraph_tab_overrides = None;
+    if let Some(level) = style
+        .paragraph_property
+        .outline_lvl
+        .as_ref()
+        .map(|outline_level| outline_level.v)
+        .filter(|&value| value < 6)
+    {
+        resolved.heading_level = Some(level);
+    }
+    // Once a definition establishes the heading level, formatting on that
+    // definition or any derived style is part of the document's heading
+    // treatment. Formatting inherited from Normal before the heading begins
+    // does not silence the bare-heading fallback (issue #1457).
+    if resolved.heading_level.is_some() {
+        resolved.heading_has_document_run_formatting |= has_document_run_formatting;
+    }
+}
+
+/// The document-wide run defaults, with the kerning threshold and ligatures
+/// the raw `word/styles.xml` states folded in, and Word's 10pt when they state
+/// no `w:sz` (issue #2234).
+///
+/// Kept apart from `extract_doc_default_text_style_with_theme` because that
+/// function reads docx-rs' parse, which has no `w:kern` or `w14:ligatures` to
+/// give.
+pub(super) fn resolve_doc_default_text_style(
+    styles: &docx_rs::Styles,
+    theme_fonts: &ThemeFonts,
+    pair_kerning: &PairKerningRules,
+    ligatures: &LigatureRules,
+) -> TextStyle {
+    doc_default_text_style(styles, theme_fonts, pair_kerning, ligatures).0
+}
+
+/// `resolve_doc_default_text_style`, and whether its size is the unstated
+/// default rather than a stated `w:sz`.
+fn doc_default_text_style(
+    styles: &docx_rs::Styles,
+    theme_fonts: &ThemeFonts,
+    pair_kerning: &PairKerningRules,
+    ligatures: &LigatureRules,
+) -> (TextStyle, bool) {
+    let mut text: TextStyle = extract_doc_default_text_style_with_theme(styles, theme_fonts);
+    text.pair_kerning = Some(pair_kerning.document_default());
+    text.ligatures = Some(ligatures.document_default());
+    let font_size_is_unstated_default: bool = text.font_size.is_none();
+    text.font_size.get_or_insert(WORD_UNSTATED_FONT_SIZE_PT);
+    (text, font_size_is_unstated_default)
+}
+
+/// Merge style text formatting with explicit run formatting.
+/// Explicit formatting (from the run itself) takes priority over style formatting.
+/// For heading styles, default sizes are applied when neither the style nor the
+/// run specifies them. Bold is synthesized only for a bare, unformatted
+/// heading definition; a document-defined heading run treatment that omits
+/// `w:b` remains regular.
+pub(super) fn merge_text_style(explicit: &TextStyle, style: Option<&ResolvedStyle>) -> TextStyle {
+    let (style_text, heading_level, heading_has_document_run_formatting, font_size_is_unstated) =
+        match style {
+            Some(style) => (
+                &style.text,
+                style.heading_level,
+                style.heading_has_document_run_formatting,
+                style.font_size_is_unstated_default,
+            ),
+            None => return explicit.clone(),
+        };
+
+    let mut merged: TextStyle = style_text.clone();
+
+    // Heading defaults: apply fallback size/bold when the style itself
+    // doesn't specify them. This must happen before the explicit overwrite
+    // so that explicit values still win.
+    if let Some(level) = heading_level {
+        if merged.font_size.is_none() || font_size_is_unstated {
+            merged.font_size = Some(HEADING_FONT_SIZES[level]);
+        }
+        if merged.bold.is_none() && !heading_has_document_run_formatting {
+            merged.bold = Some(true);
+        }
+    }
+
+    merged.merge_from(explicit);
+
+    merged
+}
+
+/// Merge style paragraph formatting with explicit paragraph formatting.
+/// Explicit formatting takes priority.
+pub(super) fn merge_paragraph_style(
+    explicit: &ParagraphStyle,
+    explicit_tab_overrides: Option<&[TabStopOverride]>,
+    style: Option<&ResolvedStyle>,
+) -> ParagraphStyle {
+    let style_paragraph = style.map(|resolved_style| &resolved_style.paragraph);
+    let inherited_tab_stops = style.and_then(resolve_style_tab_stops);
+
+    ParagraphStyle {
+        alignment: explicit
+            .alignment
+            .or(style_paragraph.and_then(|style| style.alignment)),
+        // Measured on Word: a paragraph's own w:wordWrap beats the one its
+        // style carries — a ListParagraph with w:val="0" breaks mid-eojeol
+        // although the style alone would not (issue #730).
+        word_wrap: explicit
+            .word_wrap
+            .or(style_paragraph.and_then(|style| style.word_wrap)),
+        indent_left: explicit
+            .indent_left
+            .or(style_paragraph.and_then(|style| style.indent_left)),
+        indent_right: explicit
+            .indent_right
+            .or(style_paragraph.and_then(|style| style.indent_right)),
+        indent_first_line: explicit
+            .indent_first_line
+            .or(style_paragraph.and_then(|style| style.indent_first_line)),
+        starts_after_layout_break: false,
+        clearing_breaks: Box::default(),
+        has_inline_list_number: false,
+        numbering_suffix: None,
+        line_spacing: explicit
+            .line_spacing
+            .or(style_paragraph.and_then(|style| style.line_spacing)),
+        line_box: explicit
+            .line_box
+            .or(style_paragraph.and_then(|style| style.line_box)),
+        space_before: explicit
+            .space_before
+            .or(style_paragraph.and_then(|style| style.space_before)),
+        space_after: explicit
+            .space_after
+            .or(style_paragraph.and_then(|style| style.space_after)),
+        section_mark_after: None,
+        keeps_space_before_at_page_top: false,
+        decoration_before_spacing: None,
+        // Percentage paragraph gaps are a DrawingML intermediate. Word's
+        // spacing reaches the IR as absolute points.
+        space_before_percent: None,
+        space_after_percent: None,
+        heading_level: style
+            .and_then(|resolved_style| resolved_style.heading_level)
+            .map(|level| (level + 1) as u8),
+        direction: explicit.direction,
+        tab_stops: merge_tab_stops(
+            explicit.tab_stops.as_deref(),
+            explicit_tab_overrides,
+            inherited_tab_stops.as_deref(),
+        ),
+        default_tab_stop_pt: explicit
+            .default_tab_stop_pt
+            .or(style_paragraph.and_then(|style| style.default_tab_stop_pt)),
+        background: explicit
+            .background
+            .or(style_paragraph.and_then(|style| style.background)),
+        border: explicit
+            .border
+            .clone()
+            .or_else(|| style_paragraph.and_then(|style| style.border.clone())),
+        // Follows the border it measures from rather than merging separately:
+        // a paragraph that inherits its rules inherits their gaps with them,
+        // and one that overrides them overrides the gaps too (issue #520).
+        border_space: if explicit.border.is_some() {
+            explicit.border_space.clone()
+        } else {
+            style_paragraph.and_then(|style| style.border_space.clone())
+        },
+        // Run content, not formatting: no style carries a rule or a drawing.
+        horizontal_rule: None,
+        holds_anchored_drawing: false,
+        // Word does not share a fixed line box across a
+        // paragraph's fonts, so its paragraph mark carries no line-box role.
+        paragraph_mark_font_family: None,
+        // Resolved once the paragraph's runs are known: only a run-less
+        // `<w:p>` is sized from its mark, and only
+        // `push_paragraph_from_runs` can see that (issue #1700).
+        paragraph_mark_text_style: None,
+        // Resolved from the paragraph mark once the paragraph is known to be
+        // numbered (issue #2337).
+        numbering_label_style: None,
+        // Worksheet-cell-only (issue #1631); Word paragraphs never carry one.
+        sheet_number_format_reserved_glyphs: None,
+        sheet_number_format_accounting_leading_reserved_glyphs: None,
+    }
+}
+
+fn resolve_style_tab_stops(style: &ResolvedStyle) -> Option<Vec<TabStop>> {
+    resolve_tab_stop_source(
+        style.paragraph.tab_stops.as_deref(),
+        style.paragraph_tab_overrides.as_deref(),
+    )
+}
+
+fn resolve_tab_stop_source(
+    tab_stops: Option<&[TabStop]>,
+    tab_overrides: Option<&[TabStopOverride]>,
+) -> Option<Vec<TabStop>> {
+    if let Some(tab_overrides) = tab_overrides {
+        let mut resolved: Vec<TabStop> = Vec::new();
+        apply_tab_stop_overrides(&mut resolved, tab_overrides);
+        return Some(resolved);
+    }
+
+    tab_stops.map(|tab_stops| tab_stops.to_vec())
+}
+
+fn merge_tab_stops(
+    explicit_tab_stops: Option<&[TabStop]>,
+    explicit_tab_overrides: Option<&[TabStopOverride]>,
+    inherited_tab_stops: Option<&[TabStop]>,
+) -> Option<Vec<TabStop>> {
+    if let Some(explicit_tab_overrides) = explicit_tab_overrides {
+        let mut resolved: Vec<TabStop> = inherited_tab_stops.unwrap_or(&[]).to_vec();
+        apply_tab_stop_overrides(&mut resolved, explicit_tab_overrides);
+        return Some(resolved);
+    }
+
+    explicit_tab_stops
+        .map(|tab_stops| tab_stops.to_vec())
+        .or_else(|| inherited_tab_stops.map(|tab_stops| tab_stops.to_vec()))
+}
+
+pub(super) fn apply_tab_stop_overrides(
+    tab_stops: &mut Vec<TabStop>,
+    tab_overrides: &[TabStopOverride],
+) {
+    for tab_override in tab_overrides {
+        match tab_override {
+            TabStopOverride::Set(tab_stop) => {
+                tab_stops.retain(|existing| {
+                    !tab_stop_positions_match(existing.position, tab_stop.position)
+                });
+                tab_stops.push(*tab_stop);
+            }
+            TabStopOverride::Clear(position) => {
+                tab_stops
+                    .retain(|existing| !tab_stop_positions_match(existing.position, *position));
+            }
+        }
+    }
+
+    tab_stops.sort_by(|left, right| {
+        left.position
+            .partial_cmp(&right.position)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
+fn tab_stop_positions_match(left: f64, right: f64) -> bool {
+    (left - right).abs() < 0.01
+}
+
+/// Look up the pStyle reference from a paragraph's property.
+pub(super) fn get_paragraph_style_id(prop: &docx_rs::ParagraphProperty) -> Option<&str> {
+    prop.style.as_ref().map(|style| style.val.as_str())
+}

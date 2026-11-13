@@ -1,0 +1,221 @@
+/// Supported input document formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub enum Format {
+    Docx,
+    Pptx,
+    Xlsx,
+}
+
+impl Format {
+    /// Detect format from file extension.
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        match ext.to_ascii_lowercase().as_str() {
+            "docx" => Some(Self::Docx),
+            "pptx" => Some(Self::Pptx),
+            "xlsx" => Some(Self::Xlsx),
+            _ => None,
+        }
+    }
+}
+
+/// A range of slide numbers (1-indexed) for PPTX conversion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct SlideRange {
+    /// Start slide number (1-indexed, inclusive).
+    pub start: u32,
+    /// End slide number (1-indexed, inclusive).
+    pub end: u32,
+}
+
+impl SlideRange {
+    /// Create a new slide range (1-indexed, inclusive on both ends).
+    pub fn new(start: u32, end: u32) -> Self {
+        Self { start, end }
+    }
+
+    /// Check if a 1-indexed slide number is within this range.
+    pub fn contains(&self, slide_number: u32) -> bool {
+        slide_number >= self.start && slide_number <= self.end
+    }
+
+    /// Parse a slide range string like "1-5" or "3".
+    pub fn parse(s: &str) -> Result<Self, String> {
+        if let Some((start_str, end_str)) = s.split_once('-') {
+            let start: u32 = start_str
+                .trim()
+                .parse()
+                .map_err(|_| format!("invalid start number: {start_str}"))?;
+            let end: u32 = end_str
+                .trim()
+                .parse()
+                .map_err(|_| format!("invalid end number: {end_str}"))?;
+            if start == 0 || end == 0 {
+                return Err("slide numbers must be >= 1".to_string());
+            }
+            if start > end {
+                return Err(format!("start ({start}) must be <= end ({end})"));
+            }
+            Ok(Self::new(start, end))
+        } else {
+            let n: u32 = s
+                .trim()
+                .parse()
+                .map_err(|_| format!("invalid slide number: {s}"))?;
+            if n == 0 {
+                return Err("slide number must be >= 1".to_string());
+            }
+            Ok(Self::new(n, n))
+        }
+    }
+}
+
+/// PDF standard to enforce compliance with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub enum PdfStandard {
+    /// PDF/A-2b for archival purposes.
+    PdfA2b,
+}
+
+/// Paper size for output PDF.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub enum PaperSize {
+    /// A4: 595.28pt × 841.89pt (210mm × 297mm).
+    A4,
+    /// US Letter: 612pt × 792pt (8.5in × 11in).
+    Letter,
+    /// US Legal: 612pt × 1008pt (8.5in × 14in).
+    Legal,
+    /// Custom dimensions in points.
+    Custom { width: f64, height: f64 },
+}
+
+impl PaperSize {
+    /// Returns (width, height) in points.
+    pub fn dimensions(&self) -> (f64, f64) {
+        use crate::defaults;
+        match self {
+            Self::A4 => (defaults::A4_WIDTH_PT, defaults::A4_HEIGHT_PT),
+            Self::Letter => (defaults::LETTER_WIDTH_PT, defaults::LETTER_HEIGHT_PT),
+            Self::Legal => (defaults::LEGAL_WIDTH_PT, defaults::LEGAL_HEIGHT_PT),
+            Self::Custom { width, height } => (*width, *height),
+        }
+    }
+
+    /// Parse a paper size string (case-insensitive): "a4", "letter", "legal".
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "a4" => Ok(Self::A4),
+            "letter" => Ok(Self::Letter),
+            "legal" => Ok(Self::Legal),
+            _ => Err(format!(
+                "unknown paper size: {s}; expected one of: a4, letter, legal"
+            )),
+        }
+    }
+}
+
+/// The user-interface script of the Excel installation whose printing an XLSX
+/// conversion reproduces.
+///
+/// A font that defers to the theme (`<scheme val="minor"/>`, often the
+/// Normal font) is resolved through the theme face for the script of
+/// Excel's *user interface*, not of the cell text. The same workbook therefore
+/// paints, lays out rows and sizes columns in a different face depending on
+/// the language Excel runs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub enum XlsxUiScript {
+    /// A Korean user interface: the theme's `<a:font script="Hang">` face,
+    /// then its East Asian `<a:ea>` face. The default preserves the historical
+    /// calibration against native Korean-UI Excel exports.
+    #[default]
+    Hangul,
+    /// A Latin-script user interface (English, Danish, German, ...): the
+    /// theme's `<a:latin>` face, which then lays out like a face the font
+    /// names outright.
+    Latin,
+}
+
+impl XlsxUiScript {
+    /// Parse a UI script name (case-insensitive): "hangul" or "latin".
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "hangul" => Ok(Self::Hangul),
+            "latin" => Ok(Self::Latin),
+            _ => Err(format!(
+                "unknown XLSX UI script: {s}; expected one of: hangul, latin"
+            )),
+        }
+    }
+}
+
+/// Options controlling the conversion process.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct ConvertOptions {
+    /// Filter XLSX sheets by name. Only sheets whose names are in this list
+    /// are included, hidden ones among them. If `None`, every sheet the
+    /// workbook does not hide is included — Excel prints no `hidden` or
+    /// `veryHidden` sheet.
+    pub sheet_names: Option<Vec<String>>,
+    /// The UI script of the Excel whose printing XLSX conversion reproduces;
+    /// it decides which theme face a scheme font resolves to. Defaults to
+    /// [`XlsxUiScript::Hangul`]; use [`XlsxUiScript::Latin`] for workbooks
+    /// printed from an English, Danish, German or other Latin-script Excel.
+    pub xlsx_ui_script: XlsxUiScript,
+    /// Filter PPTX slides by range (1-indexed). If `None`, all visible slides
+    /// are included unless `include_hidden_slides` is enabled.
+    pub slide_range: Option<SlideRange>,
+    /// Include PPTX slides marked hidden with `show="0"` or `show="false"`.
+    /// Defaults to `false`, matching PowerPoint PDF export. Slide ranges still
+    /// use source slide ordinals whether hidden slides are included or omitted.
+    pub include_hidden_slides: bool,
+    /// PDF standard to enforce. If `None`, produces a standard PDF 1.7.
+    pub pdf_standard: Option<PdfStandard>,
+    /// Override paper size for the output PDF. If `None`, uses the source document's size.
+    pub paper_size: Option<PaperSize>,
+    /// Additional font directories to search for fonts.
+    #[cfg_attr(feature = "typescript", ts(type = "Array<string>"))]
+    pub font_paths: Vec<std::path::PathBuf>,
+    /// Standalone font or font-collection bytes to make available during this
+    /// conversion. In-memory fonts work on native and WASM targets and take
+    /// priority over filesystem and bundled fallback fonts.
+    #[cfg_attr(feature = "typescript", ts(type = "Array<Uint8Array>"))]
+    pub font_bytes: Vec<Vec<u8>>,
+    /// Family to append as the final candidate in every generated font chain.
+    /// This lets a caller-provided face cover glyphs that none of the
+    /// document's declared families or built-in substitutes can render.
+    pub last_resort_font_family: Option<String>,
+    /// Force landscape orientation. If `Some(true)`, swaps width/height so width > height.
+    /// If `Some(false)`, forces portrait. If `None`, uses source document orientation.
+    pub landscape: Option<bool>,
+    /// Enable tagged PDF output with document structure tags (H1-H6, P, Table, Figure).
+    /// When `true`, the output PDF includes accessibility tags that map document
+    /// structure for screen readers and assistive technologies.
+    pub tagged: bool,
+    /// Enable PDF/UA (Universal Accessibility) compliance. Implies `tagged: true`.
+    /// Combines tagged PDF with the PDF/UA-1 standard for full accessibility compliance.
+    pub pdf_ua: bool,
+    /// Enable bounded-layout mode for large XLSX files.
+    /// XLSX rows are parsed into IR, then compiled in page-aligned chunks to
+    /// bound peak Typst layout memory.
+    /// Each chunk is compiled independently and the resulting PDFs are merged.
+    /// Requires the `pdf-ops` feature for PDF merging.
+    pub streaming: bool,
+    /// Target row count for each streaming compilation chunk. The converter
+    /// extends a chunk to the end of its current PDF page. Defaults to 1000 if `None`.
+    /// Only used when `streaming` is `true`.
+    pub streaming_chunk_size: Option<usize>,
+}
+
+#[cfg(test)]
+#[path = "config_tests.rs"]
+mod tests;
+
+#[cfg(all(test, feature = "typescript"))]
+#[path = "config_ts_tests.rs"]
+mod ts_tests;

@@ -10,10 +10,17 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.100"
 license = "MIT"
-authors = ["DocForge contributors"]
-repository = "https://github.com/example/docforge"
+
+[patch.crates-io]
+# Upstream declares a cdylib target for WASM. Building that target with the
+# Windows GNU toolchain exceeds MinGW's export-ordinal limit, so the vendored
+# copy keeps only the rlib target. The library API is unchanged.
+office2pdf = { path = "vendor/office2pdf" }
+
+[profile.release]
+strip = true
 
 [workspace.dependencies]
 anyhow = "1.0.95"
@@ -29,23 +36,22 @@ dotenvy = "0.15.7"
 ed25519-dalek = { version = "2.1.1", features = ["rand_core", "pkcs8"] }
 encoding_rs = "0.8.35"
 futures-util = "0.3.31"
-html2md = "0.2.15"
-http = "1.2.0"
 http-body-util = "0.1.2"
 image = { version = "0.24.9", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 mail-parser = "0.9.4"
-mime = "0.3.17"
-mime_guess = "2.0.5"
+ocrs = { version = "0.14.0", default-features = false, features = ["onnx"] }
+office2pdf = "0.10.0"
 msg_parser = "0.3.6"
 parking_lot = "0.12.3"
+pdf-render = "2.0.0"
 pdf-extract = "0.8.0"
 percent-encoding = "2.3.1"
 printpdf = { version = "0.7.0", features = ["embedded_images"] }
-pulldown-cmark = { version = "0.12.2", default-features = false, features = ["html"] }
 quick-xml = { version = "0.36.2", features = ["serialize"] }
 quoted_printable = "0.5.0"
 rand = "0.8.5"
 regex = "1.11.1"
+rten = "0.28.0"
 reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls"] }
 rsa = "0.9.7"
 resvg = "0.44.0"

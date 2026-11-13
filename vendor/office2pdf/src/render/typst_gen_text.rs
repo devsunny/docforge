@@ -1,0 +1,7978 @@
+use std::fmt::Write;
+
+use unicode_normalization::UnicodeNormalization;
+
+use crate::render::font_subst;
+
+use super::*;
+
+/// Word's default tab stop interval (0.5 inch = 36pt).
+pub(super) const DEFAULT_TAB_WIDTH_PT: f64 = 36.0;
+/// East Asian Word's default tab stop (800 twips) when settings.xml omits
+/// `w:defaultTabStop`.
+pub(super) const EAST_ASIAN_DEFAULT_TAB_WIDTH_PT: f64 = 40.0;
+const PPTX_SOFT_LINE_BREAK_CHAR: char = '\u{000B}';
+/// In-text marker the PPTX parser places between a Hangul syllable and
+/// following terminal punctuation (issue #438); never emitted literally.
+const HANGUL_KINSOKU_BREAK_CHAR: char = '\u{200B}';
+/// In-text marker the DOCX parser places at an East Asian/Latin boundary that
+/// carries no literal space (issue #521); never emitted literally.
+const EAST_ASIAN_AUTO_SPACE_CHAR: char = '\u{E001}';
+/// Word's automatic space at such a boundary, as a fraction of the run's font
+/// size. Measured as exactly a quarter em on a native export at two sizes.
+pub(crate) const EAST_ASIAN_AUTO_SPACE_EM: f64 = 0.25;
+
+/// The character the auto space is drawn with: a no-break space, so the
+/// boundary it marks stays as unbreakable as the eojeol frame kept it.
+pub(crate) const EAST_ASIAN_AUTO_SPACE_GLYPH: &str = "\u{00A0}";
+
+/// How wide Word lets an expandable gap of a justified line grow before it
+/// levels every gap on that line to one common width, in ems of the gap's own
+/// text (issue #1053).
+pub(crate) const EAST_ASIAN_JUSTIFIED_GAP_CEILING_EM: f64 = 0.5;
+
+/// The ratio term of that ceiling, in percent. `justification-limits`
+/// rejects a ratio of zero, so the smallest positive one stands in for "no
+/// ratio term": it adds 4 nanopoints to a 10.5pt space. The completed-frame
+/// pass that separates Word's phases reads a line's stretch back through the
+/// same formula, so it shares the constant (issue #1280).
+pub(crate) const EAST_ASIAN_JUSTIFIED_GAP_RATIO_TERM_PERCENT: f64 = 0.0001;
+
+/// PowerPoint snaps nominal glyph advances to this grid before accumulating
+/// them into a line. Typst keeps the font's exact fractional advances, so the
+/// sub-point error otherwise compounds across long slide lines (issue #661).
+const POWERPOINT_ADVANCE_GRID_PT: f64 = 0.125;
+
+/// Excel rounds every glyph advance to this grid before accumulating it into a
+/// cell line.
+///
+/// Measured on the ten committed XLSX golden mocks: reconstructing each
+/// line from `round_half_up(hmtx_advance x size)` reproduces all 3,656 glyph
+/// origins of their first pages — Arial, Arial Bold, Malgun Gothic and Malgun
+/// Gothic Bold at 9, 10 and 14pt — to within the 0.23pt the export's own
+/// integer `TJ` offsets can express. Rounding the *running pen position*
+/// instead, the other model that puts origins on whole points, misses: on
+/// `Region` at Malgun Gothic 12 it predicts 53, 60, 67, 74, 77, 84 where the
+/// export prints 53, 60, 66, 73, 76, 83 (issue #1088).
+///
+/// The face's own fractional advances are therefore ~5% narrow on a long line
+/// (19.5pt over 99 glyphs of 9pt Arial), because the rounding is biased upward
+/// for the many advances that land just below a half point.
+///
+/// The whole-point grid is the same quantum Excel's column widths take
+/// (issue #621). A fitted sheet applies this quantum in its declared
+/// coordinate system and scales the result afterwards (issue #1238). Word
+/// does not share it — no `docx` golden mock's export puts its origins on
+/// whole points.
+const SHEET_ADVANCE_GRID_PT: f64 = 1.0;
+
+/// Native Excel PDF positions resolve on a 1/300-inch grid. A symmetric
+/// multi-row centre gives an unmatched half-grid to the lower half, as the
+/// two-line merged title in issue #1497 isolates.
+pub(super) const SHEET_PDF_POSITION_GRID_PT: f64 = 72.0 / 300.0;
+
+/// Native Word-style table placement resolves a compressed paragraph's first
+/// and last exterior seats on a one-point edge quantum. The half-point used by
+/// a bottom anchor is derived from the same quantum, not from a fixture-sized
+/// translation (issue #1479).
+const WORD_COMPRESSED_LINE_EDGE_PT: f64 = 1.0;
+
+/// A bottom-aligned expanded Latin line in a Word table keeps one quarter
+/// point of its extra line space between baselines instead of exposing it
+/// below the last baseline. The #1219 LibreOffice trace isolates this quantum
+/// in a 15pt line with `w:line="259"` (issue #1486).
+const WORD_EXPANDED_BOTTOM_LINE_EDGE_PT: f64 = 0.25;
+
+/// Emit the ligature rule every PowerPoint slide follows.
+///
+/// PowerPoint does not apply the OpenType `liga`/`clig` features. DrawingML has
+/// no run property that asks for them — `a:rPr` carries `@spc`, `@kern` and
+/// `@baseline` but nothing for ligation — and a native macOS PowerPoint export
+/// of `customGeo.pptx` page 46 draws `testing:` and `setting:` as discrete
+/// glyphs with a dotted `i`. Typst ligates by default, so the same runs came
+/// out with the face's fused `ti`/`tti` form and a dotless `i`, which also
+/// pulled every glyph after the ligature left by the advance the merge saved —
+/// 1.4pt by the trailing colon of `setting:` (issue #1058).
+///
+/// Stated once for the document rather than on each run: it holds for every
+/// slide run including the emission sites that cannot name their own text, and
+/// only PowerPoint produces fixed pages, so nothing else can inherit it.
+/// Typst's `ligatures: false` switches off `liga` and `clig` alone, so the
+/// required-ligature and contextual features that Arabic and Indic shaping
+/// depend on (`rlig`, `ccmp`, `calt`) are untouched.
+pub(super) fn write_powerpoint_ligature_state(out: &mut String) {
+    let _ = writeln!(out, "#set text(ligatures: false)");
+}
+
+/// Emit the ligature default a Word document states for all of its text.
+///
+/// Every run carries its own decision, so this reaches only the text no run
+/// style does: a generated table of contents shapes its entries from bare
+/// metadata, and a VML text box's paragraphs are rebuilt without one. Left to
+/// the engine's default, a deed in docxide's scraped corpus that states no
+/// ligatures drew 99 `ti` and `fi` ligatures in its contents (issue #2205).
+pub(super) fn write_document_ligature_state(out: &mut String, ligatures: crate::ir::Ligatures) {
+    out.push_str("#set text(");
+    let mut first = true;
+    write_ligature_params(out, &mut first, ligatures);
+    out.push_str(")\n");
+}
+
+/// Emit the contextual Typst helpers used by fixed-page (PowerPoint) text.
+///
+/// A word stays one shaped item, preserving its kerning and PDF text mapping.
+/// Only its horizontal scale and layout width change by the
+/// difference between exact and independently grid-rounded nominal glyph
+/// widths. Pair kerning therefore remains part of the shaped word instead of
+/// being lost to one-box-per-glyph output. Spaces remain real text characters
+/// and carry their grid and neighboring pair adjustments in one weak correction,
+/// so both disappear at a line boundary while extraction stays intact. Since
+/// typst 0.15 a box keeps its content's baseline, so the word box sits on the
+/// line's baseline and occupies the same line box as unboxed text without
+/// the seat measurement 0.14 needed (upstream typst#8150).
+pub(super) fn write_powerpoint_advance_grid_helpers(out: &mut String) {
+    let _ = writeln!(
+        out,
+        r#"#let o2p-pptx-advance-grid = {POWERPOINT_ADVANCE_GRID_PT}pt
+#let o2p-pptx-word(body, glyphs) = context {{
+  let natural = measure(body).width
+  let nominal = glyphs.map(glyph => measure(glyph).width).sum()
+  let snapped = glyphs.map(glyph => calc.round(measure(glyph).width / o2p-pptx-advance-grid) * o2p-pptx-advance-grid).sum()
+  let target = natural + snapped - nominal
+  if natural == 0pt {{ body }} else {{
+    box[#scale(x: target / natural * 100%, origin: left, body)] + h(target - natural)
+  }}
+}}
+#let o2p-pptx-space(left, right) = context {{
+  let natural = measure(" ").width
+  let target = calc.round(natural / o2p-pptx-advance-grid) * o2p-pptx-advance-grid
+  let pair-delta = measure(left + " " + right).width - measure(left).width - natural - measure(right).width
+  [#" "; #h(target - natural + pair-delta, weak: true)]
+}}
+#let o2p-pptx-snap-baseline(raw-seat, layout-seat, body, nonfinal-seat: none, round-position: true, round-lines: false, size-seats: none, origin: 0pt, marker: false) = context {{
+  let top = here().position().y
+  let target = if round-position {{ origin + calc.round((top - origin + raw-seat) / 1pt) * 1pt }} else {{ top + layout-seat }}
+  let paint = move(dy: target - (top + layout-seat), body)
+  if not round-lines and nonfinal-seat == none {{ paint }} else {{
+    let nonfinal = if nonfinal-seat == none {{ raw-seat }} else {{ nonfinal-seat }}
+    let delta = (origin + calc.round((top - origin + nonfinal) / 1pt) * 1pt - target) / 1pt
+    let grid = if round-lines {{ ((top - origin + raw-seat) / 1pt, (target - origin) / 1pt, (top - origin + nonfinal) / 1pt) }} else {{ none }}
+    let kind = if marker {{ "office2pdf-pptx-list-marker" }} else {{ "office2pdf-pptx-paragraph-mark" }}
+    metadata((kind, delta, grid, size-seats)) + paint + metadata("office2pdf-pptx-paragraph-end")
+  }}
+}}"#
+    );
+}
+
+/// The auto space sized against the *run*, not the paragraph. The width is
+/// emitted in points wherever the run states a size, because an `em` in the
+/// wrapper would resolve against the paragraph's default size instead — 11pt
+/// where the run is 10.5pt, which is 0.12pt too wide at every boundary.
+///
+/// It is a no-break space carrying its own `spacing`, not an `#h()` spacer,
+/// because a justified line has to be able to stretch it. Typst's justifier
+/// reaches a line's *glyphs* alone — `Line::stretchability` sums the text
+/// items and skips every spacing item — so a spacer stays rigid and the whole
+/// of a line's stretch demand lands in the word spaces: 8.70pt against Word's
+/// 6.81pt on the line issue #1193 measured, with the auto spaces left at
+/// their quarter em against Word's 6.80pt.
+///
+/// `text(spacing:)` restates the space's own advance, so the quarter em is
+/// still the width the line breaks on and nothing re-wraps; and U+00A0 is
+/// Unicode line-break class GL, which forbids a break on either side of it,
+/// which is what keeps the mid-word break that #521's frame existed to
+/// prevent from reopening. See [`write_east_asian_justification_limits`] for
+/// the ceiling that makes the stretch match Word's.
+///
+/// The metadata in front of it is for the completed-frame pass that
+/// separates Word's phases (issue #1280): there an auto space and a word
+/// space are both space glyphs, and the tag is the one inline marker Typst
+/// maps to no text at all, so it opens no break where the no-break space
+/// forbids one.
+fn east_asian_auto_space(run: &Run) -> String {
+    let width: String = match run.style.font_size {
+        Some(size) => format!("{}pt", format_f64(size * EAST_ASIAN_AUTO_SPACE_EM)),
+        None => format!("{EAST_ASIAN_AUTO_SPACE_EM}em"),
+    };
+    let mut params: String = String::new();
+    let mut spacing_style: TextStyle = run.style.clone();
+    spacing_style.baseline_shift = None;
+    write_text_params_for_run(
+        &mut params,
+        &spacing_style,
+        EAST_ASIAN_AUTO_SPACE_GLYPH,
+        EAST_ASIAN_AUTO_SPACE_GLYPH,
+    );
+    if !params.is_empty() {
+        params.push_str(", ");
+    }
+    let _ = write!(params, "spacing: {width}");
+    format!(
+        "#metadata(\"{}\")#text({params})[\\u{{00A0}}]",
+        crate::render::word_justified_gap_phases::AUTO_SPACE_MARKER
+    )
+}
+
+fn inline_numbering_prefix_len(style: &ParagraphStyle) -> Option<usize> {
+    style.has_inline_list_number.then_some(
+        if style.numbering_suffix == Some(crate::ir::ListMarkerSuffix::Space) {
+            2
+        } else {
+            1
+        },
+    )
+}
+
+fn word_inline_numbering_runs(para: &Paragraph, line_grid_pitch: Option<f64>) -> Option<Vec<Run>> {
+    if para.style.line_box.is_some()
+        || matches!(
+            para.style.line_spacing,
+            Some(LineSpacing::Exact(_) | LineSpacing::AtLeast(_))
+        )
+    {
+        return None;
+    }
+    let prefix_len: usize = inline_numbering_prefix_len(&para.style)?;
+    let body: &[Run] = para.runs.get(prefix_len..)?;
+    if body.is_empty() {
+        return None;
+    }
+    let body_size_pt: f64 = paragraph_font_size_pt(body);
+    let (_, body_bottom_em) = word_line_box_em(body, &para.style, line_grid_pitch)?;
+    let body_bottom_pt: f64 = body_bottom_em * body_size_pt;
+    if !body_bottom_pt.is_finite() || body_bottom_pt < 0.0 {
+        return None;
+    }
+    let mut natural_style: ParagraphStyle = para.style.clone();
+    natural_style.line_spacing = Some(LineSpacing::Proportional(1.0));
+    let mut runs: Vec<Run> = para.runs.clone();
+    // Word seats the larger label by its own ascent, but its descent and the
+    // proportional surplus come from the body. Scaling both by marker size
+    // inflated every later item; fixed run edges survive tab splitting/wrapping.
+    for marker in &mut runs[..prefix_len] {
+        let marker_size_pt: f64 = paragraph_font_size_pt(std::slice::from_ref(marker));
+        if !marker_size_pt.is_finite() || marker_size_pt <= 0.0 {
+            return None;
+        }
+        let (marker_top_em, _) =
+            word_line_box_em(std::slice::from_ref(marker), &natural_style, None)?;
+        marker.style.line_box = Some(LineBox {
+            ascent_em: marker_top_em,
+            descent_em: body_bottom_pt / marker_size_pt,
+        });
+    }
+    Some(runs)
+}
+
+pub(super) fn generate_paragraph(
+    out: &mut String,
+    para: &Paragraph,
+    ctx: &mut super::GenCtx,
+) -> Result<(), ConvertError> {
+    let line_grid_pitch: Option<f64> = ctx.line_grid_pitch;
+    let default_tab_width_pt: f64 = ctx.default_tab_width_pt;
+    let breaks_hangul_at_eojeol: bool = ctx.breaks_hangul_at_eojeol;
+    let available_measure_pt: Option<f64> = ctx.available_measure_pt;
+    let wraps_beside_floats: bool = std::mem::take(&mut ctx.float_wrap_pending);
+    let clears_floats: Option<BreakClear> = ctx.float_wrap_clear.take();
+    let style = &para.style;
+    let inline_numbering_runs: Option<Vec<Run>> = word_inline_numbering_runs(para, line_grid_pitch);
+    let runs: &[Run] = inline_numbering_runs.as_deref().unwrap_or(&para.runs);
+    let body_metric_runs: &[Run] = inline_numbering_runs
+        .as_ref()
+        .and_then(|_| inline_numbering_prefix_len(style).and_then(|count| runs.get(count..)))
+        .unwrap_or(runs);
+    let paragraph_tab_width_pt: f64 = paragraph_default_tab_width_pt(style, default_tab_width_pt);
+
+    // A heading is a paragraph that also feeds the outline, and Word lays it
+    // out as one. It paints the heading's `w:pBdr` and `w:shd` (issue #581),
+    // spaces and measures it from the same `w:spacing` and line box — no
+    // built-in `Heading N` gap takes part, measured on native exports whose
+    // `Heading1` states no `w:spacing` (issue #1132) — and seats it across the
+    // line by the same `w:jc`, `w:ind` and `w:bidi` (issue #1820). So a heading
+    // takes this path too, and only its inline content differs. It used to
+    // have a copy of this path that gained those settings one issue at a time;
+    // the horizontal ones never arrived, and a centred zh-CN Word "Title",
+    // which carries `w:outlineLvl 0`, printed flush left.
+    let is_empty_paragraph: bool = para.runs.is_empty() && style.heading_level.is_none();
+    let empty_paragraph_bottom_border_extent_pt: f64 = if is_empty_paragraph {
+        paragraph_bottom_border_extent_pt(style)
+    } else {
+        0.0
+    };
+    let paragraph_mark_metric_run: Option<Run> = if is_empty_paragraph {
+        style
+            .paragraph_mark_text_style
+            .as_deref()
+            .map(|mark_style| Run {
+                text: String::new(),
+                style: mark_style.clone(),
+                href: None,
+                footnote: None,
+                inline_box: None,
+            })
+    } else {
+        None
+    };
+    let line_metric_runs: &[Run] = paragraph_mark_metric_run
+        .as_ref()
+        .map(std::slice::from_ref)
+        .unwrap_or(body_metric_runs);
+    let line_height_settings: Option<String> = if is_empty_paragraph {
+        None
+    } else {
+        word_line_height_settings(line_metric_runs, style, line_grid_pitch)
+    };
+    let has_para_style = needs_block_wrapper(style) || line_height_settings.is_some();
+    let empty_paragraph_line_height_pt: f64 = if is_empty_paragraph {
+        match style.line_spacing {
+            Some(LineSpacing::Exact(points) | LineSpacing::AtLeast(points)) if points > 0.0 => {
+                points
+            }
+            // An absent `w:line` is single spacing, so a paragraph that
+            // states none still takes its mark's line, as a proportional one
+            // does; a flat 12pt fell 1.8pt short for a 12pt Arial mark.
+            Some(LineSpacing::Proportional(_)) | None => {
+                word_line_box_em(line_metric_runs, style, line_grid_pitch)
+                    .map(|(top, bottom)| (top + bottom) * paragraph_font_size_pt(line_metric_runs))
+                    .unwrap_or(12.0)
+            }
+            _ => 12.0,
+        }
+    } else {
+        12.0
+    };
+    let empty_paragraph_placeholder_height_pt: f64 = empty_paragraph_line_height_pt;
+    let first_line_indent: Option<f64> = style
+        .indent_first_line
+        .filter(|indent| indent.abs() > 0.0001 && !para.runs.is_empty());
+
+    // Word's `w:ind` offsets the paragraph's whole column, and paints
+    // `w:shd` and `w:pBdr` from the indent rather than the margin, so the
+    // indent goes on an outer block as an inset and the fill and border stay
+    // on an inner block that spans only the inset content area (issue #464).
+    let indent = paragraph_indent_pt(style);
+    let is_framed_inline_list_number: bool = style.has_inline_list_number
+        && (style.background.is_some() || style.border.is_some())
+        && indent.is_some();
+    let outer_indent: Option<(f64, f64)> = if is_framed_inline_list_number {
+        None
+    } else {
+        indent
+    };
+    let page_top_gap: Option<(f64, f64)> = style
+        .space_before
+        .filter(|gap| style.keeps_space_before_at_page_top && *gap > 0.0)
+        .zip(ctx.active_body_top_pt);
+    // The page-top gap goes inside the outermost block, so that block is
+    // written even without an indent.
+    let has_outer_spacing_block: bool = outer_indent.is_some() || page_top_gap.is_some();
+    // Each part of a paragraph split at a clearing break wraps on its own, so
+    // the one after the break can start below the tables it clears. A heading
+    // stays whole: it is one outline entry.
+    if wraps_beside_floats
+        && (has_para_style || has_outer_spacing_block)
+        && style.heading_level.is_none()
+        && let Some((head, clear, tail)) = super::float_wrap::split_at_clearing_break(para)
+    {
+        for (part, part_clear) in [(head, clears_floats), (tail, Some(clear))] {
+            ctx.float_wrap_pending = !ctx.body_floats.is_empty();
+            ctx.float_wrap_clear = part_clear;
+            generate_paragraph(out, &part, ctx)?;
+        }
+        return Ok(());
+    }
+    // The wrap goes inside the paragraph's outermost block, where the block's
+    // own spacing has already been laid and its content starts at the first
+    // line's top. A paragraph that writes no block of its own is left as it
+    // is.
+    // TODO(bare paragraph beside a float): such a paragraph, which states no
+    // spacing, line or decoration, still runs under a floating table or text
+    // frame.
+    let float_wrap: Option<(String, f64)> =
+        (wraps_beside_floats && (has_para_style || has_outer_spacing_block)).then(|| {
+            let first_line_pt: f64 = if is_empty_paragraph {
+                empty_paragraph_line_height_pt
+            } else {
+                let font_size_pt: f64 = paragraph_font_size_pt(line_metric_runs);
+                word_line_box_em(line_metric_runs, style, line_grid_pitch)
+                    .map(|(top, bottom)| (top + bottom) * font_size_pt)
+                    .unwrap_or(font_size_pt)
+            };
+            let space_before_pt: f64 = style.space_before.unwrap_or(0.0).max(0.0);
+            let mut open = String::new();
+            super::float_wrap::write_float_wrap_open(
+                &mut open,
+                &ctx.body_floats,
+                clears_floats,
+                first_line_pt,
+                space_before_pt,
+            );
+            // The least this paragraph advances the flow: its before-gap and
+            // one line, which a multiple below single makes shorter.
+            let line_multiple: f64 = match style.line_spacing {
+                Some(LineSpacing::Proportional(multiple)) => multiple.clamp(0.0, 1.0),
+                _ => 1.0,
+            };
+            (open, first_line_pt * line_multiple + space_before_pt)
+        });
+    if let Some((_, advance_pt)) = float_wrap {
+        super::float_wrap::advance_past_floats(&mut ctx.body_floats, advance_pt);
+    }
+    let float_wrap: Option<String> = float_wrap.map(|(open, _)| open);
+    let should_move_empty_top_border_to_before_spacing: bool = is_empty_paragraph
+        && style.decoration_before_spacing.is_some()
+        && style.background.is_some()
+        && style
+            .border
+            .as_deref()
+            .and_then(|border| border.top.as_ref())
+            .is_some_and(|side| side.style != BorderLineStyle::Double);
+    let wraps_in_outer_block: bool = has_outer_spacing_block && float_wrap.is_some();
+    let wraps_in_style_block: bool =
+        !has_outer_spacing_block && has_para_style && float_wrap.is_some();
+    if has_outer_spacing_block {
+        let page_top_gap_label: Option<String> = page_top_gap.map(|_| {
+            let id: usize = ctx.next_page_top_gap_id;
+            ctx.next_page_top_gap_id += 1;
+            let label: String = format!("o2p-page-top-gap-{id}");
+            let _ = writeln!(out, "#metadata(none) <{label}>");
+            label
+        });
+        out.push_str("#block(width: 100%");
+        write_block_spacing_params(out, style, true, empty_paragraph_bottom_border_extent_pt);
+        if outer_indent.is_some() {
+            write_paragraph_indent_inset(out, outer_indent);
+        }
+        write_empty_paragraph_unbreakable(out, is_empty_paragraph);
+        out.push_str(")[\n");
+        if let Some((label, (gap, body_top_pt))) = page_top_gap_label.zip(page_top_gap) {
+            write_page_top_gap(out, &label, gap, body_top_pt);
+        }
+        if let Some(open) = float_wrap.as_deref().filter(|_| wraps_in_outer_block) {
+            out.push_str(open);
+        }
+    }
+
+    if has_para_style {
+        // The wrapper must span the full line width: Typst blocks shrink to
+        // their content by default, which would defeat the inner #align.
+        // Word measures `w:spacing w:before/w:after` from the edges of the
+        // full line box, which `word_line_height_settings` spans directly,
+        // so those gaps reach the block unmodified (issues #394, #452).
+        out.push_str("#block(width: 100%");
+        if indent.is_none() && !has_outer_spacing_block {
+            write_block_spacing_params(out, style, true, empty_paragraph_bottom_border_extent_pt);
+        }
+        write_block_decoration_params(out, style, should_move_empty_top_border_to_before_spacing);
+        write_empty_paragraph_unbreakable(out, is_empty_paragraph);
+        out.push_str(")[\n");
+        write_paragraph_double_border_overlays(
+            out,
+            &style.border,
+            style.border_space.as_deref().copied().unwrap_or_default(),
+        );
+        if let Some(open) = float_wrap.as_deref().filter(|_| wraps_in_style_block) {
+            out.push_str(open);
+        }
+        if is_framed_inline_list_number {
+            out.push_str("#block(width: 100%, above: 0pt, below: 0pt");
+            write_paragraph_indent_inset(out, indent);
+            out.push_str(")[\n");
+        }
+        write_line_box_settings(out, style.line_box);
+        if !is_empty_paragraph {
+            write_par_settings(out, style, line_metric_runs, false);
+        }
+        if let Some(ref settings) = line_height_settings {
+            out.push_str(settings);
+        }
+    }
+
+    if is_empty_paragraph {
+        // Empty paragraphs return before the text path, so paint their shaded
+        // before-gap here as well.
+        write_paragraph_before_spacing_overlay(
+            out,
+            style,
+            false,
+            should_move_empty_top_border_to_before_spacing,
+        );
+        let _ = write!(
+            out,
+            "#v({}pt)",
+            format_f64(empty_paragraph_placeholder_height_pt)
+        );
+        if let Some(rule) = style.horizontal_rule.as_deref() {
+            out.push('\n');
+            write_horizontal_rule(out, rule, 0.0);
+        }
+        if wraps_in_style_block {
+            out.push_str("\n]");
+        }
+        if has_para_style {
+            out.push_str("\n]");
+        }
+        if wraps_in_outer_block {
+            out.push_str("\n]");
+        }
+        if has_outer_spacing_block {
+            out.push_str("\n]");
+        }
+        out.push('\n');
+        return Ok(());
+    }
+
+    if let Some(level) = style.heading_level {
+        write_heading_contents_entry(out, level, runs);
+    }
+
+    let alignment = style.alignment;
+    let use_align = matches!(
+        alignment,
+        Some(Alignment::Center) | Some(Alignment::Right) | Some(Alignment::Left)
+    );
+
+    if use_align {
+        let align_str = match alignment {
+            Some(Alignment::Left) => "left",
+            Some(Alignment::Center) => "center",
+            Some(Alignment::Right) => "right",
+            _ => "left",
+        };
+        let _ = write!(out, "#align({align_str})[");
+    }
+
+    if let Some(indent) = first_line_indent {
+        let _ = write!(
+            out,
+            "#par(first-line-indent: (amount: {}pt, all: true))[",
+            format_f64(indent)
+        );
+    }
+
+    // Whichever fixed line box the wrapper above put in force — the computed
+    // Word line, or the paragraph's own `LineBox` — is what a framed eojeol
+    // has to restore inside itself. The two are mutually exclusive:
+    // `word_line_leading_pt` bails on a paragraph that declares a `LineBox`.
+    let line_box_em: Option<(f64, f64)> = has_para_style
+        .then(|| {
+            word_line_box_em(line_metric_runs, style, line_grid_pitch).or_else(|| {
+                style
+                    .line_box
+                    .map(|line_box| (line_box.ascent_em, line_box.descent_em))
+            })
+        })
+        .flatten();
+    let eojeol_wrap: EojeolWrap = paragraph_eojeol_wrap(
+        breaks_hangul_at_eojeol,
+        style,
+        line_box_em,
+        available_measure_pt,
+    );
+    let tab_lines: Option<WordTabLines> =
+        word_paragraph_tab_lines(style, indent, first_line_indent, available_measure_pt);
+    let tab_stops: Option<Vec<TabStop>> =
+        with_hanging_indent_stop(style.tab_stops.as_deref(), tab_lines);
+    let exact_line_ascent_pt: Option<f64> = exact_line_ascent_pt(
+        style,
+        line_box_em.map(|(top_em, _)| top_em),
+        paragraph_font_size_pt(line_metric_runs),
+    );
+    match style.heading_level {
+        // The runs keep the plain emitter: the per-run line boxes of issue
+        // #638 were measured on mixed-face body paragraphs only.
+        Some(level) => {
+            let _ = write!(out, "#heading(level: {level})[");
+            write_paragraph_before_spacing_overlay(out, style, true, false);
+            generate_runs_with_tabs_and_metrics_in_context(
+                out,
+                runs,
+                tab_stops.as_deref(),
+                paragraph_tab_width_pt,
+                TabPen::from_word_lines(tab_lines),
+                eojeol_wrap,
+                None,
+                InlineBoxLine {
+                    line_spacing: style.line_spacing,
+                    exact_ascent_pt: exact_line_ascent_pt,
+                },
+                ctx,
+            )?;
+            write_terminal_word_paragraph_mark(out, runs, style, line_grid_pitch);
+            out.push(']');
+        }
+        None => {
+            write_paragraph_before_spacing_overlay(out, style, true, false);
+            generate_word_runs_with_tabs_in_context(
+                out,
+                runs,
+                tab_stops.as_deref(),
+                paragraph_tab_width_pt,
+                eojeol_wrap,
+                style,
+                line_grid_pitch,
+                tab_lines,
+                exact_line_ascent_pt,
+                ctx,
+            )?;
+            write_terminal_word_paragraph_mark(out, runs, style, line_grid_pitch);
+        }
+    }
+
+    if first_line_indent.is_some() {
+        out.push(']');
+    }
+
+    if use_align {
+        out.push(']');
+    }
+
+    if is_framed_inline_list_number {
+        out.push_str("\n]");
+    }
+
+    if wraps_in_style_block {
+        out.push_str("\n]");
+    }
+    if has_para_style {
+        out.push_str("\n]");
+    }
+    if wraps_in_outer_block {
+        out.push_str("\n]");
+    }
+    if has_outer_spacing_block {
+        out.push_str("\n]");
+    }
+
+    out.push('\n');
+    Ok(())
+}
+
+fn write_terminal_word_paragraph_mark(
+    out: &mut String,
+    runs: &[Run],
+    style: &ParagraphStyle,
+    line_grid_pitch: Option<f64>,
+) {
+    let last_content = runs
+        .iter()
+        .rev()
+        .find(|run| !run.text.is_empty() || run.footnote.is_some() || run.inline_box.is_some());
+    let Some(last) = last_content.filter(|run| {
+        run.footnote.is_none() && run.inline_box.is_none() && run.text.ends_with('\n')
+    }) else {
+        return;
+    };
+    let mark = Run {
+        text: "x".into(),
+        style: style
+            .paragraph_mark_text_style
+            .as_deref()
+            .unwrap_or(&last.style)
+            .clone(),
+        href: None,
+        footnote: None,
+        inline_box: None,
+    };
+    // Typst drops an empty final line; Word's paragraph mark retains it.
+    // The zero-width strut uses mark metrics and adds no painted/searchable text.
+    if let Some((top, bottom)) =
+        word_line_box_em(std::slice::from_ref(&mark), style, line_grid_pitch)
+    {
+        let size = paragraph_font_size_pt(std::slice::from_ref(&mark));
+        let _ = write!(
+            out,
+            "#box(width: 0pt, height: {}pt, baseline: {}pt)",
+            format_f64((top + bottom) * size),
+            format_f64(bottom * size)
+        );
+    } else {
+        out.push_str("#box(width: 0pt)[#hide[");
+        generate_run(out, &mark);
+        out.push_str("]]");
+    }
+}
+
+/// Drop a heading's plain text under the contents label.
+///
+/// A contents entry is laid out as body text, not as a copy of the heading,
+/// so it cannot be built from the heading's rendered content — the size and
+/// weight are inline markup inside it and no enclosing set rule beats them.
+/// The list styles this instead (issue #610), the same shape the caption
+/// lists already use.
+fn write_heading_contents_entry(out: &mut String, level: u8, runs: &[Run]) {
+    let plain: String = paragraph_plain_text(runs);
+    let _ = writeln!(
+        out,
+        "#metadata((level: {level}, text: \"{}\", font: {}))<{}>",
+        escape_typst_string(&plain),
+        crate::render::font_subst::font_with_fallbacks_for_text(
+            first_run_family(runs).unwrap_or("Calibri"),
+            &plain,
+        ),
+        TOC_ENTRY_LABEL
+    );
+}
+
+/// The letter-space PowerPoint counts after a slide line's last glyph, when
+/// the paragraph's alignment is one that the extra width moves the line by.
+///
+/// PowerPoint measures a line with one letter-space after *every* glyph, the
+/// last one included, and places the line from that width: centring halves the
+/// trailing space, right alignment consumes it whole, and left alignment —
+/// which starts at the content edge whatever the width — cannot see it at all.
+/// Typst drops the tracking of a shaped item's final glyph
+/// ([`track_and_space`] adds it only where another glyph follows), so a
+/// centred tracked line came out half a letter-space to the right of the
+/// native export (issue #1075).
+///
+/// The space belongs to the last run that puts a glyph on the line, because
+/// that run's `a:rPr/@spc` is the one PowerPoint applies after it.
+///
+/// [`track_and_space`]: https://github.com/typst/typst/blob/v0.15.1/crates/typst-layout/src/inline/shaping.rs
+pub(super) fn powerpoint_trailing_letter_space_pt(
+    style: &ParagraphStyle,
+    runs: &[Run],
+) -> Option<f64> {
+    if !matches!(
+        style.alignment,
+        Some(Alignment::Center) | Some(Alignment::Right)
+    ) {
+        return None;
+    }
+    runs.iter()
+        .rev()
+        .find(|run| !run.text.is_empty())?
+        .style
+        .letter_spacing
+        // Zero is not tracking: PowerPoint writes `spc="0"` routinely, and a
+        // `0pt` spacer would be pure noise in every deck that does.
+        .filter(|spacing| *spacing != 0.0)
+}
+
+/// Where a Word paragraph's lines start and end from the margin, as
+/// [`generate_paragraph`] lays them out: `indent` is the paragraph's
+/// [`paragraph_indent_pt`], `first_line_indent` the first-line indent it
+/// emits, and `container_measure_pt` the width the container gives a line.
+///
+/// Word counts tab stops and the default grid from the margin, not from the
+/// indent (ECMA-376 Part 1, 17.3.1.37: a stop's position is "with respect to
+/// the current page margins"). Only a start-aligned left-to-right paragraph
+/// qualifies: a centred or right-aligned line, or a right-to-left one, does
+/// not start at its indent.
+pub(super) fn word_paragraph_tab_lines(
+    style: &ParagraphStyle,
+    indent: Option<(f64, f64)>,
+    first_line_indent: Option<f64>,
+    container_measure_pt: Option<f64>,
+) -> Option<WordTabLines> {
+    if matches!(style.direction, Some(TextDirection::Rtl))
+        || matches!(style.alignment, Some(Alignment::Center | Alignment::Right))
+    {
+        return None;
+    }
+    let (left, right): (f64, f64) = indent.unwrap_or((0.0, 0.0));
+    Some(WordTabLines {
+        first_origin_pt: left + first_line_indent.unwrap_or(0.0),
+        continuation_origin_pt: left,
+        end_pt: container_measure_pt
+            .map(|measure| measure - right)
+            .filter(|end| *end > left),
+    })
+}
+
+/// The paragraph's stops plus the one a hanging indent makes: Word sends a
+/// first-line tab to the left indent before any default stop, unless an
+/// explicit stop comes first (issue #2226). Later lines start at that indent,
+/// so the stop only ever serves the first.
+fn with_hanging_indent_stop(
+    tab_stops: Option<&[TabStop]>,
+    tab_lines: Option<WordTabLines>,
+) -> Option<Vec<TabStop>> {
+    let Some(lines) =
+        tab_lines.filter(|lines| lines.first_origin_pt < lines.continuation_origin_pt - 0.0001)
+    else {
+        return tab_stops.map(<[TabStop]>::to_vec);
+    };
+    let position: f64 = lines.continuation_origin_pt;
+    let mut stops: Vec<TabStop> = tab_stops.map(<[TabStop]>::to_vec).unwrap_or_default();
+    if !stops
+        .iter()
+        .any(|stop| (stop.position - position).abs() < 0.01)
+    {
+        let at: usize = stops
+            .iter()
+            .position(|stop| stop.position > position)
+            .unwrap_or(stops.len());
+        stops.insert(
+            at,
+            TabStop {
+                position,
+                alignment: TabAlignment::Left,
+                leader: TabLeader::None,
+            },
+        );
+    }
+    Some(stops)
+}
+
+pub(super) fn paragraph_default_tab_width_pt(style: &ParagraphStyle, fallback_pt: f64) -> f64 {
+    style
+        .default_tab_stop_pt
+        .filter(|width_pt| *width_pt > 0.0)
+        .unwrap_or(fallback_pt)
+}
+
+/// The paragraph's signed `(left, right)` indent in points, or `None` when it
+/// has neither. Word lets a paragraph hang into the margin, and a negative
+/// block inset widens the line into it the same way (issue #2233).
+pub(super) fn paragraph_indent_pt(style: &ParagraphStyle) -> Option<(f64, f64)> {
+    let left: f64 = style.indent_left.unwrap_or(0.0);
+    let right: f64 = style.indent_right.unwrap_or(0.0);
+    (left != 0.0 || right != 0.0).then_some((left, right))
+}
+
+/// The black outline Word for Mac paints around a shaded horizontal rule,
+/// whatever its `fillcolor`, and how far inside the rule's top and bottom its
+/// path runs. In docxide-pdf's `isla_language_lesson_plan`, a 1.5pt rule in an
+/// Arial 12pt header paragraph below an 18.95pt table row is stroked at y
+/// 67.40–68.50, where that 13.8pt line ends at 68.75. A body rule in
+/// `croatian_grant_guidelines` and a 60.9% header rule in
+/// `slovak_pedagogical_practice_agreement` are stroked alike: a 1.10pt-tall
+/// path under a 0.75pt black line (issue #2251). Measured on 1.5pt rules only.
+const SHADED_RULE_OUTLINE_PT: f64 = 0.75;
+const SHADED_RULE_INSET_PT: f64 = 0.2;
+
+/// Place a paragraph's horizontal rule on the bottom of its line, which lies
+/// `line_bottom_pt` below the bottom of the block it is written into; that
+/// block spans the paragraph's line between its indents (issue #2251). Word
+/// stands the rule on the bottom of its line.
+pub(super) fn write_horizontal_rule(out: &mut String, rule: &HorizontalRule, line_bottom_pt: f64) {
+    let width: String = match rule.width {
+        HorizontalRuleWidth::Fraction(fraction) => format!("{}%", format_f64(fraction * 100.0)),
+        HorizontalRuleWidth::Points(points) => format!("{}pt", format_f64(points)),
+    };
+    let alignment: &str = match rule.alignment {
+        Alignment::Center => "center",
+        Alignment::Right => "right",
+        Alignment::Left | Alignment::Justify => "left",
+    };
+    match rule.paint {
+        HorizontalRulePaint::Shaded => {
+            let _ = write!(
+                out,
+                "#place(bottom + {alignment}, dy: {}pt, rect(width: {width}, height: {}pt, \
+                 fill: none, stroke: {}pt + rgb(0, 0, 0)))",
+                format_f64(line_bottom_pt - SHADED_RULE_INSET_PT),
+                format_f64((rule.height - 2.0 * SHADED_RULE_INSET_PT).max(0.0)),
+                format_f64(SHADED_RULE_OUTLINE_PT),
+            );
+        }
+        HorizontalRulePaint::Solid(color) => {
+            let _ = write!(
+                out,
+                "#place(bottom + {alignment}, dy: {}pt, rect(width: {width}, height: {}pt, \
+                 fill: {}, stroke: none))",
+                format_f64(line_bottom_pt),
+                format_f64(rule.height),
+                rgb(&color),
+            );
+        }
+    }
+}
+
+fn write_paragraph_indent_inset(out: &mut String, indent: Option<(f64, f64)>) {
+    if let Some((left, right)) = indent {
+        let _ = write!(
+            out,
+            ", inset: (left: {}pt, right: {}pt)",
+            format_f64(left),
+            format_f64(right)
+        );
+    }
+}
+
+/// Whether the paragraph needs its own block to carry style. The indent is
+/// deliberately absent: `generate_paragraph` wraps flow indents directly,
+/// while fixed-text paragraph and list paths compute their PowerPoint-specific
+/// first-line origin separately. Counting it here would add a duplicate bare
+/// wrapper that only leaks Typst's default block spacing.
+pub(super) fn needs_block_wrapper(style: &ParagraphStyle) -> bool {
+    // A horizontal rule is placed against the bottom of its paragraph's own
+    // block (issue #2251).
+    style.horizontal_rule.is_some()
+        || style.space_before.is_some()
+        || style.space_after.is_some()
+        || style.background.is_some()
+        || style.border.is_some()
+        || style.line_spacing.is_some()
+        || style.line_box.is_some()
+        || matches!(style.alignment, Some(Alignment::Justify))
+        || matches!(style.direction, Some(TextDirection::Rtl))
+}
+
+/// Line-box settings for a body paragraph: a fixed box spanning Word's full
+/// natural line advance — the font's hhea line, 1.3 times its gap-free part
+/// when the line carries East Asian text, or a snapping document grid's
+/// pitch — or the declared positive exact advance, with zero leading.
+/// Typst's glyph-tight default renders such documents 20-30% shorter and
+/// shifts every page break (issue #354).
+///
+/// For natural and grid advances, the baseline sits at a constant `hhea
+/// ascender + lineGap` below the box top — bare `hhea ascender` for an East
+/// Asian line, which leaves the gap out entirely (issue #1638) — never at the
+/// font's ascender/descender proportion of it. Extra East Asian or grid
+/// height accrues below the baseline (issues #508, #518). For exact spacing,
+/// extra height is split above and below the natural font box; when the
+/// declared advance is shorter, the descent is preserved and the top edge is
+/// reduced, which can clip glyphs.
+///
+/// Carrying the advance inside the box, rather than recovering the
+/// remainder as `par(leading:)`, is what makes a paragraph's height match
+/// Word's. Typst inserts `leading` only *between* the lines of one
+/// paragraph, so an n-line paragraph came out one whole leading short
+/// however many lines it had, and consecutive 9pt Courier New paragraphs
+/// advanced 28% tighter than Word (issue #452). It also lets `w:spacing
+/// w:before/w:after` reach the block unchanged, because the block edges now
+/// sit exactly where Word measures those gaps from (issue #394).
+pub(super) fn word_line_height_settings(
+    runs: &[Run],
+    style: &ParagraphStyle,
+    line_grid_pitch: Option<f64>,
+) -> Option<String> {
+    let (top_em, bottom_em) = word_line_box_em(runs, style, line_grid_pitch)?;
+    // Pin the line box to the nominal font's own metric edges as fixed em
+    // values rather than the "ascender"/"descender" keywords. The keywords
+    // let Typst resolve the box against the tallest font on each line, so a
+    // bullet marker or em dash pulled from a taller fallback font inflated
+    // that one line's advance past the grid/single-spacing (issue #398).
+    Some(format!(
+        "#set text(top-edge: {}em, bottom-edge: -{}em)\n#set par(leading: 0pt)\n",
+        format_f64(top_em),
+        format_f64(bottom_em)
+    ))
+}
+
+/// The `(top-edge, bottom-edge)` in em behind [`word_line_height_settings`],
+/// exposed so a framed eojeol can restore the same edges inside itself
+/// (issue #626).
+pub(super) fn word_line_box_em(
+    runs: &[Run],
+    style: &ParagraphStyle,
+    line_grid_pitch: Option<f64>,
+) -> Option<(f64, f64)> {
+    if let Some(LineSpacing::Exact(points) | LineSpacing::AtLeast(points)) = style.line_spacing
+        && points > 0.0
+    {
+        let family: &str = word_paragraph_metric_family(runs, style)?;
+        let (ascender_em, descender_em, _pitch_em) =
+            word_line_metrics_em(family, line_takes_east_asian_metrics(runs))?;
+        let font_size_pt: f64 = paragraph_font_size_pt(runs);
+        if !font_size_pt.is_finite() || font_size_pt <= 0.0 {
+            return None;
+        }
+
+        let exact_line_em: f64 = points / font_size_pt;
+        let natural_line_em: f64 = ascender_em + descender_em;
+        if exact_line_em >= natural_line_em {
+            // Word centres the text when an exact line is taller than the
+            // font's metric box; `par(leading:)` alone cannot seat its first
+            // line or keep that extra height from accumulating between lines.
+            let half_extra_em: f64 = (exact_line_em - natural_line_em) / 2.0;
+            return Some((ascender_em + half_extra_em, descender_em + half_extra_em));
+        }
+
+        // An exact line shorter than the font is bottom-aligned and can clip
+        // the top of the glyph, so keep the descent and use the remaining
+        // declared height above the baseline.
+        return Some(((exact_line_em - descender_em).max(0.0), descender_em));
+    }
+
+    let (ascender_em, descender_em, leading_em) =
+        word_line_box_and_leading(runs, style, line_grid_pitch)?;
+    let metric_em: f64 = ascender_em + descender_em;
+    if metric_em <= 0.0 {
+        return None;
+    }
+    let pitch_em: f64 = metric_em + leading_em;
+    let top_em: f64 = ascender_em + east_asian_ascent_excess_em(runs, metric_em);
+    Some((top_em, pitch_em - top_em))
+}
+
+/// The Word line-box context applied to each declared font run in a mixed-face
+/// body paragraph.
+///
+/// The paragraph-level fixed edges remain the nominal face's edges, which is
+/// what prevents glyph fallback from inflating an otherwise uniform line
+/// (issue #398). When the paragraph deliberately names more than one metric
+/// family, however, Word takes the greatest ascent and descent among the runs
+/// that actually land on each line. Giving those runs their own numeric edges
+/// lets Typst perform that per-line maximum without consulting glyph fallback
+/// or imposing a paragraph-wide maximum on every line (issue #638).
+#[derive(Clone, Copy)]
+struct WordRunLineMetrics<'a> {
+    paragraph_style: &'a ParagraphStyle,
+    line_grid_pitch: Option<f64>,
+}
+
+impl<'a> WordRunLineMetrics<'a> {
+    fn for_mixed_declared_families(
+        runs: &[Run],
+        paragraph_style: &'a ParagraphStyle,
+        line_grid_pitch: Option<f64>,
+    ) -> Option<Self> {
+        let mut families = runs
+            .iter()
+            .filter(|run| run.footnote.is_none() && !run.text.is_empty())
+            .filter_map(|run| east_asian_aware_metric_family(std::slice::from_ref(run)));
+        let first_family: &str = families.next()?;
+        families
+            .any(|family| !family.eq_ignore_ascii_case(first_family))
+            .then_some(Self {
+                paragraph_style,
+                line_grid_pitch,
+            })
+    }
+
+    fn line_box_em(self, run: &Run) -> Option<(f64, f64)> {
+        word_line_box_em(
+            std::slice::from_ref(run),
+            self.paragraph_style,
+            self.line_grid_pitch,
+        )
+    }
+}
+
+/// A line-box override attached to one run rather than the whole paragraph.
+/// Typst then takes the greatest top and bottom among only the runs that land
+/// on each physical line.
+#[derive(Clone, Copy)]
+enum RunLineBox {
+    Em { top: f64, bottom: f64 },
+    Points { top: f64, bottom: f64 },
+}
+
+#[derive(Clone, Copy)]
+enum RunLineMetrics<'a> {
+    Word(WordRunLineMetrics<'a>),
+    PowerPoint(PowerPointRunLineMetrics),
+}
+
+impl RunLineMetrics<'_> {
+    fn line_box(self, run: &Run) -> Option<RunLineBox> {
+        match self {
+            Self::Word(metrics) => metrics
+                .line_box_em(run)
+                .map(|(top, bottom)| RunLineBox::Em { top, bottom }),
+            Self::PowerPoint(metrics) => metrics
+                .line_box_pt(run)
+                .map(|(top, bottom)| RunLineBox::Points { top, bottom }),
+        }
+    }
+}
+
+/// PowerPoint line metrics evaluated at a physical line's own declared size.
+///
+/// The paragraph-wide family set still decides the baseline share, preserving
+/// the existing font model. An automatically wrapped paragraph attaches the
+/// point edges to each run so Typst chooses the largest run that landed on the
+/// line (#1329); an explicit hard-break stack asks for the split at the line's
+/// already-known maximum size (#1252).
+#[derive(Clone, Copy)]
+struct PowerPointRunLineMetrics {
+    plain_ascent_em: f64,
+    line_spacing: f64,
+}
+
+impl PowerPointRunLineMetrics {
+    fn for_paragraph(runs: &[Run], style: &ParagraphStyle) -> Option<Self> {
+        let (plain_ascent_em, line_spacing) = powerpoint_paragraph_line_model(runs, style)?;
+        Some(Self {
+            plain_ascent_em,
+            line_spacing,
+        })
+    }
+
+    fn for_mixed_declared_sizes(runs: &[Run], style: &ParagraphStyle) -> Option<Self> {
+        let visible_runs: Vec<&Run> = runs
+            .iter()
+            .filter(|run| run.footnote.is_none() && !run.text.is_empty())
+            .collect();
+        if visible_runs.is_empty() || visible_runs.iter().any(|run| run.style.font_size.is_none()) {
+            return None;
+        }
+        let first_size: f64 = visible_runs[0].style.font_size?;
+        if !visible_runs.iter().any(|run| {
+            run.style
+                .font_size
+                .is_some_and(|size| (size - first_size).abs() > f64::EPSILON)
+        }) {
+            return None;
+        }
+
+        Self::for_paragraph(runs, style)
+    }
+
+    fn line_box_pt(self, run: &Run) -> Option<(f64, f64)> {
+        Some(self.line_box_pt_for_size(run.style.font_size?))
+    }
+
+    fn line_box_pt_for_size(self, font_size_pt: f64) -> (f64, f64) {
+        let (top_em, bottom_em) = powerpoint_percentage_line_box_em(
+            self.plain_ascent_em,
+            font_size_pt,
+            self.line_spacing,
+        );
+        (top_em * font_size_pt, bottom_em * font_size_pt)
+    }
+}
+
+/// The line-box model used by the measured stack for explicit slide breaks.
+///
+/// Plain lines round their baseline seat independently at the size of the
+/// physical line they hold (#1252). Explicit spacing keeps the existing
+/// paragraph-relative model: #1254 supplies the measured percentage regimes,
+/// while absolute spacing remains outside #1252's plain no-`lnSpc` probe.
+#[derive(Clone, Copy)]
+enum PowerPointHardBreakLineMetrics {
+    PerLine(PowerPointRunLineMetrics),
+    Paragraph { top_em: f64, bottom_em: f64 },
+}
+
+impl PowerPointHardBreakLineMetrics {
+    fn line_box_pt(self, font_size_pt: f64) -> (f64, f64) {
+        match self {
+            Self::PerLine(metrics) => metrics.line_box_pt_for_size(font_size_pt),
+            Self::Paragraph { top_em, bottom_em } => {
+                (top_em * font_size_pt, bottom_em * font_size_pt)
+            }
+        }
+    }
+}
+
+/// Line-box settings for a slide's text: PowerPoint's flat 1.2em line, split
+/// by [`crate::render::pdf::powerpoint_line_box_split_em`], and zero leading
+/// between lines.
+///
+/// This is the PPTX counterpart of [`word_line_height_settings`], and the two
+/// models genuinely differ. Word's line is the font's own hhea pitch;
+/// PowerPoint's ignores the font's metrics for the height and consults them
+/// only for where inside it the baseline sits. Slide text used to take the Word
+/// treatment, which is up to 4% short per line and accumulates down a bullet
+/// list, and it seated the baseline by Typst's normalised ascender, which put
+/// a bottom-anchored box's last baseline flat on the inset with no descent gap
+/// at all (issue #513).
+///
+/// `<a:lnSpc><a:spcPct>` scales that line rather than replacing it: the advance
+/// is `percent x 1.2em`, and [`powerpoint_percentage_line_box_em`] chooses the
+/// measured below- or above-100% baseline regime. Carrying the percentage as
+/// `par(leading)` instead moved nothing between single-line paragraphs — a
+/// slide's code block is one `<a:p>` per line — so the lines overlapped (issue
+/// #541).
+///
+/// The seat inside that line is measured in whole points rather than in em.
+/// Paragraph-wide callers therefore resolve it against the largest declared
+/// size. An automatically wrapped mixed-size paragraph attaches the resulting
+/// point edges to each run. A plain explicitly hard-broken stack likewise
+/// resolves the seat at each line's own maximum size, instead of rescaling the
+/// paragraph maximum's already-rounded ratio (#1252); a stack with explicit
+/// line spacing retains the paragraph-relative model described above.
+///
+/// `None` when the paragraph carries its own line box or when the font's
+/// metrics are unknown. An absolute `a:spcPts` rule is expressed as the
+/// equivalent scale of PowerPoint's plain 1.2em line so it retains the same
+/// baseline-seating model while replacing the advance.
+fn powerpoint_paragraph_line_box_em(runs: &[Run], style: &ParagraphStyle) -> Option<(f64, f64)> {
+    if let Some(LineSpacing::Exact(points) | LineSpacing::AtLeast(points)) = style.line_spacing
+        && points > 0.0
+        && style.line_box.is_none()
+    {
+        let families: Vec<&str> = powerpoint_line_families(runs, style);
+        let (ascent_em, _descent_em) =
+            crate::render::pdf::powerpoint_line_box_em_for_families(&families)?;
+        let font_size_pt: f64 = paragraph_font_size_pt(runs);
+        let plain_advance_pt: f64 =
+            crate::render::pdf::POWERPOINT_LINE_HEIGHT_FACTOR * font_size_pt;
+        return Some(powerpoint_top_resized_line_box_em(
+            ascent_em,
+            font_size_pt,
+            points / plain_advance_pt,
+        ));
+    }
+    let (ascent_em, percent) = powerpoint_paragraph_line_model(runs, style)?;
+    Some(powerpoint_percentage_line_box_em(
+        ascent_em,
+        paragraph_font_size_pt(runs),
+        percent,
+    ))
+}
+
+fn powerpoint_paragraph_line_model(runs: &[Run], style: &ParagraphStyle) -> Option<(f64, f64)> {
+    if style.line_box.is_some() {
+        return None;
+    }
+    let percent: f64 = match style.line_spacing {
+        None => 1.0,
+        Some(LineSpacing::Proportional(factor)) if factor > 0.0 => factor,
+        Some(_) => return None,
+    };
+    let families: Vec<&str> = powerpoint_line_families(runs, style);
+    let (ascent_em, _descent_em) =
+        crate::render::pdf::powerpoint_line_box_em_for_families(&families)?;
+    Some((ascent_em, percent))
+}
+
+/// Families sharing the paragraph's nominal final-line box, including the
+/// end mark. Typst keeps this box for layout; the completed-line paint pass
+/// removes the mark's seating contribution from automatically wrapped
+/// nonfinal lines. An undeclared run family inherits the named families, or
+/// the renderer's default when no family is declared.
+fn powerpoint_line_families<'a>(runs: &'a [Run], style: &'a ParagraphStyle) -> Vec<&'a str> {
+    let mut families: Vec<&str> = Vec::new();
+    let mut push = |family: &'a str| {
+        if !family.is_empty()
+            && !families
+                .iter()
+                .any(|seen| seen.eq_ignore_ascii_case(family))
+        {
+            families.push(family);
+        }
+    };
+    for run in runs {
+        if let Some(family) = run.style.font_family.as_deref() {
+            push(family);
+        }
+    }
+    if let Some(mark) = style.paragraph_mark_font_family.as_deref() {
+        push(mark);
+    }
+    if families.is_empty() {
+        families.push(crate::defaults::TYPST_DEFAULT_FONT_FAMILY);
+    }
+    families
+}
+
+/// The `(above baseline, below baseline)` split, in em, of a line an
+/// `<a:lnSpc><a:spcPct>` has resized to `percent` of PowerPoint's 1.2em box,
+/// for text set at `font_size_pt`. `ascent_em` is the plain line's own
+/// above-baseline share, as [`crate::render::pdf::powerpoint_line_box_em`]
+/// splits it.
+///
+/// **PowerPoint seats a baseline a whole number of points below its line box's
+/// top**, and the descent gap is whatever is left of the line. So the seat's
+/// share of the em is not constant across sizes, and neither is the gap:
+/// measured on native PowerPoint 16.112 exports, Avenir Next LT Pro keeps
+/// 0.192em under its baseline at 10pt and 0.2625em at 32pt. A one-factor probe
+/// deck of bottom-anchored boxes with every inset zeroed — Georgia (1.13623em,
+/// fits the box), Verdana (1.21533em), Avenir Next LT Pro (1.21289em) and
+/// Posterama (1.33008em) at 8, 11, 14, 18, 24, 28, 32, 36, 40, 44, 48, 54, 72
+/// and 100pt — puts all 56 cells on `1.2 x size - round(share x size)` within
+/// the exports' 0.12pt half-grid, and none of them within 0.12pt of the
+/// unrounded share. Carrying the share as a plain em fraction left every slide
+/// of the #841 Contoso deck that repeats its 10pt footer band 0.55pt high
+/// (issue #1074).
+///
+/// Georgia is the one of the four that fits the box, and its cells land on the
+/// same proportional share the other three do. Halving a fitting face's extra
+/// leading instead — which is what
+/// [`crate::render::pdf::powerpoint_line_box_split_em`] used to hand it — misses
+/// 9 of Georgia's 14 cells, by up to 2.04pt at 72pt (issue #1118).
+///
+/// At or below 100%, PowerPoint resizes the line from its **top**: the gap the
+/// face keeps below its baseline is the plain line's `1.2em - ascent_em`, and
+/// the ascent side absorbs the whole change. Measured against the plain-box
+/// control for the same face and size, Arial 38pt drops its first baseline
+/// 36.96pt below the content top plain and 30.00pt under `val="85000"`, a 6.96pt
+/// loss where the line loses 6.84pt. All 18 Posterama titles of the #841
+/// Contoso deck agree across 30, 32, 36, 38, 46 and 50pt. Scaling both sides at
+/// 85% instead left every one of those titles 1.8-3.7pt low (issues #1020,
+/// #1024).
+///
+/// Above 100%, PowerPoint switches to a face-independent 0.9em ascent and
+/// scales that with the percentage. A native PowerPoint 16.112 one-factor
+/// probe covers Arial at 6, 8, 9, 10, 11, 12 and 14pt under 125%, 150% and
+/// 200%; every first baseline lands on `round(0.9 x percent x size)`. Replacing
+/// Arial with Georgia, Verdana or Times New Roman at 150% leaves every baseline
+/// unchanged. Holding the plain descent gap instead misses those cells by up
+/// to two points (issue #1254).
+///
+/// The OOXML value is precise to one thousandth of a percent, but PowerPoint
+/// rounds it to a whole percent before choosing the regime or sizing the line:
+/// 100.499% is layout-identical to 100%, while 100.500% is identical to 101%.
+///
+/// At or below 100%, rounding lands on the **scaled** seat measured back from
+/// the plain line's unrounded gap, so there is one rounding and not two.
+/// Rounding the plain seat to a point first and subtracting that from the
+/// scaled advance predicts 10pt for slide 8's 14pt `Heraclitus` attribution
+/// under `val="85000"`, where the export seats it 11.04pt below the content
+/// top; the unrounded-gap form predicts 11. The #841 deck's other `spcPct`
+/// frames cannot tell the two apart — its 30pt centred and 38pt top-anchored
+/// Posterama titles land on 23pt and 29pt either way — so that one attribution
+/// carries the distinction.
+///
+/// The seat cannot outgrow the line it sits in, so a percentage small enough to
+/// close the box takes the ascent to zero rather than negative.
+pub(super) fn powerpoint_percentage_line_box_em(
+    ascent_em: f64,
+    font_size_pt: f64,
+    percent: f64,
+) -> (f64, f64) {
+    let (advance_em, seat_em) = powerpoint_percentage_line_box_seat_em(ascent_em, percent);
+    powerpoint_line_box_from_seat_em(advance_em, seat_em, font_size_pt)
+}
+
+fn powerpoint_percentage_line_box_seat_em(ascent_em: f64, percent: f64) -> (f64, f64) {
+    let percent: f64 = powerpoint_whole_percent(percent);
+    if percent > 1.0 {
+        let advance_em: f64 = crate::render::pdf::POWERPOINT_LINE_HEIGHT_FACTOR * percent;
+        let seat_em: f64 =
+            (POWERPOINT_EXPANDED_PERCENTAGE_ASCENT_EM * percent).clamp(0.0, advance_em);
+        return (advance_em, seat_em);
+    }
+    powerpoint_top_resized_line_box_seat_em(ascent_em, percent)
+}
+
+const POWERPOINT_EXPANDED_PERCENTAGE_ASCENT_EM: f64 = 0.9;
+
+fn powerpoint_whole_percent(percent: f64) -> f64 {
+    if !percent.is_finite() {
+        return 0.0;
+    }
+    let thousandths_of_percent: f64 = (percent.max(0.0) * 100_000.0).round();
+    (thousandths_of_percent / 1_000.0).round() / 100.0
+}
+
+fn powerpoint_top_resized_line_box_em(
+    ascent_em: f64,
+    font_size_pt: f64,
+    percent: f64,
+) -> (f64, f64) {
+    let (advance_em, seat_em) = powerpoint_top_resized_line_box_seat_em(ascent_em, percent);
+    powerpoint_line_box_from_seat_em(advance_em, seat_em, font_size_pt)
+}
+
+fn powerpoint_top_resized_line_box_seat_em(ascent_em: f64, percent: f64) -> (f64, f64) {
+    let advance_em: f64 = (crate::render::pdf::POWERPOINT_LINE_HEIGHT_FACTOR * percent).max(0.0);
+    let below_em: f64 = crate::render::pdf::POWERPOINT_LINE_HEIGHT_FACTOR - ascent_em;
+    (advance_em, (advance_em - below_em).clamp(0.0, advance_em))
+}
+
+fn powerpoint_line_box_from_seat_em(
+    advance_em: f64,
+    seat_em: f64,
+    font_size_pt: f64,
+) -> (f64, f64) {
+    let seat_em: f64 = seat_em.clamp(0.0, advance_em);
+    if font_size_pt.is_nan() || font_size_pt <= 0.0 {
+        return (seat_em, advance_em - seat_em);
+    }
+    let advance_pt: f64 = advance_em * font_size_pt;
+    let seat_pt: f64 = (seat_em * font_size_pt).round().clamp(0.0, advance_pt);
+    (
+        seat_pt / font_size_pt,
+        (advance_pt - seat_pt) / font_size_pt,
+    )
+}
+
+/// The same box, stated in the unit that survives the scope it lands in.
+///
+/// An `em` in a `#set text` edge resolves against whatever size is in force
+/// where the rule applies, not against the size the box was derived from. The
+/// paragraph emits a `#set text(size:)` of its own only when every one of its
+/// runs declares the same size, and a `<a:br/>` used to reach the IR as a run
+/// with no run properties at all — so one hard break was enough to strip that
+/// rule and leave the edges resolving against Typst's 11pt default. Every
+/// hard-broken line under 11pt then advanced a flat `1.2 x 11pt` = 13.20pt, 89%
+/// too far for a 6pt caption (issue #1115). The break now carries the style of
+/// the run it follows (issue #1666), so it no longer strips the rule on its
+/// own; a column whose lines declare different sizes still states no agreed
+/// size, and a break that opens its paragraph still falls back to the
+/// paragraph's default run style.
+///
+/// Restating the box in points pins it to the size it was computed from — the
+/// paragraph's largest declared size, which is the one PowerPoint's line keys
+/// on. When nothing declares a size there is none to pin to: the box was
+/// derived from the same default an `em` resolves against, so keeping `em`
+/// leaves an inherited size (a slide table's, say) still governing.
+pub(super) fn powerpoint_line_height_settings(
+    runs: &[Run],
+    style: &ParagraphStyle,
+) -> Option<String> {
+    let (ascent_em, descent_em) = powerpoint_paragraph_line_box_em(runs, style)?;
+    Some(powerpoint_line_height_settings_for_box(
+        runs, ascent_em, descent_em,
+    ))
+}
+
+/// PowerPoint table rows grow by the expanded paragraph ascent plus the
+/// plain line's below-baseline gap, with a 1.2em floor. Its horizontal rules
+/// sit on row boundaries and do not consume that line box. Native probes of
+/// Calibri and Arial table cells across 105–125% spacing establish this row
+/// model; slide text boxes retain their separate 1.2em-scaled line.
+pub(super) fn powerpoint_table_line_height_settings(
+    runs: &[Run],
+    style: &ParagraphStyle,
+) -> Option<String> {
+    let line_box: Option<(f64, f64)> = match style.line_spacing {
+        Some(LineSpacing::Proportional(factor)) if powerpoint_whole_percent(factor) > 1.0 => {
+            let families: Vec<&str> = powerpoint_line_families(runs, style);
+            let (_, plain_bottom_em) =
+                crate::render::pdf::powerpoint_line_box_em_for_families(&families)?;
+            let font_size_pt: f64 = paragraph_font_size_pt(runs);
+            let percent: f64 = powerpoint_whole_percent(factor);
+            let advance_em: f64 = (POWERPOINT_EXPANDED_PERCENTAGE_ASCENT_EM * percent
+                + plain_bottom_em)
+                .max(crate::render::pdf::POWERPOINT_LINE_HEIGHT_FACTOR);
+            let advance_pt: f64 = advance_em * font_size_pt;
+            let ascent_pt: f64 =
+                (POWERPOINT_EXPANDED_PERCENTAGE_ASCENT_EM * percent * font_size_pt)
+                    .round()
+                    .clamp(0.0, advance_pt);
+            Some((
+                ascent_pt / font_size_pt,
+                (advance_pt - ascent_pt) / font_size_pt,
+            ))
+        }
+        _ => powerpoint_paragraph_line_box_em(runs, style),
+    };
+    let (ascent_em, descent_em) = line_box?;
+    Some(powerpoint_line_height_settings_for_box(
+        runs, ascent_em, descent_em,
+    ))
+}
+
+fn powerpoint_line_height_settings_for_box(
+    runs: &[Run],
+    ascent_em: f64,
+    descent_em: f64,
+) -> String {
+    let Some(font_size_pt) = declared_paragraph_font_size_pt(runs) else {
+        return format!(
+            "#set text(top-edge: {}em, bottom-edge: -{}em)\n#set par(leading: 0pt)\n",
+            format_f64(ascent_em),
+            format_f64(descent_em)
+        );
+    };
+    format!(
+        "#set text(top-edge: {}pt, bottom-edge: -{}pt)\n#set par(leading: 0pt)\n",
+        format_f64(ascent_em * font_size_pt),
+        format_f64(descent_em * font_size_pt)
+    )
+}
+
+/// Explicit breaks already have a separate line-stack model.
+/// TODO(scripted line seating): shifted glyph baselines need logical line IDs
+/// before the completed-frame pass can distinguish them from separate lines.
+///
+/// A zero displacement is no displacement. Masters routinely state
+/// `<a:defRPr baseline="0">`, which every run of the deck inherits, and
+/// PowerPoint seats those runs exactly like unshifted ones — so they keep the
+/// story-grid rounding a raised or lowered run has to forgo (issue #1071).
+fn can_adjust_powerpoint_physical_lines(runs: &[Run]) -> bool {
+    runs.iter().all(|run| {
+        run.style.vertical_align.is_none()
+            && !has_baseline_displacement(&run.style)
+            && !run.text.contains(['\n', '\r', '\u{000B}'])
+    })
+}
+
+/// Whether the run is actually raised or lowered, as opposed to carrying an
+/// inherited `baseline="0"` that leaves it on the line.
+fn has_baseline_displacement(style: &TextStyle) -> bool {
+    style
+        .baseline_shift
+        .is_some_and(|BaselineShiftEm(shift_em)| shift_em != 0.0)
+}
+
+/// PowerPoint rounds within a text story before translating it into its box.
+/// Capture the story origin once so later paragraphs share that local grid.
+pub(super) fn write_powerpoint_relative_baseline_scope_open(out: &mut String) {
+    out.push_str("#context { let o2p-pptx-grid-origin = here().position().y; [\n");
+}
+
+/// Top-anchored slide text rounds paragraph positions within the story;
+/// centered/bottom text keeps its existing layout seats. Floating Word
+/// text boxes share the generator but must not inherit the slide paint pass.
+#[derive(Clone, Copy)]
+pub(super) enum PowerPointBaselineMode {
+    Disabled,
+    Top,
+    Relative,
+}
+
+impl PowerPointBaselineMode {
+    pub(super) fn for_paragraph(
+        self,
+        runs: &[Run],
+        style: &ParagraphStyle,
+    ) -> Option<PowerPointBaselineSnap> {
+        match self {
+            Self::Disabled => None,
+            Self::Top => powerpoint_baseline_snap(runs, style),
+            Self::Relative => {
+                let mut snap = powerpoint_baseline_snap(runs, style)?;
+                if !can_adjust_powerpoint_physical_lines(runs) {
+                    return None;
+                }
+                let unmarked_style = ParagraphStyle {
+                    paragraph_mark_font_family: None,
+                    ..style.clone()
+                };
+                snap.nonfinal_seat_pt =
+                    Some(powerpoint_baseline_snap(runs, &unmarked_style)?.raw_seat_pt);
+                snap.round_position = false;
+                Some(snap)
+            }
+        }
+    }
+}
+
+/// Metric and layout seats for a fixed slide paragraph. After Typst wraps,
+/// physical lines round their running positions within the story, using each
+/// line's font size and excluding the paragraph-end font from nonfinal lines.
+/// Unwrapped centered/bottom text retains its anchor-relative layout seat.
+/// These paint adjustments do not change wrapping or layout height.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct PowerPointBaselineSnap {
+    raw_seat_pt: f64,
+    layout_seat_pt: f64,
+    nonfinal_seat_pt: Option<f64>,
+    round_position: bool,
+    round_lines: bool,
+    mixed_size_seats: Option<(f64, f64)>,
+}
+
+impl PowerPointBaselineSnap {
+    pub(super) fn write_open(self, out: &mut String) {
+        self.write_scope_open(out, false);
+    }
+
+    pub(super) fn write_marker_open(self, out: &mut String) {
+        self.write_scope_open(out, true);
+    }
+
+    pub(super) fn adjusts_physical_lines(self) -> bool {
+        self.round_lines || self.nonfinal_seat_pt.is_some()
+    }
+
+    fn write_scope_open(self, out: &mut String, marker: bool) {
+        let _ = write!(
+            out,
+            "#o2p-pptx-snap-baseline({}pt, {}pt",
+            format_f64(self.raw_seat_pt),
+            format_f64(self.layout_seat_pt),
+        );
+        if let Some(seat) = self.nonfinal_seat_pt {
+            let _ = write!(out, ", nonfinal-seat: {}pt", format_f64(seat));
+        }
+        out.push_str(", origin: o2p-pptx-grid-origin");
+        if !self.round_position {
+            out.push_str(", round-position: false");
+        }
+        if self.round_lines {
+            out.push_str(", round-lines: true");
+        }
+        if let Some((advance_em, marked_em)) = self.mixed_size_seats {
+            let nonfinal = self.nonfinal_seat_pt.unwrap_or(self.raw_seat_pt);
+            let nonfinal_em = marked_em * nonfinal / self.raw_seat_pt;
+            let _ = write!(
+                out,
+                ", size-seats: ({}, {}, {}, {}, {}, {})",
+                format_f64(marked_em),
+                format_f64(nonfinal_em),
+                format_f64(advance_em),
+                format_f64(self.layout_seat_pt),
+                format_f64(self.raw_seat_pt),
+                format_f64(nonfinal),
+            );
+        }
+        if marker {
+            out.push_str(", marker: true");
+        }
+        out.push_str(")[");
+    }
+}
+
+pub(super) fn powerpoint_baseline_snap(
+    runs: &[Run],
+    style: &ParagraphStyle,
+) -> Option<PowerPointBaselineSnap> {
+    let font_size_pt: f64 = declared_paragraph_font_size_pt(runs)?;
+    if !font_size_pt.is_finite() || font_size_pt <= 0.0 || style.line_box.is_some() {
+        return None;
+    }
+
+    let raw_seat_em: f64 = match style.line_spacing {
+        Some(LineSpacing::Exact(points) | LineSpacing::AtLeast(points)) if points > 0.0 => {
+            let families: Vec<&str> = powerpoint_line_families(runs, style);
+            let (ascent_em, _descent_em) =
+                crate::render::pdf::powerpoint_line_box_em_for_families(&families)?;
+            let plain_advance_pt: f64 =
+                crate::render::pdf::POWERPOINT_LINE_HEIGHT_FACTOR * font_size_pt;
+            powerpoint_top_resized_line_box_seat_em(ascent_em, points / plain_advance_pt).1
+        }
+        _ => {
+            let (ascent_em, percent) = powerpoint_paragraph_line_model(runs, style)?;
+            powerpoint_percentage_line_box_seat_em(ascent_em, percent).1
+        }
+    };
+    let raw_seat_pt: f64 = raw_seat_em * font_size_pt;
+    let layout_seat_pt: f64 = powerpoint_paragraph_line_box_em(runs, style)?.0 * font_size_pt;
+    let nonfinal_seat_pt = style
+        .paragraph_mark_font_family
+        .as_ref()
+        .filter(|_| can_adjust_powerpoint_physical_lines(runs))
+        .and_then(|_| {
+            let unmarked_style = ParagraphStyle {
+                paragraph_mark_font_family: None,
+                ..style.clone()
+            };
+            powerpoint_baseline_snap(runs, &unmarked_style)
+                .map(|snap| snap.raw_seat_pt)
+                .filter(|seat| (seat - raw_seat_pt).abs() > 0.0001)
+        });
+    Some(PowerPointBaselineSnap {
+        raw_seat_pt,
+        layout_seat_pt,
+        nonfinal_seat_pt,
+        round_position: true,
+        round_lines: can_adjust_powerpoint_physical_lines(runs),
+        mixed_size_seats: PowerPointRunLineMetrics::for_mixed_declared_sizes(runs, style)
+            .filter(|_| raw_seat_pt > 0.0)
+            .map(|metrics| {
+                powerpoint_percentage_line_box_seat_em(
+                    metrics.plain_ascent_em,
+                    metrics.line_spacing,
+                )
+            }),
+    })
+}
+
+/// The height, in points, of one blank PowerPoint line for `runs`.
+///
+/// The empty-paragraph strut in a slide's table cell has to be sized from the
+/// same model as its neighbours, or the blank line keeps Word's hhea height
+/// while the text beside it takes PowerPoint's 1.2em one (issues #625, #663).
+pub(super) fn powerpoint_line_box_pt(runs: &[Run]) -> Option<f64> {
+    let family: &str = runs
+        .iter()
+        .find_map(|run| run.style.font_family.as_deref())
+        .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_FAMILY);
+    let (ascent_em, descent_em) = crate::render::pdf::powerpoint_line_box_em(family)?;
+    Some((ascent_em + descent_em) * paragraph_font_size_pt(runs))
+}
+
+/// The nominal font's `(above baseline, below baseline)` split plus the
+/// leading, in em, that tops the line box up to Word's line advance. `None`
+/// when the metric-edge treatment does not apply.
+///
+/// Since #508 the pair already sums to the font's single-spacing pitch, so the
+/// leading is zero for a Latin line with no grid; it carries the East Asian
+/// bonus and any grid slack (issue #518).
+fn word_line_box_and_leading(
+    runs: &[Run],
+    style: &ParagraphStyle,
+    line_grid_pitch: Option<f64>,
+) -> Option<(f64, f64, f64)> {
+    let leading_pt: f64 = word_line_leading_pt(runs, style, line_grid_pitch)?;
+    let family: &str = word_paragraph_metric_family(runs, style)?;
+    let (ascender_em, descender_em, _word_pitch_em) =
+        word_line_metrics_em(family, line_takes_east_asian_metrics(runs))?;
+    let font_size: f64 = paragraph_font_size_pt(runs);
+    Some((ascender_em, descender_em, leading_pt / font_size))
+}
+
+/// Word gives a line set in an East Asian face 130% of the font's own
+/// ascender-plus-descender, and centres the bonus on the baseline: half above,
+/// half below.
+///
+/// The face decides, not the line's characters — see
+/// [`line_takes_east_asian_metrics`] (issue #643).
+///
+/// Both halves are measured, not assumed. Against native Word exports an Arial
+/// first baseline sits at `hhea ascender + lineGap` = 0.937988em below the text
+/// top while a Malgun Gothic one at the same settings sits at 1.28786em, and
+/// the difference is exactly `0.15 x` Malgun's 1.330078em line — the term #508
+/// could not attribute to any font table. The matching lower half shows up
+/// as the advance: every Korean fixture in the business corpus paces its
+/// wrapped lines at `1.3 x` that line (10.5pt Malgun measures 18.00-18.24
+/// against 18.156 predicted), and 06_official_letter_ko's 9.5pt paragraphs
+/// advance 16.43pt where the font's bare line is 12.64pt (issue #518).
+///
+/// The line the factor multiplies excludes the face's `hhea` line gap, which
+/// Malgun Gothic and Meiryo could not show because theirs is zero — see
+/// [`word_line_metrics_em`] (issue #1638).
+const EAST_ASIAN_LINE_HEIGHT_FACTOR: f64 = 1.3;
+
+/// The half of that bonus which lands above the baseline.
+const EAST_ASIAN_ASCENT_EXCESS: f64 = (EAST_ASIAN_LINE_HEIGHT_FACTOR - 1.0) / 2.0;
+
+/// The line metrics Word measures a line set in `family` by, in em units:
+/// `(above baseline, below baseline, single-line pitch)`.
+///
+/// A Latin line is [`crate::render::pdf::font_line_metrics_em`] unchanged: the
+/// face's `hhea` line gap belongs to the pitch, and Word puts it above the
+/// baseline (Arial 67/2048 in issue #508, the system Times New Roman's 87/2048
+/// in #1284).
+///
+/// **An East Asian line leaves the gap out of both.** Its box is
+/// [`EAST_ASIAN_LINE_HEIGHT_FACTOR`] times the bare `hhea` ascender-plus-
+/// descender, and its baseline sits [`EAST_ASIAN_ASCENT_EXCESS`] of that same
+/// bare line below the ascender. Malgun Gothic and Meiryo hid this for as long
+/// as they were the only faces measured, because their gap is zero; Batang,
+/// Gulim, Dotum and Gungsuh declare 152/1024, and carrying it advanced a 10.5pt
+/// Batang paragraph 15.68pt per line where a native Word for Mac export
+/// advances 13.65pt = `1.3 x (879 + 145)/1024`, and seated its first baseline
+/// 1.77pt low (issue #1638).
+///
+/// The gap-free reading is `hhea`'s, not `OS/2`'s `usWin` pair, which those
+/// faces cannot tell apart because the two are equal for every one of them.
+/// Three native Word for Mac exports of Japanese probe paragraphs in faces
+/// where they differ settle it: Yu Gothic (`hhea` 1802/-455/1024, `usWin`
+/// 2017/619) advances 15.03pt at 10.5pt against 15.04 predicted from `hhea`
+/// and 17.57 from `usWin`, Hiragino Sans GB (880/-120/500 against 951/211)
+/// advances 13.65 against 13.65 and 15.86, and Yu Mincho — same `hhea` as Yu
+/// Gothic, different `usWin` — exports baselines identical to Yu Gothic's.
+///
+/// The rule is not Korean-specific: a SimSun probe (`hhea` 220/-36/36 per 256)
+/// advances 13.60pt and seats its first baseline 10.61pt below the margin,
+/// against 13.65 and 10.59 gap-free (15.57 and 12.38 with the gap), and a
+/// Microsoft YaHei one — a CJK face that declares no gap — keeps the plain
+/// 1.3 factor at 18.00pt against 18.02 predicted.
+fn word_line_metrics_em(family: &str, takes_east_asian_metrics: bool) -> Option<(f64, f64, f64)> {
+    let (ascender_em, descender_em, pitch_em) = crate::render::pdf::font_line_metrics_em(family)?;
+    if !takes_east_asian_metrics {
+        return Some((ascender_em, descender_em, pitch_em));
+    }
+    // `font_line_metrics_em` folds the gap into its first element, so removing
+    // it from the ascent and the pitch keeps the triple summing to itself.
+    let line_gap_em: f64 = crate::render::pdf::font_line_gap_em(family).unwrap_or(0.0);
+    Some((
+        ascender_em - line_gap_em,
+        descender_em,
+        pitch_em - line_gap_em,
+    ))
+}
+
+/// The family whose metrics pace these runs' lines.
+///
+/// A line carrying East Asian text is paced by the East Asian face, not by the
+/// Latin one the same runs also name: the 1.3 factor above was measured
+/// against Malgun Gothic's hhea pitch. Reading the Latin family was harmless
+/// only while `w:eastAsia` was being dropped and the Latin family was the one
+/// actually shaping the Hangul (issue #575).
+fn east_asian_aware_metric_family(runs: &[Run]) -> Option<&str> {
+    let latin = || runs.iter().find_map(|run| run.style.font_family.as_deref());
+    if has_east_asian_text(runs) {
+        runs.iter()
+            .find_map(|run| run.style.east_asian_font_family.as_deref())
+            .or_else(latin)
+    } else {
+        latin()
+    }
+}
+
+pub(super) fn word_paragraph_metric_family<'a>(
+    runs: &'a [Run],
+    style: &'a ParagraphStyle,
+) -> Option<&'a str> {
+    east_asian_aware_metric_family(runs).or_else(|| {
+        (runs.is_empty() && matches!(style.line_spacing, Some(LineSpacing::Proportional(_)))).then(
+            || {
+                style
+                    .paragraph_mark_font_family
+                    .as_deref()
+                    .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_FAMILY)
+            },
+        )
+    })
+}
+
+/// The family that actually paints a spreadsheet cell's representative run.
+///
+/// Sheet line seats are measured from the painted face, not from a declared
+/// family's metric-substitution chain. Typst walks the emitted list per glyph,
+/// so a Simplified Chinese face that has no Hangul yields to the Korean script
+/// fallback even though a family-only metric lookup can resolve it (issue
+/// #1239).
+fn sheet_cell_metric_family(runs: &[Run]) -> Option<String> {
+    let run: &Run = sheet_cell_metric_run(runs)?;
+    let latin_family: &str = run
+        .style
+        .font_family
+        .as_deref()
+        .or(run.style.east_asian_font_family.as_deref())?;
+    Some(crate::render::font_subst::painted_family_for_text(
+        latin_family,
+        run.style.east_asian_font_family.as_deref(),
+        &run.text,
+    ))
+}
+
+/// The run whose face represents a spreadsheet cell's line metrics. Keeping
+/// this selection shared makes the painted and declared family answers below
+/// describe the same run even when a paragraph mixes scripts or faces.
+fn sheet_cell_metric_run(runs: &[Run]) -> Option<&Run> {
+    if has_east_asian_text(runs) {
+        runs.iter()
+            .find(|run| {
+                run.text.chars().any(is_cjk_like)
+                    && (run.style.font_family.is_some()
+                        || run.style.east_asian_font_family.is_some())
+            })
+            .or_else(|| {
+                runs.iter()
+                    .find(|run| run.style.east_asian_font_family.is_some())
+            })
+    } else {
+        runs.iter().find(|run| run.style.font_family.is_some())
+    }
+}
+
+/// The workbook family Excel uses to choose a wrapped sheet cell's native
+/// line advance. Painting may resolve that request to a substitute, but the
+/// source application's pitch remains keyed to the declared face (#1498).
+fn sheet_cell_declared_metric_family(runs: &[Run]) -> Option<&str> {
+    let run: &Run = sheet_cell_metric_run(runs)?;
+    if has_east_asian_text(runs) {
+        run.style
+            .east_asian_font_family
+            .as_deref()
+            .or(run.style.font_family.as_deref())
+    } else {
+        run.style
+            .font_family
+            .as_deref()
+            .or(run.style.east_asian_font_family.as_deref())
+    }
+}
+
+fn has_east_asian_text(runs: &[Run]) -> bool {
+    runs.iter().any(|run| run.text.chars().any(is_cjk_like))
+}
+
+/// Whether Word measures this line with its East Asian metrics.
+///
+/// Word keys that on the face the line is **set in**, not on the script of its
+/// characters: a CJK family shapes its own Latin glyphs and the line keeps the
+/// East Asian height. Three Heading2 paragraphs in `03_meeting_minutes_ko`
+/// share `w:rPr` naming Malgun Gothic in every `w:rFonts` slot and differ only
+/// in script; Word gives them the same height, and gating on the text left the
+/// Latin-only one 2.37pt short (issue #643).
+///
+/// Reading the resolved metric family rather than `w:eastAsia` directly is what
+/// keeps a Latin line Latin: the business fixtures declare
+/// `w:eastAsia="Arial"`, and [`east_asian_aware_metric_family`] already resolves
+/// a Latin-only line to its Latin family. So an Arial paragraph inside a Korean
+/// document keeps its own line, which is what Word does — snapping those
+/// inflated every Western document by 30-50% (issue #354).
+pub(super) fn line_takes_east_asian_metrics(runs: &[Run]) -> bool {
+    has_east_asian_text(runs)
+        || east_asian_aware_metric_family(runs)
+            .is_some_and(crate::render::font_subst::is_east_asian_family)
+}
+
+/// The extra ascent, in em, that Word gives a line set in an East Asian face.
+///
+/// `pitch_em` is the font's own gap-free line ([`word_line_metrics_em`]), never
+/// the line's advance: under a document grid the slot's extra height accrues
+/// entirely below the baseline, so this term must not scale with the slot
+/// (issues #518, #1638).
+fn east_asian_ascent_excess_em(runs: &[Run], pitch_em: f64) -> f64 {
+    if line_takes_east_asian_metrics(runs) {
+        EAST_ASIAN_ASCENT_EXCESS * pitch_em
+    } else {
+        0.0
+    }
+}
+
+/// A line's sub-baseline share, in em: the East Asian advance minus the ascent
+/// Word seats the glyphs at, rather than the face's plain descender.
+///
+/// Two callers want exactly this quantity. A footer story is measured **up**
+/// from the `w:pgMar/@w:footer` line to its last line's box bottom, which is
+/// the mirror of [`word_header_line_ascent_em`]. A header's `w:pBdr w:space`
+/// gap is measured **down** from the same box bottom. The rationale below was
+/// established for the footer case; the header case is noted at the end.
+///
+/// Which one it is decides the footer outright. The three golden mocks 01, 02
+/// and 03 differ in their `footer1.xml` only in `w:rFonts`, and Word moves the
+/// baseline with the font: 804.72pt for the Arial footer and 802.80pt for the
+/// Malgun Gothic ones, both at `w:footer="708"` = 35.40pt on A4. Typst's
+/// `bottom-edge: "descender"` answers with its *normalised* descender, which is
+/// 0.199em for Malgun Gothic against the 0.4412em its line box actually carries
+/// below the baseline — so every Korean footer in the corpus printed 2.10pt low
+/// while the Arial one, whose two answers nearly agree, looked correct
+/// (issue #630).
+///
+/// East Asian metrics key on the resolved face, not on the footer's characters:
+/// `- 2 -` is ASCII in all three files and Word still gives the Malgun ones the
+/// taller line. That is [`line_takes_east_asian_metrics`]'s rule, already
+/// established for body lines by issue #643.
+///
+/// The header path asks the same question: `w:pBdr w:space` is measured from
+/// the line's bottom, so a Korean header rule sat 1.98pt high on the same
+/// normalised-descender answer until it read this instead (issue #737).
+///
+/// `None` when the face's metrics are unknown, which leaves the story on the
+/// renderer's own seat.
+pub(super) fn word_line_box_descent_em(runs: &[Run]) -> Option<f64> {
+    let family: &str = east_asian_aware_metric_family(runs)?;
+    let (ascender_em, descender_em, pitch_em) =
+        word_line_metrics_em(family, line_takes_east_asian_metrics(runs))?;
+    if ascender_em + descender_em <= 0.0 || pitch_em <= 0.0 {
+        return None;
+    }
+    let advance_em: f64 = if line_takes_east_asian_metrics(runs) {
+        EAST_ASIAN_LINE_HEIGHT_FACTOR * pitch_em
+    } else {
+        pitch_em
+    };
+    let top_em: f64 = ascender_em + east_asian_ascent_excess_em(runs, pitch_em);
+    Some(advance_em - top_em)
+}
+
+/// How far an Excel sheet header or footer line reaches below its baseline,
+/// in points of the sheet's own coordinate space.
+///
+/// Each run reaches its face's bare `hhea` descender at its own size —
+/// deliberately *not* [`word_line_box_descent_em`], which carries Word's 1.3x
+/// East Asian line box and the line gap Word keeps above the baseline,
+/// neither of which any Excel export measured here shows. Native
+/// Excel-for-Mac exports seat a footer baseline its `hhea` descent above the
+/// band Excel leaves for it — Calibri 0.26855em, Arial 0.21191em, Verdana
+/// 0.20996em, Times New Roman 0.21631em and Aptos 0.28174em all land on the
+/// whole point Excel prints (issue #1142).
+///
+/// The line bottoms out on whichever run reaches furthest: not the first
+/// run's face, and not the largest run. A 20pt Trebuchet MS `#` ahead of 8pt
+/// Aptos text seats the line on the 20pt run's 4.44pt, and 13pt Aptos beside
+/// 15pt Arial on the Aptos run's 3.66pt rather than the larger run's 3.18pt,
+/// in either order. The reported Sensitivity label — a 1pt marker run in the
+/// Normal font ahead of the 8pt Aptos text — had taken the marker's face for
+/// the label's descent (issue #1552).
+///
+/// `scale` is the fit-to-page factor already multiplied into the runs' sizes
+/// (issue #940), divided back out so the result is in the sheet points the
+/// seat is rounded in. `None` when no run's face has metrics, which leaves the
+/// story on the renderer's own seat.
+pub(super) fn sheet_line_deepest_descent_pt(runs: &[Run], scale: f64) -> Option<f64> {
+    runs.iter()
+        .filter_map(|run| {
+            let family: &str = east_asian_aware_metric_family(std::slice::from_ref(run))?;
+            let (_, descent_em, _) = crate::render::pdf::font_line_metrics_em(family)?;
+            let size_pt: f64 = run
+                .style
+                .font_size
+                .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_SIZE_PT)
+                / scale;
+            (descent_em > 0.0).then_some(descent_em * size_pt)
+        })
+        .reduce(f64::max)
+}
+
+/// Where Word seats a header story's first baseline, in em below the
+/// `w:pgMar/@w:header` line the header is measured from.
+///
+/// That origin is the top of the first line's box, so a Latin header gets the
+/// very edge [`crate::render::pdf::font_line_metrics_em`] gives every body
+/// line: the face's `hhea` ascender **plus** its `hhea` line gap. An East Asian
+/// line adds the upper half of its bonus to a gap-free ascender instead,
+/// because its box leaves the gap out at both ends ([`word_line_metrics_em`],
+/// issue #1638).
+///
+/// The Latin seat is four one-factor native Word 16.112 exports of
+/// `unit_test_headers.docx` at `w:header="720"` = 36pt, the header run given an
+/// explicit `w:rFonts` and `w:sz`: Arial 24pt lands at 58.56pt against 58.51
+/// predicted, Times New Roman 24pt at 58.32 against 58.41, and Times New Roman
+/// 12pt at 47.28 against 47.20, each inside the 0.24pt grid those exports
+/// quantise positions to and each 0.59 to 0.93pt away from the bare-ascender
+/// seat. Georgia 24pt, which declares no gap, is the control: it measures
+/// 58.08pt where both models predict 58.01 (issue #1640).
+///
+/// That supersedes the bare-ascender reading of issues #508 and #629, which was
+/// calibrated on an 8pt Arial header at `w:header="708"` = 35.40pt — a size
+/// whose 0.26pt gap and an origin sitting half a device pixel off the grid
+/// leave the two models one pixel apart, too close for that export to separate.
+///
+/// The East Asian bonus keys on the resolved face, not on the header's
+/// characters, like every other line box (issues #643, #814): a one-factor
+/// native export of `10_research_report_ko` with its header text swapped to
+/// `Monthly Customer Satisfaction Trend Report` keeps the baseline at 45.60pt —
+/// exactly the Korean control's seat — where the bare ascender would put it at
+/// 44.11pt. Malgun Gothic declares no line gap, so those Korean measurements
+/// bind the gap-free branch unchanged.
+fn word_header_line_ascent_em(runs: &[Run], family: &str) -> Option<f64> {
+    // Read the ascender explicitly rather than through `font_line_metrics_em`,
+    // whose `ttf_parser` alias answers with OS/2 `sTypoAscender` on the faces
+    // that set `USE_TYPO_METRICS` (see `font_hhea_ascender_em`).
+    let ascender_em: f64 = crate::render::pdf::font_hhea_ascender_em(family)?;
+    if !line_takes_east_asian_metrics(runs) {
+        let line_gap_em: f64 = crate::render::pdf::font_line_gap_em(family).unwrap_or(0.0);
+        return Some(ascender_em + line_gap_em);
+    }
+    let (_, _, pitch_em) = word_line_metrics_em(family, true)?;
+    Some(ascender_em + EAST_ASIAN_ASCENT_EXCESS * pitch_em)
+}
+
+/// How far a pinned header band must move so its first baseline lands where
+/// Word puts it, in points, positive downward.
+///
+/// The difference between [`word_header_line_ascent_em`] and the ascent the
+/// compiler gives the same line — its default `top-edge` is `"cap-height"` —
+/// resolved at the size that line is set in. Emitting the difference as a band
+/// offset rather than as a `top-edge` is what keeps the story's own line advance
+/// untouched: `top-edge` applies to every line of the paragraph it is set on, so
+/// declaring Word's ascent there stretched a wrapped 8pt Arial header's advance
+/// from 10.93pt to 12.44pt against Word's 9.20pt (issue #629).
+///
+/// Both terms read the same family and the same size — the largest among the
+/// runs, which is the one whose ascent wins the line in either engine.
+pub(super) fn word_header_band_shift_pt(runs: &[Run]) -> Option<f64> {
+    let family: &str = east_asian_aware_metric_family(runs)?;
+    let word_ascent_em: f64 = word_header_line_ascent_em(runs, family)?;
+    let compiler_ascent_em: f64 = crate::render::pdf::font_cap_height_em(family)?;
+    Some((word_ascent_em - compiler_ascent_em) * paragraph_font_size_pt(runs))
+}
+
+/// Leading that makes a header or footer line advance by Word's pitch.
+///
+/// Typst advances a line by `top-edge + bottom-edge + leading`, and the story
+/// carried none of those, so it took the 0.65em default: a wrapped 8pt Arial
+/// header advanced 10.9305pt = (0.65 + 0.71631) x 8 where Word advances
+/// 9.1992pt = (2355/2048) x 8 (issue #735).
+///
+/// The leading is the remainder after the edges, not a replacement for them.
+/// That matters: the top edge is what #629's `word_header_band_shift_pt` seats
+/// the first baseline against, so leaving it alone keeps that seat exactly
+/// where it was and confines this to the advance *between* lines.
+/// `bottom_edge_em` is how far below the baseline the caller set the bottom
+/// edge, which is nonzero where a pinned footer band sets its last line's
+/// descent there (issue #2326).
+///
+/// Not to be confused with [`word_line_leading_pt`], which answers a different
+/// question for body paragraphs: that one is folded into a fixed line box,
+/// this one is emitted directly as `par(leading:)` for a header or footer
+/// story.
+///
+/// `None` where the face's metrics are unknown. Where the edges already
+/// exceed Word's pitch — a band edge taken from a deeper face than this
+/// paragraph's — no leading shrinks the advance to it, and none at all comes
+/// closest.
+pub(super) fn word_hf_line_leading_pt(runs: &[Run], bottom_edge_em: f64) -> Option<f64> {
+    let family: &str = east_asian_aware_metric_family(runs)?;
+    let (_ascender_em, _descender_em, pitch_em) =
+        word_line_metrics_em(family, line_takes_east_asian_metrics(runs))?;
+    if pitch_em <= 0.0 {
+        return None;
+    }
+    // The story sets no `top-edge`, so Typst's default cap-height one is what
+    // the advance already carries.
+    let top_edge_em: f64 = crate::render::pdf::font_cap_height_em(family)?;
+    let advance_em: f64 = word_natural_line_em(runs, pitch_em);
+    let leading_em: f64 = advance_em - top_edge_em - bottom_edge_em;
+    Some(leading_em.max(0.0) * paragraph_font_size_pt(runs))
+}
+
+/// The height one header or footer line takes, in points.
+///
+/// Word's natural line for the paragraph's resolved face and size — the hhea
+/// line, or 1.3 times its gap-free part for an East Asian one. A header taller than the band
+/// `w:top - w:header` leaves has to grow the top margin, and this is the term
+/// that measures it (issue #736).
+///
+/// `None` where the face's metrics are unknown, which leaves the band at the
+/// declared size rather than guessing at a growth.
+pub(super) fn word_line_advance_pt(runs: &[Run]) -> Option<f64> {
+    let family: &str = east_asian_aware_metric_family(runs)?;
+    let (_ascender_em, _descender_em, pitch_em) =
+        word_line_metrics_em(family, line_takes_east_asian_metrics(runs))?;
+    if pitch_em <= 0.0 {
+        return None;
+    }
+    Some(word_natural_line_em(runs, pitch_em) * paragraph_font_size_pt(runs))
+}
+
+/// Share of an exact header line Word puts above the baseline.
+///
+/// Word lays a `w:lineRule="exact"` header line out at its stated height and
+/// seats the baseline four fifths of the way down, whatever the face, so a
+/// line shorter than the face clips the tops of its glyphs. docxide-pdf's
+/// first-page header cases seat Aptos 12pt 128.08pt and 9.50pt below the tops
+/// of a 160pt and a 12pt line, the second shorter than Aptos's 14.65pt natural
+/// line (issue #2214). LibreOffice Writer splits its fixed line height the
+/// same way. Body lines still centre the extra height in [`word_line_box_em`],
+/// although docxide-pdf's `continued-gap-cell-after0-before0` reference seats
+/// a 16pt exact body-cell line 0.8 down too, 0.66pt below ours (recorded in
+/// #1874).
+const WORD_EXACT_LINE_ASCENT_SHARE: f64 = 0.8;
+
+/// The ascent and descent, in points, of one exact header line `line_pt` tall.
+pub(super) fn word_exact_line_box_pt(line_pt: f64) -> (f64, f64) {
+    let ascent_pt: f64 = WORD_EXACT_LINE_ASCENT_SHARE * line_pt;
+    (ascent_pt, line_pt - ascent_pt)
+}
+
+/// The ascent and descent, in points, of one natural header line.
+///
+/// The baseline sits one [`word_header_line_ascent_em`] below the line top, as
+/// [`word_header_band_shift_pt`] seats it, and the rest of
+/// [`word_line_advance_pt`] lies below it. `None` where the face's metrics are
+/// unknown.
+pub(super) fn word_header_line_box_pt(runs: &[Run]) -> Option<(f64, f64)> {
+    let family: &str = east_asian_aware_metric_family(runs)?;
+    let ascent_pt: f64 = word_header_line_ascent_em(runs, family)? * paragraph_font_size_pt(runs);
+    let advance_pt: f64 = word_line_advance_pt(runs)?;
+    Some((ascent_pt, (advance_pt - ascent_pt).max(0.0)))
+}
+
+/// The line advance Word gives this paragraph before any grid is consulted:
+/// the font's hhea line, or 1.3 times its gap-free part when the line is set in
+/// an East Asian face (issues #518, #643, #1638). `word_pitch_em` must come
+/// from [`word_line_metrics_em`], which has already dropped the gap for such a
+/// line.
+fn word_natural_line_em(runs: &[Run], word_pitch_em: f64) -> f64 {
+    if line_takes_east_asian_metrics(runs) {
+        EAST_ASIAN_LINE_HEIGHT_FACTOR * word_pitch_em
+    } else {
+        word_pitch_em
+    }
+}
+
+/// The font size Word resolves a paragraph's line box against: the largest
+/// size among its runs, falling back to the Word default when unset.
+fn paragraph_font_size_pt(runs: &[Run]) -> f64 {
+    largest_font_size_pt(runs.iter().filter_map(|run| run.style.font_size))
+}
+
+/// The same size, but only when a run actually declares one. `None` says the
+/// paragraph inherits its size, so a length derived from it cannot be stated in
+/// absolute points (issue #1115).
+fn declared_paragraph_font_size_pt(runs: &[Run]) -> Option<f64> {
+    runs.iter()
+        .filter_map(|run| run.style.font_size)
+        .reduce(f64::max)
+}
+
+/// The largest declared size, or Word's default when nothing declares one —
+/// which, in that fallback alone, is also what an `em` resolves against, since
+/// the generator emits no document-wide `#set text(size:)`.
+///
+/// The equivalence does not extend to a declared size. A paragraph states a
+/// `#set text(size:)` only where every run agrees on one, so an `em` length
+/// derived from the largest declared size can still resolve against the 11pt
+/// default — which is what pinned every hard-broken line under 11pt to 13.20pt
+/// (issue #1115). Use [`declared_paragraph_font_size_pt`] and emit points when
+/// the length has to carry the size it was derived from.
+fn largest_font_size_pt(sizes: impl Iterator<Item = f64>) -> f64 {
+    let largest: f64 = sizes.fold(f64::NAN, f64::max);
+    if largest.is_nan() { 11.0 } else { largest }
+}
+
+/// The row-level East Asian line metrics shared by cells, decided once per
+/// row so cell text cannot shift the row's answer (issue #498).
+///
+/// The two gates deliberately differ, mirroring the body path's asymmetry:
+/// the line *box* keys on the face the row's lines are set in (issues #643,
+/// #814), while a snapping document grid keys on the characters — Word does
+/// not stretch a Latin-only line to the grid pitch (issue #354).
+#[derive(Clone, Copy)]
+pub(super) struct RowEastAsianMetrics {
+    /// Whether any cell in the row carries East Asian characters — what a
+    /// snapping grid and its `w:spacing w:after` absorption key on (issues
+    /// #354, #500).
+    pub has_east_asian_text: bool,
+    /// Whether the row's lines take Word's East Asian line box — keyed on the
+    /// resolved face, not the script of the characters (issues #643, #814).
+    pub takes_east_asian_metrics: bool,
+}
+
+/// Whether a cell's grid-snapped line box already contains the paragraph's
+/// `w:spacing w:after`, so the caller must not emit it a second time.
+///
+/// Mirrors the guard inside [`word_cell_line_box_settings`] exactly, including
+/// its early return for a paragraph carrying its own line box — gating on
+/// `has_east_asian_text` alone would strip the gap from those.
+///
+/// A declared `w:spacing w:line` is deliberately *not* a bail here, and must
+/// not become one again: since issue #727 the box scales by the multiple
+/// rather than being abandoned, so it absorbs the gap like any other, and
+/// re-adding the clause would emit `w:after` twice on a grid-snapped
+/// line-spaced row.
+pub(super) fn cell_grid_absorbs_space_after(
+    style: &ParagraphStyle,
+    line_grid_pitch: Option<f64>,
+    row_east_asian: RowEastAsianMetrics,
+) -> bool {
+    row_east_asian.has_east_asian_text
+        && style.line_box.is_none()
+        && line_grid_pitch.is_some_and(|pitch| pitch > 0.0)
+}
+
+/// Shared metrics for tight-row centered cells and horizontal bottom merges
+/// (#839). Unmerged top/bottom cells retain their distinct seats (#1721).
+#[derive(Clone)]
+pub(super) struct SheetRowLine {
+    /// The family whose metrics pace the row's shared line.
+    pub metric_family: String,
+    /// The size the row's line resolves at: the largest run size in the row.
+    pub font_size_pt: f64,
+}
+
+/// The advance, in points, of one line set in `metric_family` at
+/// `font_size_pt` under the row's East Asian answer — the height the
+/// tightness gate compares the row's content box against (issue #839).
+///
+/// `None` when the family's metrics are unknown, in which case no shared row
+/// line can be resolved either.
+pub(super) fn sheet_row_line_advance_pt(
+    metric_family: &str,
+    font_size_pt: f64,
+    takes_east_asian_metrics: bool,
+) -> Option<f64> {
+    let (_ascender_em, _descender_em, pitch_em) =
+        crate::render::pdf::font_line_metrics_em(metric_family)?;
+    if pitch_em <= 0.0 {
+        return None;
+    }
+    let advance_em: f64 = if takes_east_asian_metrics {
+        EAST_ASIAN_LINE_HEIGHT_FACTOR * pitch_em
+    } else {
+        pitch_em
+    };
+    Some(advance_em * font_size_pt)
+}
+
+/// The baseline-to-baseline advance Excel gives a sheet cell's lines when it
+/// sets more than one — a wrapped cell, or one carrying its own line breaks —
+/// for a face and size the sweep below measured (issue #1163).
+///
+/// **It is not the face's `hhea` line**, which is what the cell's box spans,
+/// and no rounding of that line reproduces it: Arial and Times New Roman
+/// declare the same 2355/2048 line yet advance 29pt against 27pt at 24pt,
+/// while Verdana's taller 2489 advances 30pt there. The best fit over the
+/// whole sweep of `ROUND(ascender) + ROUND(line gap) + ROUND(descender) + c`,
+/// across every combination of floor/ceil/round and the `hhea`, `OS/2 win`
+/// and `OS/2 typo` metric sets, misses 36 of 126 samples; a per-face
+/// `ROUND(k x size + c)` misses 9 of Segoe UI's 21 alone. So this is a
+/// measured table, exactly as the row-height recompute in
+/// `parser::xlsx_cells` is, and for the same reason.
+///
+/// **Method.** Native Excel-for-Mac exports of purpose-built probe workbooks
+/// (`/Volumes/T7/scratch/issue-1163`, built with openpyxl): one wrapped,
+/// top-aligned cell per (face, size) in a fixed track far taller than its
+/// text, read back with `mutool draw -F stext`. Every block advances by one
+/// constant whole number of points.
+///
+/// Four factors were swept and none of them moves it:
+///
+/// - **the workbook's Normal font** — the same 126-cell sweep exported under
+///   `fonts[0]` of Arial 10, Segoe UI 10 and Calibri 11 returns the identical
+///   table, so the advance keys on the *cell's* face, and the printed grid's
+///   `x0.92` compaction (which Calibri 11 turns on) does not reach it
+/// - **the row's track** — Arial 14 advances 17.00pt in 60, 90, 120, 160, 200
+///   and 240pt tracks alike
+/// - **the characters** — a Malgun Gothic column set in Korean answers its
+///   Latin twin at all fourteen sizes, the same independence issue #1060
+///   measured for the line box itself
+/// - **the column width** — the large-size batch was exported twice at two
+///   different widths, wrapping at different points, and agreed everywhere
+///
+/// **Confirmed against a real workbook.** The sheet of #1163 prints at a 0.82
+/// fit-to-page scale, and its three wrapped cells measure 17.22, 13.12 and
+/// 31.16pt between baselines — 21.00, 16.00 and 38.00pt unscaled, which is
+/// exactly what this table gives Segoe UI 14, Segoe UI 12 and Century Gothic
+/// 30. Trebuchet MS was swept later by the same method
+/// (`/Volumes/T7/scratch/issue-1551`) after a 10pt wrapped note advanced
+/// 11.89pt on its `hhea` line against the native 13.00pt (issue #1551).
+///
+/// `None` for a family or size the sweep did not reach, which leaves the
+/// caller on the face's `hhea` line. **Nothing here interpolates**, and no
+/// family may be lent another's column: Arial and Times New Roman share a
+/// `hhea` line and diverge here, Aptos and Aptos Narrow were each swept in
+/// full before being paired, and so were `Malgun Gothic` and `맑은 고딕`.
+pub(super) fn sheet_wrapped_line_advance_pt(family: &str, font_size_pt: f64) -> Option<f64> {
+    let advances: &[f64; SHEET_ADVANCE_SIZES_PT.len()] = &SHEET_WRAPPED_LINE_ADVANCES
+        .iter()
+        .find(|face| {
+            face.families
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(family))
+        })?
+        .advances_pt;
+    SHEET_ADVANCE_SIZES_PT
+        .iter()
+        .position(|size_pt| (font_size_pt - size_pt).abs() < 0.01)
+        .map(|index| advances[index])
+}
+
+/// The font sizes [`SHEET_WRAPPED_LINE_ADVANCES`] states an advance for, in
+/// points. Every series carries one entry per size, in this order.
+const SHEET_ADVANCE_SIZES_PT: [f64; 21] = [
+    8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 20.0, 22.0, 24.0, 26.0, 28.0,
+    30.0, 32.0, 36.0, 40.0, 48.0,
+];
+
+/// One face's measured advances, and the family names that select it.
+struct SheetLineAdvances {
+    /// Matched whole and case-insensitively, never as a prefix.
+    families: &'static [&'static str],
+    /// One advance in points per entry of [`SHEET_ADVANCE_SIZES_PT`].
+    advances_pt: [f64; SHEET_ADVANCE_SIZES_PT.len()],
+}
+
+/// What the sweep described on [`sheet_wrapped_line_advance_pt`] measured, one
+/// series per face.
+#[rustfmt::skip]
+const SHEET_WRAPPED_LINE_ADVANCES: [SheetLineAdvances; 14] = [
+    SheetLineAdvances { families: &["Arial"], advances_pt:
+        [11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 21.0, 22.0, 24.0, 27.0, 29.0, 32.0, 33.0, 35.0, 38.0, 43.0, 46.0, 56.0] },
+    SheetLineAdvances { families: &["Times New Roman"], advances_pt:
+        [11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 23.0, 26.0, 27.0, 30.0, 32.0, 34.0, 37.0, 41.0, 46.0, 54.0] },
+    SheetLineAdvances { families: &["Verdana"], advances_pt:
+        [11.0, 12.0, 13.0, 14.0, 16.0, 17.0, 18.0, 19.0, 20.0, 22.0, 23.0, 25.0, 28.0, 30.0, 32.0, 35.0, 37.0, 40.0, 45.0, 49.0, 59.0] },
+    SheetLineAdvances { families: &["Tahoma"], advances_pt:
+        [11.0, 12.0, 13.0, 14.0, 15.0, 17.0, 18.0, 19.0, 20.0, 22.0, 23.0, 25.0, 28.0, 30.0, 32.0, 35.0, 37.0, 40.0, 44.0, 49.0, 59.0] },
+    SheetLineAdvances { families: &["Georgia"], advances_pt:
+        [11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 20.0, 21.0, 22.0, 23.0, 26.0, 28.0, 31.0, 33.0, 36.0, 37.0, 42.0, 47.0, 56.0] },
+    SheetLineAdvances { families: &["Courier New"], advances_pt:
+        [11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 24.0, 26.0, 28.0, 31.0, 32.0, 35.0, 38.0, 42.0, 46.0, 55.0] },
+    SheetLineAdvances { families: &["Helvetica"], advances_pt:
+        [11.0, 12.0, 13.0, 15.0, 16.0, 17.0, 18.0, 19.0, 21.0, 22.0, 22.0, 25.0, 27.0, 30.0, 32.0, 34.0, 37.0, 39.0, 44.0, 49.0, 59.0] },
+    SheetLineAdvances { families: &["Segoe UI"], advances_pt:
+        [11.0, 13.0, 14.0, 16.0, 16.0, 20.0, 21.0, 23.0, 23.0, 25.0, 26.0, 28.0, 31.0, 33.0, 38.0, 40.0, 43.0, 45.0, 50.0, 57.0, 67.0] },
+    SheetLineAdvances { families: &["Calibri"], advances_pt:
+        [11.0, 12.0, 14.0, 14.0, 15.0, 16.0, 18.0, 19.0, 20.0, 22.0, 23.0, 25.0, 28.0, 30.0, 33.0, 36.0, 38.0, 40.0, 45.0, 50.0, 60.0] },
+    SheetLineAdvances { families: &["Aptos", "Aptos Narrow"], advances_pt:
+        [11.0, 12.0, 13.0, 14.0, 15.0, 17.0, 18.0, 19.0, 21.0, 22.0, 23.0, 26.0, 28.0, 31.0, 32.0, 35.0, 37.0, 40.0, 45.0, 50.0, 60.0] },
+    SheetLineAdvances { families: &["Century Gothic"], advances_pt:
+        [11.0, 12.0, 13.0, 14.0, 16.0, 17.0, 18.0, 19.0, 21.0, 22.0, 23.0, 25.0, 28.0, 30.0, 33.0, 35.0, 38.0, 40.0, 45.0, 50.0, 60.0] },
+    SheetLineAdvances { families: &["Malgun Gothic", "맑은 고딕"], advances_pt:
+        [13.0, 14.0, 15.0, 17.0, 18.0, 19.0, 20.0, 22.0, 23.0, 26.0, 27.0, 30.0, 32.0, 35.0, 37.0, 40.0, 44.0, 47.0, 52.0, 59.0, 69.0] },
+    SheetLineAdvances { families: &["Gulim"], advances_pt:
+        [12.0, 13.0, 14.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 22.0, 23.0, 25.0, 27.0, 30.0, 32.0, 34.0, 36.0, 40.0, 44.0, 49.0, 59.0] },
+    // Swept for issue #1551 beside an Arial control that reproduced its series
+    // above on every size; the two diverge at 16, 26, 30, 40 and 48pt.
+    SheetLineAdvances { families: &["Trebuchet MS"], advances_pt:
+        [11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 20.0, 21.0, 22.0, 24.0, 27.0, 29.0, 31.0, 33.0, 36.0, 38.0, 43.0, 48.0, 57.0] },
+];
+
+/// Where a spreadsheet cell's fixed row track sits, so the cell's line can be
+/// seated on the baseline the native export prints (issue #1063).
+///
+/// `None` outside that regime: a Word table, an auto-height sheet row (whose
+/// track is the content's own answer, not Excel's), or a top- or
+/// bottom-aligned multi-row merge whose seat has only been measured within
+/// one row. A single-row top-aligned cell is inside it since issue #1606.
+#[derive(Clone, Copy)]
+pub(super) struct SheetCellSeat {
+    /// The cell's printed fixed-track height, in points. This is one row for
+    /// an ordinary cell and the joined height for a centred multi-row merge.
+    pub track_pt: f64,
+    /// The cell's own top inset — its padding plus its share of the border.
+    pub inset_top_pt: f64,
+    /// The cell's own bottom inset.
+    pub inset_bottom_pt: f64,
+    /// The gap the bottom seat keeps under the baseline however small the
+    /// font, in points — this workbook's floor (issues #1097, #1199).
+    pub descent_floor_pt: f64,
+    /// Whether the cell spans several columns. Excel assigns an odd point of
+    /// vertical centring slack to the opposite half for a horizontal merge
+    /// (issue #1242).
+    pub is_horizontally_merged: bool,
+    /// Whether this is a vertically centred cell spanning multiple fixed rows.
+    /// Excel resolves that block centre to the lower half of its PDF position
+    /// grid (issue #1497).
+    pub is_centered_multi_row: bool,
+    /// Whether the worksheet row carries Excel's `thickBot` flag, which lifts
+    /// a bottom-aligned line one sheet point (issue #1545).
+    pub row_has_thick_bottom: bool,
+}
+
+/// The baseline Excel prints for one line of a face whose bare `hhea` numbers
+/// are `ascent_em`/`descent_em`/`line_gap_em`, set at `font_size_pt` in a
+/// `track_pt` row, as an offset below the track's **top boundary**
+/// (issues #1063, #1161).
+///
+/// Excel lays a sheet out in whole sheet-space points, and it rounds the three
+/// `hhea` numbers into points **separately** before composing the line box:
+/// the ascender truncated, the line gap rounded up, the descender rounded.
+/// The box is the three added together, the baseline sits the gap plus the
+/// ascent below its top, and the box is centred in the row's own track — not
+/// in the cell's inset content box, which four native probe exports show has
+/// no say in the vertical seat. An unmerged cell gives an odd leftover point
+/// to the space *above* the line; a horizontally merged cell gives it to the
+/// space below. A fitted sheet then raises the fixed-row text origin by one
+/// sheet-space point and scales that completed seat onto the printed page
+/// (issues #1238, #1242, #1496).
+///
+/// Measured on native Excel-for-Mac exports of purpose-built probe workbooks
+/// (`/Volumes/T7/scratch/issue-1063/probe`, reproduced in
+/// `sheet_cell_line_seat_reproduces_the_native_excel_probe`): a row-height
+/// sweep from 12pt to 60pt at Arial 10, a font-size sweep from 8pt to 44pt in
+/// 40pt and 60pt tracks, and a border/no-border and Normal-font pairing that
+/// changed nothing. All 28 unmerged samples land on the ceiling cadence
+/// exactly.
+///
+/// Those probes are Arial-only, and Arial's 67/2048 line gap makes the
+/// separate rounding indistinguishable from folding the gap into the ascender
+/// first: the two readings differ by 1pt in the ascent and 2pt in the box,
+/// which cancel in the centred seat. A face declaring **no** line gap
+/// separates them, and the folded reading then seats every line a point low —
+/// Segoe UI, Century Gothic and Calibri all measured that way on the workbook
+/// of #1161, reproduced in
+/// `sheet_cell_line_seat_reproduces_a_face_with_no_line_gap`.
+///
+/// The merge selector comes from four one-factor Excel-for-Mac 16.112.2
+/// exports of the #1242 workbook. Removing only A1:B1's merge moves its 30pt
+/// Century Gothic baseline in a 90pt track from 56pt to 57pt below the track
+/// top; changing the size, track or horizontal alignment preserves the
+/// respective merged cadence.
+pub(super) fn sheet_cell_baseline_from_track_top_pt(
+    track_pt: f64,
+    ascent_em: f64,
+    descent_em: f64,
+    line_gap_em: f64,
+    font_size_pt: f64,
+    is_horizontally_merged: bool,
+    print_scale: Option<f64>,
+) -> f64 {
+    // The parser has already folded a fit-to-page scale into the track and
+    // font. Excel instead snaps their declared sheet-space values, then
+    // scales that answer onto the printed page (issue #1238).
+    let scale: f64 = print_scale.filter(|scale| *scale > 0.0).unwrap_or(1.0);
+    let sheet_font_size_pt: f64 = font_size_pt / scale;
+    let sheet_track_pt: f64 = track_pt / scale;
+    let ascent_pt: f64 = (ascent_em * sheet_font_size_pt).floor();
+    let line_gap_pt: f64 = (line_gap_em * sheet_font_size_pt).ceil();
+    let descent_pt: f64 = (descent_em * sheet_font_size_pt).round();
+    let above_baseline_pt: f64 = line_gap_pt + ascent_pt;
+    let line_pt: f64 = above_baseline_pt + descent_pt;
+    let half_slack_pt: f64 = (sheet_track_pt - line_pt) / 2.0;
+    let slack_above_pt: f64 = if is_horizontally_merged {
+        half_slack_pt.floor()
+    } else {
+        half_slack_pt.ceil()
+    };
+    // The enclosing fitted-sheet translation now puts the row and its text
+    // on Excel's snapped sheet-space origin, so no separate fitted lift is
+    // needed here (issues #1496, #1719).
+    (slack_above_pt + above_baseline_pt) * scale
+}
+
+/// The constant Excel adds to a top-aligned line's `hhea` ascent plus line
+/// gap before rounding the pair to the whole sheet point its baseline sits
+/// below the track's top boundary (issue #1606).
+///
+/// The #1063 Arial probes admit any value in `[1.12, 1.23)`: 10pt seats 11
+/// (`9.38 + c` must round up) while 12pt, 28pt and 44pt seat 12, 27 and 42
+/// (`11.26 + c`, `26.26 + c` and `41.27 + c` must not). No composition of the
+/// separately rounded ascent and gap the centred seat uses reproduces the
+/// series — `floor(ascent) + ceil(gap) + 1` misses 24pt and
+/// `round(ascent) + ceil(gap) + 1` misses 12pt.
+const SHEET_TOP_ALIGNED_SEAT_OFFSET_PT: f64 = 1.17;
+
+/// The baseline Excel prints for a **top-aligned** line of a face whose
+/// `hhea` ascender and line gap add to `ascent_with_gap_em`, set at
+/// `font_size_pt`, as an offset below its fixed track's **top boundary**
+/// (issue #1606).
+///
+/// Excel adds [`SHEET_TOP_ALIGNED_SEAT_OFFSET_PT`] to the face's ascent plus
+/// line gap at the cell's *declared* size and rounds the sum to a whole sheet
+/// point; nothing else enters. The seat is track-independent (a 12pt Arial
+/// line sits 12pt below the top of 20, 30, 45 and 60pt tracks alike), a cell
+/// border changes nothing, and a horizontal merge keeps the unmerged answer:
+/// the #982 workbook's merged B4:D4 instruction block prints its Segoe UI 14
+/// first baseline 16 sheet points below row 4's top, exactly where the
+/// unmerged Arial series predicts. A fitted sheet evaluates the rule in
+/// declared sheet space and scales the completed answer onto the page; its
+/// page-level translation already supplies the snapped origin, so no
+/// separate physical-origin lift is applied (issues #1496, #1719).
+///
+/// Measured on the native Excel-for-Mac exports of the #1063 probe workbooks
+/// (`/Volumes/T7/scratch/issue-1063/probe`, the top-aligned rows of probe 1's
+/// size and track sweeps and probe 2's bordered/unbordered pairing) and on the
+/// two native exports of the #982 workbook, reproduced in
+/// `top_aligned_sheet_cell_seat_reproduces_the_native_excel_probe`.
+pub(super) fn sheet_cell_top_baseline_from_track_top_pt(
+    ascent_with_gap_em: f64,
+    font_size_pt: f64,
+    print_scale: Option<f64>,
+) -> f64 {
+    let scale: f64 = print_scale.filter(|scale| *scale > 0.0).unwrap_or(1.0);
+    let sheet_font_size_pt: f64 = font_size_pt / scale;
+    let seat_pt: f64 =
+        (ascent_with_gap_em * sheet_font_size_pt + SHEET_TOP_ALIGNED_SEAT_OFFSET_PT).round();
+    seat_pt * scale
+}
+
+/// The gap Excel never closes between a bottom-aligned sheet cell's baseline
+/// and its row's bottom boundary, in the workbooks whose printed grid keeps
+/// its declared row tracks (issue #1097).
+///
+/// Flat across every factor probed: the row's track height (12, 13, 14, 15,
+/// 16, 17, 18, 20, 22, 25, 30, 40, 45 and 60pt all give 4.00), the cell's own
+/// border, its weight, and the workbook's Normal font (Arial 10, Calibri 11
+/// and Arial 20 all give 4.00). So it is one distance, not a face's metric in
+/// disguise — though only Arial cells were measured, so a face whose descent
+/// is far from Arial's could yet show it as something else.
+pub(crate) const SHEET_CELL_MIN_DESCENT_SEAT_PT: f64 = 4.0;
+
+/// The 3pt gap measured for the remapped Calibri/Aptos family in the native
+/// floor probe matrix, one point below the script-face theme family
+/// (issue #1199). Face-specific row-track mappings measured later do not
+/// choose this floor.
+///
+/// Measured on native Excel-for-Mac exports of `10_kpi_tracker_en.xlsx`, whose
+/// A11 note is the corpus's one bottom-aligned cell small enough to tell a
+/// floor from a bare descent. Ruling that cell with a thin box border makes
+/// Excel print its row's own boundaries, so the seat is read rather than
+/// inferred; a re-export with only the border added moves no text, and one
+/// sweeping the note's `sz` over eleven sizes gives:
+///
+/// | size | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 16 | 18 | 20 | 24 |
+/// | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+/// | seat | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 4 | 4 | 5 |
+///
+/// which is `max(3, round(0.211914 x size))` at every one of them. Issue #1097
+/// read this family as having no floor at all from its one available sample,
+/// `09_expense_report_en`'s Arial Bold 14 title at 3.00pt — a size whose bare
+/// rounded descent is already 3, so it cannot separate the two readings. The
+/// four sizes at or under 11 can, and they floor.
+pub(crate) const COMPACTED_SHEET_CELL_MIN_DESCENT_SEAT_PT: f64 = 3.0;
+
+/// A horizontally merged bottom-aligned cell keeps one more point below its
+/// baseline than the workbook-wide floors above (issue #1390).
+///
+/// Native Excel-for-Mac one-factor probes changed only `A1:F1`'s merge state
+/// in the Korean quotation fixture: the 14pt merged title rested 5pt above
+/// the fixed track's bottom boundary while its unmerged twin rested 4pt above
+/// it. Declared-family sweeps did not move the line. Size sweeps showed the
+/// value is a floor, not a replacement seat: it binds at 8-18pt, while larger
+/// face-specific descents continue to win.
+const MERGED_SHEET_CELL_MIN_DESCENT_SEAT_PT: f64 = 5.0;
+
+/// The descent Excel rests a bottom-aligned sheet cell's last line on: the
+/// face's `hhea` descent at a whole number of points, sitting on the row's own
+/// bottom boundary (issue #1063) — but never closer to that boundary than the
+/// workbook's own floor (issues #1097, #1199), and never on that rounded
+/// descent at all for a face [`sheet_cell_measured_seat_pt`] measured a seat
+/// of its own for (issue #1208).
+///
+/// The boundary itself, with no inset under it: over the probe's size sweep
+/// the fitted inset is 0.00-0.14pt.
+///
+/// `descent_floor_pt` is the workbook-wide distance
+/// `xlsx_cells::bottom_aligned_descent_floor_pt` reads, which carries the
+/// measurement behind it: [`COMPACTED_SHEET_CELL_MIN_DESCENT_SEAT_PT`] for the
+/// remapped Calibri/Aptos family in the floor probe matrix,
+/// [`SHEET_CELL_MIN_DESCENT_SEAT_PT`] for its script-face theme family, and
+/// zero for a Normal font Excel neither remaps nor resolves by script, whose
+/// cells rest on the bare rounded descent (issue #1545). Each family
+/// reproduces its native probes at every size swept; later face-specific
+/// printed-grid mappings do not choose this separately measured floor. The
+/// values differ only under a font small enough to separate them, which on
+/// Arial is 11pt and below.
+pub(super) fn sheet_cell_descent_pt(
+    family: &str,
+    descent_em: f64,
+    font_size_pt: f64,
+    print_scale: Option<f64>,
+    descent_floor_pt: f64,
+) -> f64 {
+    // Excel reads every seat component at the size the cell declares and
+    // prints the result through the sheet's fit-to-page scale, which the
+    // parser has already folded into `font_size_pt`. That includes both the
+    // measured face series and the rounded hhea descent/floor (issue #1238).
+    let scale: f64 = print_scale.filter(|scale| *scale > 0.0).unwrap_or(1.0);
+    let sheet_font_size_pt: f64 = font_size_pt / scale;
+    sheet_cell_measured_seat_pt(family, sheet_font_size_pt)
+        .unwrap_or_else(|| (descent_em * sheet_font_size_pt).round())
+        .max(descent_floor_pt)
+        * scale
+}
+
+/// The sheet points Excel lifts a bottom-aligned line by when its worksheet
+/// row carries `thickBot="1"`, printed through the sheet's fit scale
+/// (issue #1545).
+///
+/// Measured on native Excel-for-Mac 16.112 one-factor exports of the budget
+/// workbook of #1545. Removing the flag from the `Cash flow` row (Trebuchet
+/// MS 10 in a 19.5pt custom row) dropped its baseline from 3 to 2 sheet
+/// points above the row boundary; adding it to the unflagged `Cumulative
+/// cash flow` row raised that one from 2 to 3. Adding `thickTop` instead, and
+/// giving the cell itself a thin, thick or double bottom border in place of
+/// its medium top one, each moved nothing: Excel reads the row's flag, not
+/// the border it summarises. The lift is one whole sheet point at every size
+/// of an 8-16pt sweep and at 100%, 85% and 78% print scale.
+pub(super) fn sheet_cell_thick_bottom_lift_pt(
+    row_has_thick_bottom: bool,
+    print_scale: Option<f64>,
+) -> f64 {
+    if !row_has_thick_bottom {
+        return 0.0;
+    }
+    let scale: f64 = print_scale.filter(|scale| *scale > 0.0).unwrap_or(1.0);
+    SHEET_ADVANCE_GRID_PT * scale
+}
+
+/// The seat measured for `family` at `font_size_pt`, or `None` where no sweep
+/// reached that face and size or where the sweep could only see the workbook's
+/// own floor (issue #1208).
+///
+/// **Method.** Native Excel-for-Mac exports of purpose-built probe workbooks
+/// (`/Volumes/T7/scratch/issue-1208/probe`, built with openpyxl): one
+/// bottom-aligned cell per (face, size) in an auto-height row, each ruled by a
+/// thin box border so Excel prints the row's own boundaries rather than
+/// leaving them to be inferred, and the baseline read back with
+/// `mutool draw -F trace`. A border-free control block reproduced the same
+/// baselines, so ruling the cell moves nothing.
+///
+/// **The seat does not depend on the track.** Malgun Gothic's column was swept
+/// a second time in fixed 60pt tracks and answered the same seat at all
+/// fifteen sizes of that run. That is what rules out reading the seat as an
+/// ascent measured down from the row's *top*, which fits the auto rows of
+/// issue #1208's fixture just as well but would put a 60pt track's baseline
+/// 25pt lower than a 35pt one's.
+///
+/// **No rounded descent fits these three faces.** Malgun Gothic seats 4pt at
+/// 14pt, which needs a descent under 0.3214em, and 14pt at 40pt, which needs
+/// one of at least 0.3375em. So this is a measured table, exactly as
+/// [`SHEET_WRAPPED_LINE_ADVANCES`] is, and it shares that sweep's size axis.
+///
+/// **It is an exception list, not a replacement.** The same probe swept Arial,
+/// Verdana, Georgia, Times New Roman, Tahoma, Courier New, Century Gothic,
+/// Calibri, Aptos and MS Gothic over the same twenty-one sizes, and
+/// `max(floor, round(descent x size))` reproduces all two hundred and ten of
+/// those samples. MS Gothic conforming is why the exception cannot be stated
+/// as "an East Asian face".
+///
+/// The original sweep left values at or below its four-point workbook floor
+/// unmeasured. Issue #1815 isolates Malgun Gothic sizes 8–14 in separate ruled
+/// rows under an Arial default style: sizes 8–10 seat at 3pt, and 11–14 at 4pt.
+/// An independent Arial 4pt control seats at 2pt, below every measured Malgun
+/// value; default-style Arial sizes 4, 8 and 11 preserve those positions.
+/// Gulim/Batang values still masked by the workbook floor remain `None`, with
+/// rounded descent as the fallback; their unfloored small seats are unverified.
+///
+/// **Nothing here interpolates**, and no family may be lent another's column:
+/// Gulim and Batang share their `hhea` metrics but were each swept in full
+/// before being given the same numbers. Each Korean alias rides with the face
+/// `font_subst` resolves it to rather than a sweep of its own, the same
+/// pairing [`SHEET_WRAPPED_LINE_ADVANCES`] makes for `맑은 고딕`.
+fn sheet_cell_measured_seat_pt(family: &str, font_size_pt: f64) -> Option<f64> {
+    let seats: &[Option<f64>; SHEET_ADVANCE_SIZES_PT.len()] = &SHEET_CELL_SEATS
+        .iter()
+        .find(|face| {
+            face.families
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(family))
+        })?
+        .seats_pt;
+    SHEET_ADVANCE_SIZES_PT
+        .iter()
+        .position(|size_pt| (font_size_pt - size_pt).abs() < 0.01)
+        .and_then(|index| seats[index])
+}
+
+/// One face's measured bottom-aligned seats, and the family names that select
+/// it.
+struct SheetCellSeats {
+    /// Matched whole and case-insensitively, never as a prefix.
+    families: &'static [&'static str],
+    /// One seat in points per entry of [`SHEET_ADVANCE_SIZES_PT`], which this
+    /// series shares because both were swept on one probe.
+    seats_pt: [Option<f64>; SHEET_ADVANCE_SIZES_PT.len()],
+}
+
+/// What the sweep described on [`sheet_cell_measured_seat_pt`] measured, one
+/// series per face that the rounded descent does not reproduce.
+#[rustfmt::skip]
+const SHEET_CELL_SEATS: [SheetCellSeats; 3] = [
+    SheetCellSeats { families: &["Malgun Gothic", "맑은 고딕"], seats_pt:
+        [Some(3.0), Some(3.0), Some(3.0), Some(4.0), Some(4.0), Some(4.0), Some(4.0), Some(5.0), Some(5.0), Some(6.0), Some(6.0), Some(7.0), Some(7.0), Some(8.0), Some(8.0), Some(9.0), Some(10.0), Some(11.0), Some(12.0), Some(14.0), Some(16.0)] },
+    SheetCellSeats { families: &["Gulim", "굴림"], seats_pt:
+        [None, None, None, None, None, None, None, None, None, None, None, None, None, None, Some(5.0), Some(5.0), Some(5.0), Some(7.0), Some(7.0), Some(8.0), Some(10.0)] },
+    SheetCellSeats { families: &["Batang", "바탕"], seats_pt:
+        [None, None, None, None, None, None, None, None, None, None, None, None, None, None, Some(5.0), Some(5.0), Some(5.0), Some(7.0), Some(7.0), Some(8.0), Some(10.0)] },
+];
+
+/// A table-cell paragraph's fixed line box, resolved at the paragraph's own
+/// font size — or at the row's shared family and size when a tight
+/// spreadsheet row supplies a [`SheetRowLine`] (issue #839). `top_em`/
+/// `bottom_em` are the metric edges the cell emits; `leading_pt` is the gap
+/// between line boxes.
+pub(super) struct CellLineBox {
+    pub top_em: f64,
+    pub bottom_em: f64,
+    /// The gap between successive boxes. It carries the surplus removed from
+    /// below a descender-seated spreadsheet line (issue #618), the remainder
+    /// below a compressed Word line's first baseline (issue #1460), or the
+    /// difference between Excel's measured wrapped-line pitch and the face's
+    /// hhea box (issue #1163). Moving those quantities into leading preserves
+    /// multi-line advance without lengthening the final line's exterior box.
+    pub leading_pt: f64,
+    pub font_size_pt: f64,
+    /// Points the seated last line still has to drop below the cell's
+    /// content box to reach its measured seat. Typst clamps a positive
+    /// `bottom-edge` at the content box, so a descender seat that falls inside
+    /// the cell's bottom inset — a border-widened inset over a bare rounded
+    /// descent (issues #1277, #1545) — cannot be expressed by the box alone;
+    /// the cell translates its content by this much instead. Zero wherever the
+    /// box reaches the seat on its own.
+    pub seat_shortfall_pt: f64,
+}
+
+/// Line-box settings for a **Word or sheet** table cell: a fixed box spanning
+/// the font's full single-spacing (hhea) line — 1.3 times it for an East Asian
+/// row — seated at the same constant ascent the body path uses. In the default
+/// uncompressed emission the box carries the whole line advance below the
+/// ascent with zero leading, so a single-line cell occupies the full line
+/// height Word gives it rather than only the tighter metric box (which left
+/// auto-height rows too short, issue #396). For an expanded exact line in a
+/// top-aligned floating text box, it assigns the added height to the ascent
+/// and descent in their font-metric ratio, preserving the line advance while
+/// seating its first baseline as Word does (issue #2019). Ordinary Word cells
+/// retain the measured ascender seat, and spreadsheet cells keep their own
+/// seating rules. A Word line compressed
+/// below the face's metric box instead seats its first baseline halfway
+/// through the compressed advance, scales the exterior descent, and carries
+/// the remaining inter-line distance as leading (issue #1460). When
+/// `seats_text_on_descender` is set (bottom-aligned
+/// spreadsheet cells in fixed-height rows), the box instead ends at the
+/// font's descender and the removed sub-baseline surplus moves into leading,
+/// so the last line's descent rests on the row's bottom inset edge while
+/// multi-line advance is unchanged (issue #618) — unless `sheet_seat` re-seats
+/// it, below. `None` when the font's metrics are unknown or the paragraph
+/// carries its own line box; a declared
+/// `w:spacing w:line` scales the box instead of suppressing it (issue #727).
+///
+/// The box also carries the paragraph's `w:spacing w:after` when a snapping
+/// grid is in force, because Word snaps the line and that gap together (issues
+/// #500, #503).
+///
+/// When `sheet_row_line` is `Some`, a tight-row centered cell or horizontal
+/// bottom merge uses the row's shared metrics (#839). Unmerged top/bottom cells
+/// keep their own seats (#1721). Spreadsheet cells are excluded from Word's
+/// compressed-line redistribution.
+///
+/// When `sheet_seat` is `Some` — a spreadsheet cell in a fixed row track,
+/// gated by `generate_table_cell` — the box is redistributed around the
+/// baseline so it seats where Excel prints it, overriding both seats above:
+/// the ascent and descent are each rounded to a whole point and the line is
+/// centred in the row's own *track*, or, under bottom alignment, its rounded
+/// descent rests on the track's own bottom boundary, or, under top alignment,
+/// its baseline sits the whole sheet point of
+/// [`sheet_cell_top_baseline_from_track_top_pt`] below the track's top
+/// boundary (issue #1606). The box's height, and with it the row's advance,
+/// is unchanged (issue #1063).
+///
+/// When `sheet_print_scale` is `Some` — any cell of a spreadsheet, carrying
+/// the sheet's `fitToWidth` factor — a face and size
+/// [`sheet_wrapped_line_advance_pt`] measured pace their *lines* on Excel's
+/// own pitch instead of on that box, and the difference leaves the box
+/// untouched and rides as leading. So a sheet cell's leading is non-zero
+/// whatever its vertical alignment (issue #1163).
+///
+/// A **slide's** table cell does not come here: it paces on PowerPoint's flat
+/// 1.2em line via [`powerpoint_line_height_settings`], like the slide's own
+/// text boxes (issue #663).
+// Same shape as `word_cell_line_box`, which this only formats the result of;
+// grouping the arguments would have to split both, and the sheet's three are
+// each read on their own inside the box.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn word_cell_line_box_settings(
+    runs: &[Run],
+    style: &ParagraphStyle,
+    line_grid_pitch: Option<f64>,
+    row_east_asian: RowEastAsianMetrics,
+    vertical_align: Option<CellVerticalAlign>,
+    seats_text_on_descender: bool,
+    sheet_row_line: Option<&SheetRowLine>,
+    sheet_seat: Option<SheetCellSeat>,
+    sheet_print_scale: Option<f64>,
+    in_top_aligned_floating_text_box: bool,
+) -> Option<String> {
+    let line_box: CellLineBox = word_cell_line_box(
+        runs,
+        style,
+        line_grid_pitch,
+        row_east_asian,
+        vertical_align,
+        seats_text_on_descender,
+        sheet_row_line,
+        sheet_seat,
+        sheet_print_scale,
+        in_top_aligned_floating_text_box,
+    )?;
+    Some(format!(
+        // The descent is negated here rather than written behind a literal
+        // `-`: a Word cell's box can carry a negative descent, and a negative
+        // edge behind that sign emitted `--0.02em`. A sheet cell's descender
+        // seat never goes below zero here — Typst clamps a positive
+        // `bottom-edge` at the content box, so a seat inside the cell's
+        // bottom inset rides in `CellLineBox::seat_shortfall_pt` instead
+        // (issue #1545).
+        "#set text(top-edge: {}em, bottom-edge: {}em)\n#set par(leading: {}pt)\n",
+        format_f64(line_box.top_em),
+        format_f64(-line_box.bottom_em),
+        format_f64(line_box.leading_pt)
+    ))
+}
+
+/// The line box behind [`word_cell_line_box_settings`], exposed so the spill
+/// wrapper can size its clip box and strut from the same numbers the block
+/// emits (issue #618).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn word_cell_line_box(
+    runs: &[Run],
+    style: &ParagraphStyle,
+    line_grid_pitch: Option<f64>,
+    row_east_asian: RowEastAsianMetrics,
+    vertical_align: Option<CellVerticalAlign>,
+    seats_text_on_descender: bool,
+    sheet_row_line: Option<&SheetRowLine>,
+    sheet_seat: Option<SheetCellSeat>,
+    sheet_print_scale: Option<f64>,
+    in_top_aligned_floating_text_box: bool,
+) -> Option<CellLineBox> {
+    if style.line_box.is_some() {
+        return None;
+    }
+    // Tight-row centered cells and horizontal bottom merges share row metrics
+    // (#839); unmerged top/bottom cells keep their own seats (#1721). Other
+    // centered fixed-track cells use the painted face (#1239), while bottom
+    // cells retain the separately measured descender-seat model.
+    let painted_sheet_family: Option<String> = (sheet_seat.is_some() && !seats_text_on_descender)
+        .then(|| sheet_cell_metric_family(runs))
+        .flatten();
+    let declared_sheet_family: Option<&str> = sheet_print_scale
+        .is_some()
+        .then(|| sheet_cell_declared_metric_family(runs))
+        .flatten();
+    let (family, font_size): (&str, f64) = match sheet_row_line {
+        Some(row_line) => (row_line.metric_family.as_str(), row_line.font_size_pt),
+        None => (
+            painted_sheet_family
+                .as_deref()
+                .or_else(|| east_asian_aware_metric_family(runs))?,
+            paragraph_font_size_pt(runs),
+        ),
+    };
+    let (ascender_em, descender_em, word_pitch_em) =
+        word_line_metrics_em(family, row_east_asian.takes_east_asian_metrics)?;
+    let metric_em: f64 = ascender_em + descender_em;
+    if metric_em <= 0.0 || word_pitch_em <= 0.0 {
+        return None;
+    }
+    // The row decides whether its lines are East Asian, not this cell: reading
+    // each cell's own text put a Korean label and its numeric neighbours on
+    // line boxes of different heights, splitting one row across two baselines
+    // 4.29pt apart (issue #498). So both the 1.3 line-height bonus and the
+    // ascent excess it implies key on the row's answer.
+    let natural_em: f64 = if row_east_asian.takes_east_asian_metrics {
+        EAST_ASIAN_LINE_HEIGHT_FACTOR * word_pitch_em
+    } else {
+        word_pitch_em
+    };
+    // A grid-snapped row snaps the line *plus* the paragraph's own `w:spacing
+    // w:after`, not the line alone. Snapping the bare line and then adding the
+    // gap outside it made every grid-scoped row 1.06pt too tall, because
+    // 12.64pt of Malgun and a 1.5pt gap both fit inside one 18pt line where
+    // 18 + 1.5 does not (issues #500, #503). `cell_grid_absorbs_space_after`
+    // gates the caller's matching suppression of the trailing gap; the two must
+    // agree. The grid keys on the row's *text*, not its face: Word does not
+    // stretch a Latin-only line to the grid pitch (issues #354, #814).
+    let advance_em: f64 = match line_grid_pitch.filter(|pitch| *pitch > 0.0) {
+        Some(pitch) if row_east_asian.has_east_asian_text => {
+            // Same two-way choice as the body path (issue #508), with the
+            // paragraph's `w:after` inside the quantity being compared.
+            let natural_pt: f64 = natural_em * font_size + style.space_after.unwrap_or(0.0);
+            let advance_pt: f64 = if natural_pt <= pitch {
+                pitch
+            } else {
+                natural_pt
+            };
+            advance_pt / font_size
+        }
+        _ => natural_em,
+    };
+    // `w:spacing w:line` states the advance the same way inside a cell as it
+    // does in the body: a proportional rule scales Word's own line, an exact
+    // one replaces it outright. Bailing on any declared spacing left the
+    // paragraph with no fixed box at all, so the multiple never applied and the
+    // advance fell back to whatever Typst chose (issue #727).
+    let advance_em: f64 = match style.line_spacing {
+        None => advance_em,
+        Some(LineSpacing::Proportional(factor)) if factor > 0.0 => advance_em * factor,
+        Some(LineSpacing::Exact(points) | LineSpacing::AtLeast(points)) if points > 0.0 => {
+            points / font_size
+        }
+        // A non-positive rule states nothing usable; Word ignores it.
+        Some(_) => advance_em,
+    };
+    let excess_em: f64 = if row_east_asian.takes_east_asian_metrics {
+        EAST_ASIAN_ASCENT_EXCESS * word_pitch_em
+    } else {
+        0.0
+    };
+    // Word centres a proportionally compressed table-cell line on its
+    // baseline. Keeping the face's full hhea ascent above the baseline and
+    // subtracting the whole compression from the descent moved large poster
+    // text down even though its baseline advance already matched the native
+    // export (issue #1460). Keep the advance unchanged and redistribute only
+    // its two edges. A spreadsheet has separately measured line seats below;
+    // `sheet_print_scale` is its reliable marker even when the sheet is
+    // unscaled and this particular cell is top-aligned.
+    let centres_compressed_word_line: bool =
+        sheet_print_scale.is_none() && advance_em + f64::EPSILON < metric_em;
+    let top_em: f64 = if centres_compressed_word_line {
+        advance_em / 2.0
+    } else {
+        ascender_em + excess_em
+    };
+    // Excel rests a bottom-aligned cell's last line on its descender: the
+    // descent bottom sits on the row's bottom inset edge with all slack above.
+    // The symmetric box carries the East Asian 0.15-line surplus below the
+    // baseline, which floated bottom-aligned Korean cells above where Excel
+    // prints them (issue #618). Ending the box at the descender and moving the
+    // surplus into leading keeps multi-line advance identical.
+    //
+    // This once cited the header/footer path as applying the same rule with
+    // `bottom-edge: "descender"`. It no longer does: a header's `w:pBdr` gap
+    // measures from the East Asian line box's bottom, not the descender, and
+    // reads that from `word_line_box_descent_em` (issue #737). The seating
+    // here is Excel's and is unaffected.
+    // TODO(#618 follow-up: leading is one per-paragraph pt value derived from
+    // the max run size, so mixed-font-size wrapped lines gain
+    // 0.15*pitch*(max-line) advance error; needs per-line seating if a real
+    // sheet exhibits it).
+    let (bottom_em, leading_pt): (f64, f64) = if seats_text_on_descender {
+        (
+            descender_em,
+            ((advance_em - top_em - descender_em) * font_size).max(0.0),
+        )
+    } else if centres_compressed_word_line {
+        // The first baseline is centred in the compressed advance, but Word
+        // does not give the last line the whole lower half as exterior space.
+        // It scales the face's descent by the same ratio as the line and puts
+        // the remainder between baselines. This keeps a wrapped line's pitch
+        // unchanged while preventing that inter-line space from lengthening
+        // the paragraph after its final line (issue #1460).
+        let compression: f64 = advance_em / metric_em;
+        let bottom_em: f64 = descender_em * compression;
+        (
+            bottom_em,
+            ((advance_em - top_em - bottom_em) * font_size).max(0.0),
+        )
+    } else {
+        (advance_em - top_em, 0.0)
+    };
+    // #1460 established the compressed pitch and its metric-proportional last
+    // descent. Fresh native-PDF traces at 300 DPI then exposed the smaller
+    // anchor-specific seat that whole-page thumbnails missed (#1479). Typst
+    // shares a centre-aligned block's added first edge across the slack above
+    // and below it, so reproducing the native one-point baseline shift takes
+    // two edge quanta above, one less below, and one less in leading. A bottom
+    // anchor instead transfers half a quantum above and leaves the other half
+    // as inter-line leading. Both keep the declared baseline pitch.
+    // Top/default is already seated from its top edge, so it keeps #1460's
+    // answer.
+    //
+    // Cap the quantum at the available descent for very small text. This
+    // preserves a non-negative exterior edge without changing the 1pt native
+    // rule at ordinary document sizes.
+    let (top_em, bottom_em, leading_pt): (f64, f64, f64) = if centres_compressed_word_line {
+        let edge_pt: f64 = WORD_COMPRESSED_LINE_EDGE_PT.min(bottom_em * font_size);
+        match vertical_align.unwrap_or(CellVerticalAlign::Top) {
+            CellVerticalAlign::Top => (top_em, bottom_em, leading_pt),
+            CellVerticalAlign::Center => {
+                let edge_pt: f64 = edge_pt.min(leading_pt.max(0.0));
+                (
+                    top_em + 2.0 * edge_pt / font_size,
+                    bottom_em - edge_pt / font_size,
+                    leading_pt - edge_pt,
+                )
+            }
+            CellVerticalAlign::Bottom => (
+                top_em + edge_pt / (2.0 * font_size),
+                bottom_em - edge_pt / font_size,
+                leading_pt + edge_pt / 2.0,
+            ),
+        }
+    } else {
+        (top_em, bottom_em, leading_pt)
+    };
+    // An expanded Latin auto line in a bottom-aligned Word cell has the same
+    // baseline advance as the hhea pitch times `w:line / 240`, but its final
+    // exterior edge is one quarter point shorter. Keeping that quarter point
+    // as leading preserves every baseline-to-baseline advance while lowering
+    // only the last line against the cell's bottom boundary. Limit the move to
+    // the proportional surplus so the exterior edge never cuts into the
+    // face's natural descent (issue #1486).
+    let expands_bottom_aligned_word_line: bool = sheet_print_scale.is_none()
+        && !seats_text_on_descender
+        && !row_east_asian.takes_east_asian_metrics
+        && matches!(
+            style.line_spacing,
+            Some(LineSpacing::Proportional(factor)) if factor > 1.0
+        )
+        && vertical_align == Some(CellVerticalAlign::Bottom)
+        && advance_em > metric_em;
+    let (top_em, bottom_em, leading_pt): (f64, f64, f64) = if expands_bottom_aligned_word_line {
+        let expanded_pt: f64 = (advance_em - metric_em) * font_size;
+        let edge_pt: f64 = WORD_EXPANDED_BOTTOM_LINE_EDGE_PT.min(expanded_pt);
+        (
+            top_em,
+            bottom_em - edge_pt / font_size,
+            leading_pt + edge_pt,
+        )
+    } else {
+        (top_em, bottom_em, leading_pt)
+    };
+    // A sheet cell in a fixed track seats its line where Excel prints it, not
+    // where the cell's own inset box would centre it (issue #1063). Typst
+    // places the box inside that inset box, so the seat is expressed by
+    // redistributing the box around the baseline — its height, and with it the
+    // row's advance, is unchanged.
+    let mut seat_shortfall_pt: f64 = 0.0;
+    let (mut top_em, mut bottom_em, leading_pt): (f64, f64, f64) = match sheet_seat {
+        None => (top_em, bottom_em, leading_pt),
+        Some(seat) if seats_text_on_descender => {
+            // Typst rests the box's bottom edge on the inset content bottom;
+            // Excel rests the descender on the row boundary itself, one inset
+            // lower. A horizontal merge raises only the minimum seat; a
+            // larger measured or rounded face descent still wins (#1390).
+            let descent_floor_pt: f64 = if seat.is_horizontally_merged {
+                seat.descent_floor_pt
+                    .max(MERGED_SHEET_CELL_MIN_DESCENT_SEAT_PT)
+            } else {
+                seat.descent_floor_pt
+            };
+            let descent_pt: f64 =
+                sheet_cell_descent_pt(
+                    family,
+                    descender_em,
+                    font_size,
+                    sheet_print_scale,
+                    descent_floor_pt,
+                ) + sheet_cell_thick_bottom_lift_pt(seat.row_has_thick_bottom, sheet_print_scale)
+                    - seat.inset_bottom_pt;
+            // A seat inside the inset needs the baseline *below* the content
+            // box, which Typst's clamped `bottom-edge` cannot place; keep the
+            // box on the baseline and let the cell translate the content down
+            // by the rest (issues #1277, #1545).
+            seat_shortfall_pt = (-descent_pt).max(0.0);
+            let bottom_em: f64 = descent_pt.max(0.0) / font_size;
+            (
+                top_em,
+                bottom_em,
+                ((advance_em - top_em - bottom_em) * font_size).max(0.0),
+            )
+        }
+        Some(seat) if vertical_align == Some(CellVerticalAlign::Top) => {
+            // Typst rests a top-aligned box on the cell's top inset, so the
+            // seat is the box's ascent above the baseline less that inset.
+            // Excel's whole-point seat is rounded from the face's continuous
+            // ascent, so the two differ by up to half a sheet point either
+            // way; the inset plus the continuous ascent is not it
+            // (issue #1606).
+            let baseline_pt: f64 = sheet_cell_top_baseline_from_track_top_pt(
+                ascender_em,
+                font_size,
+                sheet_print_scale,
+            );
+            let seated_top_em: f64 = (baseline_pt - seat.inset_top_pt) / font_size;
+            if seated_top_em > 0.0 {
+                (seated_top_em, advance_em - seated_top_em, leading_pt)
+            } else {
+                // An inset deeper than the seat cannot be expressed by the
+                // box; keep the unseated top-aligned box.
+                (top_em, bottom_em, leading_pt)
+            }
+        }
+        Some(seat) => {
+            // Typst centres the box in the inset content box, whose centre is
+            // this far below the track's top boundary.
+            let content_mid_pt: f64 =
+                (seat.inset_top_pt + (seat.track_pt - seat.inset_bottom_pt)) / 2.0;
+            // `font_line_metrics_em` folds the line gap into `ascender_em`,
+            // where Word wants it; Excel rounds the gap into whole points on
+            // its own, so split it back out here (issue #1161).
+            let line_gap_em: f64 = crate::render::pdf::font_line_gap_em(family).unwrap_or(0.0);
+            let baseline_pt: f64 = sheet_cell_baseline_from_track_top_pt(
+                seat.track_pt,
+                ascender_em - line_gap_em,
+                descender_em,
+                line_gap_em,
+                font_size,
+                seat.is_horizontally_merged,
+                sheet_print_scale,
+            ) + if seat.is_centered_multi_row {
+                SHEET_PDF_POSITION_GRID_PT / 2.0
+            } else {
+                0.0
+            };
+            let top_em: f64 = advance_em / 2.0 + (baseline_pt - content_mid_pt) / font_size;
+            (top_em, advance_em - top_em, leading_pt)
+        }
+    };
+    // In a top-aligned floating text box, Word seats an expanded exact line
+    // proportionally to the font's ascent and descent. The ordinary cell path
+    // keeps its measured ascender seat; changing it globally moved unrelated
+    // table text (issue #2019).
+    if in_top_aligned_floating_text_box
+        && vertical_align.unwrap_or(CellVerticalAlign::Top) == CellVerticalAlign::Top
+        && sheet_print_scale.is_none()
+        && matches!(
+            style.line_spacing,
+            Some(LineSpacing::Exact(points) | LineSpacing::AtLeast(points)) if points > 0.0
+        )
+        && advance_em > metric_em
+    {
+        let extra_em: f64 = advance_em - metric_em;
+        let top_extra_em: f64 = extra_em * ascender_em / metric_em;
+        top_em += top_extra_em;
+        bottom_em -= top_extra_em;
+    }
+    // Excel paces a sheet cell's *lines* on a measured per-face advance that
+    // is not the face's hhea line, so the surplus rides as leading rather than
+    // inside the box: the box, and with it every seat measured against it,
+    // stays exactly where issues #618/#839/#1063 put it, and only a cell that
+    // sets a second line can see the difference (issue #1163).
+    // Select that advance with the workbook's declared family even when the
+    // line-box metrics above come from the face office2pdf actually paints:
+    // Excel's Segoe UI pitch does not become Selawik's just because a host
+    // needs the bundled Selawik substitute (issue #1498).
+    // Excel evaluates that advance at the size the cell *declares* and prints
+    // it through the sheet's `fitToWidth` scale, which the parser has already
+    // folded into `font_size`; the scaled advance is no whole number of points.
+    let leading_pt: f64 = match sheet_print_scale
+        .filter(|scale| *scale > 0.0)
+        .and_then(|scale| {
+            sheet_wrapped_line_advance_pt(
+                declared_sheet_family.unwrap_or(family),
+                font_size / scale,
+            )
+            .map(|advance_pt| advance_pt * scale)
+        }) {
+        Some(advance_pt) => advance_pt - (top_em + bottom_em) * font_size,
+        None => leading_pt,
+    };
+    Some(CellLineBox {
+        top_em,
+        bottom_em,
+        leading_pt,
+        font_size_pt: font_size,
+        seat_shortfall_pt,
+    })
+}
+
+/// The top-up that raises the font's typographic metric box to Word's line
+/// advance — its hhea single-space line, or the document grid pitch for East
+/// Asian text under a `w:docGrid`. `word_line_height_settings` folds this
+/// into the fixed line-box height rather than emitting it as `par(leading:)`
+/// whitespace between boxes, because Typst inserts that only *between* the
+/// lines of one paragraph and every paragraph then came up one top-up short
+/// (issues #354, #452). A proportional `w:lineRule="auto"` scales the result
+/// rather than replacing it, because that is what Word's own rule means.
+/// `None` when the paragraph states an exact advance, carries its own line
+/// box, or the font's metrics are unknown — the treatment does not apply
+/// then.
+pub(super) fn word_line_leading_pt(
+    runs: &[Run],
+    style: &ParagraphStyle,
+    line_grid_pitch: Option<f64>,
+) -> Option<f64> {
+    if style.line_box.is_some() {
+        return None;
+    }
+    // `w:lineRule="auto"` scales Word's own line rather than replacing it:
+    // `w:line="278"` means 1.158 of the line this function computes. Bailing
+    // out on any `w:spacing w:line` left those paragraphs to Typst's default
+    // leading, which knows nothing of the East Asian line — 15.4pt against
+    // Word's 19.9pt on the technical brief (issue #575). An exact rule states
+    // the advance outright and is handled by fixed text-edge geometry in
+    // `word_line_box_em`, so it adds no `par(leading:)` here.
+    let proportion: f64 = match style.line_spacing {
+        None => 1.0,
+        Some(LineSpacing::Proportional(factor)) if factor > 0.0 => factor,
+        Some(_) => return None,
+    };
+    let family: &str = word_paragraph_metric_family(runs, style)?;
+    let (ascender_em, descender_em, word_pitch_em) =
+        word_line_metrics_em(family, line_takes_east_asian_metrics(runs))?;
+    let font_size: f64 = runs
+        .iter()
+        .filter_map(|run| run.style.font_size)
+        .fold(f64::NAN, f64::max);
+    let font_size: f64 = if font_size.is_nan() { 11.0 } else { font_size };
+    let line_box_pt: f64 = (ascender_em + descender_em) * font_size;
+    if line_box_pt <= 0.0 {
+        return None;
+    }
+
+    // Word's single spacing is the font's full hhea line, which the metric pair
+    // sums to directly (issue #508) - so for Latin text this top-up is zero and
+    // the subtraction below is just a guard for a face whose reported pitch
+    // exceeds its own ascent-plus-descent. East Asian lines get 30% more
+    // (issue #518).
+    let natural_line_pt: f64 = word_natural_line_em(runs, word_pitch_em) * font_size;
+
+    // Word only snaps East Asian *text* to the document grid, so this gate
+    // stays keyed on the characters even though the line height above is keyed
+    // on the face: a Latin-only paragraph keeps whatever advance its own line
+    // asks for rather than being stretched to the grid pitch (native Word GT:
+    // Arial 10.5 lines stay 12pt in a Korean document). Snapping Latin
+    // paragraphs inflated every Western document by 30-50% (issue #354).
+    //
+    // That advance is no longer always the bare hhea line: a Latin-only
+    // paragraph set in a CJK face now carries the 1.3 factor (issue #643). It
+    // still does not snap.
+    let advance_pt: f64 = match line_grid_pitch {
+        Some(pitch) if pitch > 0.0 && has_east_asian_text(runs) => {
+            // A grid line never compresses text below the height its font
+            // needs, and Word chooses between exactly two advances, never a
+            // multiple: the grid pitch when the natural line fits inside one
+            // grid line, otherwise the natural line untouched (issues #402,
+            // #508).
+            if natural_line_pt <= pitch {
+                pitch
+            } else {
+                natural_line_pt
+            }
+        }
+        _ => natural_line_pt,
+    };
+    Some((advance_pt * proportion - line_box_pt).max(0.0))
+}
+
+pub(super) fn write_block_params(out: &mut String, style: &ParagraphStyle) {
+    let mut first = true;
+
+    if let Some(above) = style.space_before {
+        write_param(out, &mut first, &format!("above: {}pt", format_f64(above)));
+    }
+    if let Some(below) = style.space_after {
+        write_param(out, &mut first, &format!("below: {}pt", format_f64(below)));
+    }
+}
+
+/// The paragraph's `w:spacing` gaps, for a parameter list that already has a
+/// first entry (every parameter is prefixed with a comma). They belong to
+/// the outermost block, so an indent wrapper does not separate them from the
+/// neighbouring paragraphs they collapse against.
+fn write_block_spacing_params(
+    out: &mut String,
+    style: &ParagraphStyle,
+    should_include_after_spacing: bool,
+    after_spacing_adjustment_pt: f64,
+) {
+    // An omitted Word before-gap is zero. Leaving it unset lets Typst's
+    // default block spacing enter the flow, which is unrelated to the source.
+    let above: f64 = style.space_before.unwrap_or(0.0);
+    let _ = write!(out, ", above: {}pt", format_f64(above));
+    if should_include_after_spacing
+        && (style.space_after.is_some() || after_spacing_adjustment_pt > 0.0)
+    {
+        let below: f64 = style.space_after.unwrap_or(0.0) + after_spacing_adjustment_pt;
+        let _ = write!(out, ", below: {}pt", format_f64(below));
+    }
+}
+
+/// Re-add a paragraph's before-gap where its block opens a page
+/// ([`ParagraphStyle::keeps_space_before_at_page_top`]). Typst drops a
+/// block's `above` there, so the gap becomes fixed space at the top of the
+/// block, written only when the block's label, written just before it, sits
+/// at the body top. Typst lays a tag out with the next frame, so the label
+/// lands at the block's top whether or not the space is there, and the
+/// layout settles. Elsewhere on a page the block's own `above` stands.
+fn write_page_top_gap(out: &mut String, label: &str, gap: f64, body_top_pt: f64) {
+    let _ = writeln!(
+        out,
+        "#context if locate(<{label}>).position().y <= {}pt {{ v({}pt) }}",
+        format_f64(body_top_pt + 0.01),
+        format_f64(gap)
+    );
+}
+
+/// Keeps an empty paragraph's line whole at a page or column break.
+///
+/// The line is a `#v` inside the paragraph's blocks, and Typst cuts spacing
+/// off at the end of a region without carrying the rest over. So an empty
+/// paragraph that did not fit at a page's bottom vanished, and the text after
+/// it started the next page one line high, where Word moves the line to the
+/// next page like any one-line paragraph (issue #2253).
+fn write_empty_paragraph_unbreakable(out: &mut String, is_empty_paragraph: bool) {
+    if is_empty_paragraph {
+        out.push_str(", breakable: false");
+    }
+}
+
+/// The paragraph's shading and borders, which Word paints across the
+/// paragraph's own column — from the left indent to the right indent — so
+/// they belong to the innermost block (issue #464).
+fn write_block_decoration_params(
+    out: &mut String,
+    style: &ParagraphStyle,
+    should_move_top_border_to_before_spacing: bool,
+) {
+    let decorated: bool = style.background.is_some() || style.border.is_some();
+    if let Some(background) = style.background {
+        let _ = write!(out, ", fill: {}", rgb(&background));
+    }
+    let border_space = style.border_space.as_deref().copied().unwrap_or_default();
+    if let Some(border) = &style.border {
+        write_paragraph_border_params(
+            out,
+            border,
+            border_space,
+            should_move_top_border_to_before_spacing,
+        );
+    }
+    if decorated {
+        // `outset` widens what the block paints without moving the text in
+        // it, which is what the overhang needs (issue #644).
+        let (left_outset_pt, right_outset_pt) = paragraph_horizontal_decoration_outsets(style);
+        if (left_outset_pt - right_outset_pt).abs() < 0.0001 {
+            let _ = write!(out, ", outset: (x: {}pt)", format_f64(left_outset_pt));
+        } else {
+            let _ = write!(
+                out,
+                ", outset: (left: {}pt, right: {}pt)",
+                format_f64(left_outset_pt),
+                format_f64(right_outset_pt)
+            );
+        }
+    }
+}
+
+/// Open a frame for the non-double vertical edges of a header/footer paragraph.
+/// Its outsets use the same extents as the horizontal rules and bridge the gaps
+/// above and below the text without changing the stack's layout height.
+pub(super) fn write_hf_vertical_border_block_open(
+    out: &mut String,
+    border: Option<&CellBorder>,
+    left_outset_pt: f64,
+    right_outset_pt: f64,
+    top_extension_pt: f64,
+    bottom_extension_pt: f64,
+) -> bool {
+    let Some(border) = border else {
+        return false;
+    };
+
+    let vertical_sides: [(&str, &Option<BorderSide>); 2] =
+        [("left", &border.left), ("right", &border.right)];
+    let strokes: Vec<String> = vertical_sides
+        .iter()
+        .filter_map(|(name, side)| {
+            side.as_ref()
+                .filter(|side| side.style != BorderLineStyle::Double)
+                .map(|side| format!("{name}: {}", stroke_literal(side)))
+        })
+        .collect();
+    if strokes.is_empty() {
+        return false;
+    }
+
+    out.push_str("#block(width: 100%, above: 0pt, below: 0pt, stroke: (");
+    out.push_str(&strokes.join(", "));
+    let _ = write!(
+        out,
+        "), outset: (left: {}pt, right: {}pt, top: {}pt, bottom: {}pt))[",
+        format_f64(left_outset_pt),
+        format_f64(right_outset_pt),
+        format_f64(top_extension_pt),
+        format_f64(bottom_extension_pt),
+    );
+    true
+}
+
+/// Return the left/right extent used by the paragraph frame's non-double
+/// vertical strokes, including Word's measured 0.02in overhang and their
+/// side-specific `w:space`. Double vertical sides are not emitted by the
+/// current paragraph-frame path. Header/footer horizontal rules and visible
+/// vertical edges share this geometry.
+pub(super) fn paragraph_border_horizontal_outsets(
+    border: Option<&CellBorder>,
+    border_space: Insets,
+) -> (f64, f64) {
+    let mut left_outset_pt: f64 = TEXT_COLUMN_DECORATION_OVERHANG_PT;
+    let mut right_outset_pt: f64 = TEXT_COLUMN_DECORATION_OVERHANG_PT;
+    if let Some(border) = border {
+        if border
+            .left
+            .as_ref()
+            .is_some_and(|side| side.style != BorderLineStyle::Double)
+        {
+            left_outset_pt += border_space.left;
+        }
+        if border
+            .right
+            .as_ref()
+            .is_some_and(|side| side.style != BorderLineStyle::Double)
+        {
+            right_outset_pt += border_space.right;
+        }
+    }
+    // OOXML border spaces are twips (0.05pt), so hundredths preserve source
+    // precision while avoiding binary-sum artifacts in Typst.
+    (
+        (left_outset_pt * 100.0).round() / 100.0,
+        (right_outset_pt * 100.0).round() / 100.0,
+    )
+}
+
+/// Draw one pair of paragraph-border sides around adjacent matching
+/// paragraphs. Their individual fills remain on the inner paragraph blocks;
+/// this frame carries the shared sides through the spacing between them.
+pub(super) fn write_joined_paragraph_border_frame_open(
+    out: &mut String,
+    style: &ParagraphStyle,
+) -> bool {
+    if paragraph_indent_pt(style).is_some() {
+        return false;
+    }
+    let Some(border) = style.border.as_deref() else {
+        return false;
+    };
+    let mut strokes: Vec<String> = Vec::new();
+    for (name, side) in [("left", &border.left), ("right", &border.right)] {
+        if let Some(side) = side
+            && side.style != BorderLineStyle::Double
+        {
+            strokes.push(format!("{name}: {}", stroke_literal(side)));
+        }
+    }
+    if strokes.is_empty() {
+        return false;
+    }
+
+    out.push_str("#block(width: 100%, above: 0pt, below: 0pt");
+    let _ = write!(out, ", stroke: ({})", strokes.join(", "));
+    let (left_outset_pt, right_outset_pt) = paragraph_horizontal_decoration_outsets(style);
+    if (left_outset_pt - right_outset_pt).abs() < 0.0001 {
+        let _ = write!(out, ", outset: (x: {}pt)", format_f64(left_outset_pt));
+    } else {
+        let _ = write!(
+            out,
+            ", outset: (left: {}pt, right: {}pt)",
+            format_f64(left_outset_pt),
+            format_f64(right_outset_pt)
+        );
+    }
+    out.push_str(")[\n");
+    true
+}
+
+fn paragraph_horizontal_decoration_outsets(style: &ParagraphStyle) -> (f64, f64) {
+    let border_space: Insets = style.border_space.as_deref().copied().unwrap_or_default();
+    paragraph_border_horizontal_outsets(style.border.as_deref(), border_space)
+}
+
+/// Extend paragraph shading and vertical rules through Word's `w:before`
+/// spacing. When inline content follows, a word-joiner keeps Typst's block-level
+/// `place` attached without adding a line; empty paragraphs omit the joiner so
+/// their standalone overlay does not create empty inline text.
+fn write_paragraph_before_spacing_overlay(
+    out: &mut String,
+    style: &ParagraphStyle,
+    should_attach_to_following_inline: bool,
+    should_move_top_border_to_before_spacing: bool,
+) {
+    let Some(space_before): Option<f64> = style
+        .decoration_before_spacing
+        .or(style.space_before)
+        .filter(|space| *space > 0.0)
+    else {
+        return;
+    };
+    let border: Option<&CellBorder> = style.border.as_deref();
+    let has_visible_side_border: bool = border.is_some_and(|border| {
+        [border.left.as_ref(), border.right.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|side| side.style != BorderLineStyle::Double)
+    });
+    if style.background.is_none() && !has_visible_side_border {
+        return;
+    }
+
+    let (left_outset_pt, right_outset_pt) = paragraph_horizontal_decoration_outsets(style);
+    let border_space: Insets = style.border_space.as_deref().copied().unwrap_or_default();
+    let empty_paragraph_top_inset_pt: f64 = if should_attach_to_following_inline {
+        0.0
+    } else {
+        style
+            .border
+            .as_deref()
+            .and_then(|border| border.top.as_ref())
+            .map_or(0.0, |side| {
+                paragraph_border_side_inset(side, border_space.top)
+            })
+    };
+    let (left_inset_pt, right_inset_pt): (f64, f64) = border.map_or((0.0, 0.0), |border| {
+        let left: Option<&BorderSide> = border
+            .left
+            .as_ref()
+            .filter(|side| side.style == BorderLineStyle::Double);
+        let right: Option<&BorderSide> = border
+            .right
+            .as_ref()
+            .filter(|side| side.style == BorderLineStyle::Double);
+        (
+            left.map_or(0.0, |side| {
+                border_space.left + double_rule_thickness(side.width)
+            }),
+            right.map_or(0.0, |side| {
+                border_space.right + double_rule_thickness(side.width)
+            }),
+        )
+    });
+    let left_expansion_pt: f64 = left_outset_pt + left_inset_pt;
+    let right_expansion_pt: f64 = right_outset_pt + right_inset_pt;
+    let width_delta_pt: f64 = left_expansion_pt + right_expansion_pt;
+    let width: String = if width_delta_pt < 0.0001 {
+        "100%".to_string()
+    } else {
+        format!("100% + {}pt", format_f64(width_delta_pt))
+    };
+
+    let _ = write!(
+        out,
+        "#box(place(dx: -{}pt, dy: -{}pt, rect(width: {}, height: {}pt, fill: ",
+        format_f64(left_expansion_pt),
+        format_f64(space_before + empty_paragraph_top_inset_pt),
+        width,
+        format_f64(space_before)
+    );
+    if let Some(background) = style.background {
+        out.push_str(&rgb(&background));
+    } else {
+        out.push_str("none");
+    }
+
+    let mut strokes: Vec<String> = Vec::new();
+    if let Some(border) = border {
+        for (name, side) in [
+            ("top", &border.top),
+            ("left", &border.left),
+            ("right", &border.right),
+        ] {
+            if name == "top" && !should_move_top_border_to_before_spacing {
+                continue;
+            }
+            if let Some(side) = side
+                && side.style != BorderLineStyle::Double
+            {
+                strokes.push(format!("{name}: {}", stroke_literal(side)));
+            }
+        }
+    }
+    if !strokes.is_empty() {
+        let _ = write!(out, ", stroke: ({})", strokes.join(", "));
+    }
+    out.push_str(")))");
+    if should_attach_to_following_inline {
+        out.push_str("#sym.wj#h(0pt, weak: true)");
+    }
+}
+
+/// Emit a fixed-height fill block when a shaded paragraph's joined `w:after`
+/// spacing becomes visible between adjacent paragraphs.
+pub(super) fn write_paragraph_after_spacing_shading_block(
+    out: &mut String,
+    style: &ParagraphStyle,
+    space_after: f64,
+) {
+    let Some(background) = style.background else {
+        return;
+    };
+
+    let (left_expansion_pt, right_expansion_pt) = paragraph_horizontal_decoration_outsets(style);
+    out.push_str("#block(width: 100%, height: ");
+    let _ = write!(
+        out,
+        "{}pt, above: 0pt, below: 0pt, fill: {}",
+        format_f64(space_after),
+        rgb(&background)
+    );
+    if let Some(border) = style.border.as_deref() {
+        let strokes: Vec<String> = ["left", "right"]
+            .into_iter()
+            .zip([&border.left, &border.right])
+            .filter_map(|(name, side)| {
+                side.as_ref()
+                    .filter(|side| side.style != BorderLineStyle::Double)
+                    .map(|side| format!("{name}: {}", stroke_literal(side)))
+            })
+            .collect();
+        if !strokes.is_empty() {
+            let _ = write!(out, ", stroke: ({})", strokes.join(", "));
+        }
+    }
+    if (left_expansion_pt - right_expansion_pt).abs() < 0.0001 {
+        let _ = write!(out, ", outset: (x: {}pt)", format_f64(left_expansion_pt));
+    } else {
+        let _ = write!(
+            out,
+            ", outset: (left: {}pt, right: {}pt)",
+            format_f64(left_expansion_pt),
+            format_f64(right_expansion_pt)
+        );
+    }
+    out.push_str(")[#box(width: 0pt, height: 0pt)]");
+}
+
+/// How far Word paints a rule or a shaded block past each edge of the text
+/// column it belongs to: 0.02in. Applies to `w:pBdr` and `w:shd` on a body
+/// paragraph and to a header or footer rule alike.
+///
+/// Measured, not assumed: across seven golden Word exports the widest rule on
+/// page 1 spans 456.48pt against a 453.60pt text column — 2.88pt wider, or
+/// 1.44pt at each edge — and the landscape file shows the same overhang on its
+/// own wider column. The seven cover both `w:pBdr` rules and `w:shd` blocks,
+/// and body paragraphs as well as header bands.
+///
+/// Whether the overhang is also independent of border weight and style is what
+/// issue #644 reports, and it is consistent with these files all landing on one
+/// value, but the per-style breakdown in that issue was not re-measured here.
+pub(super) const TEXT_COLUMN_DECORATION_OVERHANG_PT: f64 = 1.44;
+
+fn stroke_literal(side: &BorderSide) -> String {
+    // Callers skip Double sides; horizontal ones have separate overlays. For
+    // every reachable style this matches the table flavor of the stroke formatter.
+    stroke_value(side, true)
+}
+
+/// Emit `stroke:`/`inset:` block parameters for the paragraph's borders.
+/// Horizontal `w:pBdr` spaces expand the frame outside the text measure;
+/// vertical spaces remain insets. Horizontal double rules are drawn as overlays
+/// (Typst strokes have no double style), so those sides keep their full inset.
+/// Vertical double sides are not emitted by the current paragraph-frame path.
+///
+/// Top and bottom sides reserve their own `w:space` plus half the rule width;
+/// Typst centers a box stroke on the inset edge, so the other half falls
+/// outside it (issue #648). Left and right spaces are moved to the block's
+/// `outset` so they do not narrow the paragraph's line measure. A double side
+/// has no box stroke, so it keeps an inset for the full three-width overlay.
+/// A fixed 4pt stood in for `w:space` until #520: a letterhead declaring 8pt
+/// then pulled every line below it up by the difference, and the error is a
+/// step, not a drift, so it survives to the bottom of the page.
+fn write_paragraph_border_params(
+    out: &mut String,
+    border: &CellBorder,
+    space: Insets,
+    should_move_top_border_to_before_spacing: bool,
+) {
+    let mut strokes: Vec<String> = Vec::new();
+    let mut insets: Vec<String> = Vec::new();
+
+    let mut push_side = |name: &str, side: &Option<BorderSide>, gap: f64| {
+        let Some(side) = side else {
+            return;
+        };
+        if side.style != BorderLineStyle::Double
+            && !(name == "top" && should_move_top_border_to_before_spacing)
+        {
+            strokes.push(format!("{name}: {}", stroke_literal(side)));
+        }
+        let reserved: f64 = paragraph_border_side_inset(side, gap);
+        let is_horizontal_side: bool = matches!(name, "left" | "right");
+        let moves_space_outside: bool = is_horizontal_side && side.style != BorderLineStyle::Double;
+        if !moves_space_outside {
+            insets.push(format!("{name}: {}pt", format_f64(reserved)));
+        }
+    };
+    push_side("top", &border.top, space.top);
+    push_side("bottom", &border.bottom, space.bottom);
+    push_side("left", &border.left, space.left);
+    push_side("right", &border.right, space.right);
+
+    if !strokes.is_empty() {
+        let _ = write!(out, ", stroke: ({})", strokes.join(", "));
+    }
+    if !insets.is_empty() {
+        let _ = write!(out, ", inset: ({})", insets.join(", "));
+    }
+}
+
+fn paragraph_border_side_inset(side: &BorderSide, gap: f64) -> f64 {
+    if side.style == BorderLineStyle::Double {
+        gap + double_rule_thickness(side.width)
+    } else {
+        // Typst centers a stroke on the inset edge, so half the rule already
+        // falls outside the reserved band. Reserving the full width counts it
+        // twice and displaces the rule by half its width (#648).
+        gap + side.width / 2.0
+    }
+}
+
+fn paragraph_bottom_border_extent_pt(style: &ParagraphStyle) -> f64 {
+    // Word places `w:after` beyond the paragraph's full bottom border band.
+    // Typst reserves that band inside an empty paragraph's line box, so its
+    // extent must be carried into the following block's spacing.
+    let Some(side) = style
+        .border
+        .as_deref()
+        .and_then(|border| border.bottom.as_ref())
+    else {
+        return 0.0;
+    };
+    let border_space: Insets = style.border_space.as_deref().copied().unwrap_or_default();
+    let border_width_pt: f64 = if side.style == BorderLineStyle::Double {
+        double_rule_thickness(side.width)
+    } else {
+        side.width
+    };
+    border_space.bottom + border_width_pt
+}
+
+/// A Word double rule draws two lines of the declared width separated by a gap
+/// of the same width, so it stands three widths tall in total. Measured on
+/// 06_official_letter_ko's `w:sz="8"` letterhead rule: 3pt, against the GT's
+/// 2.93pt gap between the paragraph below it and the rule's far edge.
+fn double_rule_thickness(width: f64) -> f64 {
+    width * 3.0
+}
+
+/// Draw double-rule paragraph borders as two placed hairlines; Typst strokes
+/// cannot render Word's double style. Only horizontal doubles occur in
+/// practice (letterhead rules); the current paragraph-border path does not
+/// emit vertical double sides.
+fn write_paragraph_double_border_overlays(
+    out: &mut String,
+    border: &Option<Box<CellBorder>>,
+    space: Insets,
+) {
+    let Some(border) = border else {
+        return;
+    };
+    for (name, side, gap) in [
+        ("top", &border.top, space.top),
+        ("bottom", &border.bottom, space.bottom),
+    ] {
+        let Some(side) = side else {
+            continue;
+        };
+        if side.style != BorderLineStyle::Double {
+            continue;
+        }
+        let w = side.width;
+        let near_dy = gap + w;
+        let far_dy = gap + double_rule_thickness(w);
+        let (align, sign) = if name == "top" {
+            ("top", -1.0)
+        } else {
+            ("bottom", 1.0)
+        };
+        for dy in [near_dy, far_dy] {
+            // A placed line spans the block's layout box, which `outset` does
+            // not widen, so a double rule has to reach past both edges itself
+            // to match the single-stroke case (issue #644).
+            let _ = write!(
+                out,
+                "#place({align}, dx: -{}pt, dy: {}pt, line(length: 100% + {}pt, stroke: {}pt + {}))",
+                format_f64(TEXT_COLUMN_DECORATION_OVERHANG_PT),
+                format_f64(sign * dy),
+                format_f64(2.0 * TEXT_COLUMN_DECORATION_OVERHANG_PT),
+                format_f64(w),
+                rgb(&side.color),
+            );
+        }
+    }
+}
+
+pub(super) fn write_par_settings(
+    out: &mut String,
+    style: &ParagraphStyle,
+    runs: &[Run],
+    is_word_table_cell: bool,
+) {
+    if let Some(ref spacing) = style.line_spacing {
+        match spacing {
+            LineSpacing::Proportional(factor) => {
+                let leading = factor * 0.65;
+                let _ = writeln!(out, "  #set par(leading: {}em)", format_f64(leading));
+            }
+            LineSpacing::Exact(pts) | LineSpacing::AtLeast(pts) => {
+                let _ = writeln!(out, "  #set par(leading: {}pt)", format_f64(*pts));
+            }
+        }
+    }
+    if matches!(style.alignment, Some(Alignment::Justify)) {
+        write_justification_settings(
+            out,
+            runs,
+            justified_lines_use_first_fit_breaker(is_word_table_cell, runs),
+        );
+    }
+    if matches!(style.direction, Some(TextDirection::Rtl)) {
+        out.push_str("  #set text(dir: rtl)\n");
+    }
+}
+
+/// Justify every line of a paragraph but its last, with the East Asian gap
+/// ceiling Word uses for these runs. `first_fit` keeps Typst's first-fit line
+/// breaker, which `justify` would otherwise swap for its optimized one.
+pub(super) fn write_justification_settings(out: &mut String, runs: &[Run], first_fit: bool) {
+    out.push_str("  #set par(justify: true)\n");
+    if first_fit {
+        out.push_str("  #set par(linebreaks: \"simple\")\n");
+    }
+    write_east_asian_justification_limits(out, runs);
+}
+
+/// State the ceiling Word puts on every expandable gap of a justified line
+/// carrying the East Asian/Latin auto space.
+///
+/// Word distributes a line's stretch demand in three phases (measured over
+/// demands from 6.2pt to 300.2pt, issue #1053): the word spaces fill to half
+/// an em, then the auto spaces take the remainder, then *every* expandable
+/// gap on the line sits at one common width. Typst's justifier fills the gaps
+/// in proportion to their stretchability and, once that is spent, adds what
+/// is left equally to every justifiable glyph — so a ceiling stated as a
+/// length rather than a multiple of each gap's own width brings a 0.352em
+/// word space and a 0.25em auto space to the same half em together, and
+/// Word's common width falls out of the equal remainder. Measured on the
+/// #1193 line: 6.803pt for both kinds against Word's 6.8065pt and 6.8028pt,
+/// where the rigid quarter em gave 8.70pt and 2.62pt.
+///
+/// The phases in between are not separable here — one ratio drives every
+/// gap — so an ordinary justified line, whose demand never reaches the
+/// ceiling, would move its auto spaces where Word leaves them: 0.27pt per gap
+/// on the fixture's second line. The completed-frame pass in
+/// `word_justified_gap_phases` re-spreads such a line the way Word does,
+/// reading each gap's stretch back through this ceiling, which is why the
+/// ceiling's constants are shared with it (issue #1280).
+///
+/// The ratio term is [`EAST_ASIAN_JUSTIFIED_GAP_RATIO_TERM_PERCENT`]. The
+/// `em` resolves against each glyph's own size rather than the paragraph's,
+/// so a line mixing sizes caps each gap at its own half em. The floor stays
+/// [`JUSTIFIED_SPACING_FLOOR`], which is calibrated on the corpus and has
+/// nothing to do with this ceiling.
+///
+/// Scoped to the paragraphs that carry the auto space: Typst's line breaker
+/// prices a line against the allowance it is given, so a document-wide
+/// ceiling would move breaks in every justified Latin paragraph as well.
+pub(super) fn write_east_asian_justification_limits(out: &mut String, runs: &[Run]) {
+    if !runs
+        .iter()
+        .any(|run| run.text.contains(EAST_ASIAN_AUTO_SPACE_CHAR))
+    {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "  #set par(justification-limits: (spacing: (min: {JUSTIFIED_SPACING_FLOOR}, max: {EAST_ASIAN_JUSTIFIED_GAP_RATIO_TERM_PERCENT}% + {EAST_ASIAN_JUSTIFIED_GAP_CEILING_EM}em)))"
+    );
+}
+
+/// Whether this justified paragraph uses Word's first-fit line breaker.
+///
+/// Typst's justified line breaker is Knuth-Plass, which prices a slightly
+/// squeezed line far below a very loose one and so takes that trade whenever
+/// the shrink allowance permits it. Word's does the same under its post-2013
+/// engine: at `compatibilityMode 15` a native export pulls one more eojeol onto
+/// the line and compresses twelve word spaces to 0.9746 of natural to seat it,
+/// which is our own 0.9746 to within 0.0001pt.
+///
+/// Word's pre-2013 East Asian justification has no such phase. Swept over
+/// eleven measures either side of the fit boundary, a native legacy export
+/// seats the extra token only while it fits at natural width and refuses a
+/// 0.5pt overrun — even though the same package's Latin body paragraph, in the
+/// same export, takes up to 2.5pt of overrun. A justified legacy table-cell
+/// paragraph also follows first-fit: on issue #2020's Pullquote, it reproduces
+/// the native three-line word wrap where Knuth–Plass places one more word on
+/// line one. The body-Latin and table-cell cases therefore remain separate
+/// (issues #1130, #2020).
+///
+/// `linebreaks: "simple"` is Typst's first-fit breaker; a line only ever
+/// shrinks under it when a single unbreakable token
+/// overflows the measure, where Word overflows too. Typst already uses it for
+/// every unjustified paragraph, which is why left-aligned Korean text has
+/// always broken where Word breaks it.
+fn justified_lines_use_first_fit_breaker(is_word_table_cell: bool, runs: &[Run]) -> bool {
+    legacy_word_justification_is_active() && (is_word_table_cell || has_east_asian_text(runs))
+}
+
+pub(super) fn write_line_box_settings(out: &mut String, line_box: Option<LineBox>) {
+    let Some(line_box) = line_box else {
+        return;
+    };
+    let _ = writeln!(
+        out,
+        "#set text(top-edge: {}em, bottom-edge: -{}em)",
+        format_f64(line_box.ascent_em),
+        format_f64(line_box.descent_em),
+    );
+    out.push_str("#set par(leading: 0pt)\n");
+}
+
+pub(super) fn generate_runs_with_tabs(
+    out: &mut String,
+    runs: &[Run],
+    tab_stops: Option<&[TabStop]>,
+    default_tab_width_pt: f64,
+    eojeol_wrap: EojeolWrap,
+) {
+    generate_runs_with_tabs_and_metrics(
+        out,
+        runs,
+        tab_stops,
+        default_tab_width_pt,
+        eojeol_wrap,
+        None,
+    );
+}
+
+/// Emit fixed-page PowerPoint runs, giving each explicitly broken segment
+/// PowerPoint's own line box when every one of them fits a physical line.
+///
+/// Every line owns a 1.2em box at **its own** size, so a break advances by the
+/// preceding line's descent plus the following line's seat and a column of
+/// same-size lines paces at exactly `1.2 x size`. The seat is rounded at that
+/// line's size too; rounding once at the paragraph maximum and rescaling its
+/// ratio leaves a mixed-size break up to 0.38pt out (#1252). Typst would
+/// otherwise pace the stack by the *face's* edges, which are not PowerPoint's
+/// box.
+///
+/// A native PowerPoint 16 export of nine-line hard-broken columns measures the
+/// same-size case at `1.2 x size` for every size probed — 6, 6.5, 8, 8.5, 9,
+/// 9.2, 9.5, 9.8, 10.5, 11.5, 12.25 and 20pt — in a text box and in a table
+/// cell alike, which is what retired the 10pt line-box floor this path used to
+/// carry (issue #1172). The floor was fitted to one 9.5pt table cell that
+/// advances 12.00pt natively, but that cell follows a *13pt* line: the same
+/// export paces a nine-line 9.5pt column at 11.37pt, and the 12.00pt is the
+/// taller preceding line's descent, not a floor.
+///
+/// The width guard is essential: an edge set on a segment that wraps would
+/// affect every physical line in it, not only the one before the hard break.
+/// Unmeasured containers and segments too close to the wrapping boundary keep
+/// their existing, internally consistent Typst line boxes.
+///
+/// `reserves_trailing_letter_space` says whether the caller places a line by
+/// the width PowerPoint measured, letter-space after the last glyph included;
+/// every decline above then routes through [`generate_powerpoint_inline_runs`],
+/// which writes that reserve on the lines a hard break ends. The per-line box
+/// path never needs it: [`powerpoint_hard_break_line_fits`] declines any
+/// tracked run, so a paragraph reaching the stack has no letter-space to
+/// reserve.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn generate_powerpoint_runs_with_tabs(
+    out: &mut String,
+    runs: &[Run],
+    style: &ParagraphStyle,
+    tab_stops: Option<&[TabStop]>,
+    default_tab_width_pt: f64,
+    eojeol_wrap: EojeolWrap,
+    available_measure_pt: Option<f64>,
+    reserves_trailing_letter_space: bool,
+) {
+    let inline = |out: &mut String, lines: Option<&[PowerPointHardBreakLine]>| {
+        generate_powerpoint_inline_runs(
+            out,
+            runs,
+            lines,
+            style,
+            tab_stops,
+            default_tab_width_pt,
+            eojeol_wrap,
+            reserves_trailing_letter_space,
+        );
+    };
+
+    let Some(lines) = split_runs_on_hard_breaks(runs) else {
+        inline(out, None);
+        return;
+    };
+    let Some((measure_pt, line_metrics)) =
+        powerpoint_hard_break_stack_settings(&lines, runs, style, available_measure_pt)
+    else {
+        inline(out, Some(&lines));
+        return;
+    };
+
+    let mut line_sources: Vec<String> = Vec::with_capacity(lines.len());
+    for line in &lines {
+        let mut source: String = String::new();
+        generate_runs_with_tabs(
+            &mut source,
+            &line.runs,
+            tab_stops,
+            default_tab_width_pt,
+            eojeol_wrap,
+        );
+        line_sources.push(source);
+    }
+
+    out.push_str("#stack(dir: ttb, spacing: 0pt,\n");
+    // The full-measure line box swallows the surrounding paragraph alignment,
+    // so each line re-anchors by the paragraph's own: a centred table cell
+    // stayed centred in the reference while the first stack build flushed it
+    // to the left edge.
+    let anchor: &str = match style.alignment {
+        Some(Alignment::Center) => "top + center",
+        Some(Alignment::Right) => "top + right",
+        _ => "top + left",
+    };
+    for (line, source) in lines.iter().zip(&line_sources) {
+        let line_size_pt: f64 = line.max_font_size_pt();
+        let (top_pt, bottom_pt) = line_metrics.line_box_pt(line_size_pt);
+        let line_height_pt: f64 = top_pt + bottom_pt;
+        let _ = writeln!(
+            out,
+            "  box(width: {width}pt, height: {height}pt)[#place({anchor}, dy: {top}pt)[#text(top-edge: \"baseline\", bottom-edge: \"baseline\")[{source}]]],",
+            width = format_f64(measure_pt),
+            height = format_f64(line_height_pt),
+            top = format_f64(top_pt),
+            anchor = anchor,
+        );
+    }
+    out.push(')');
+}
+
+pub(super) fn powerpoint_hard_breaks_use_line_stack(
+    runs: &[Run],
+    style: &ParagraphStyle,
+    available_measure_pt: Option<f64>,
+) -> bool {
+    let Some(lines) = split_runs_on_hard_breaks(runs) else {
+        return false;
+    };
+    powerpoint_hard_break_stack_settings(&lines, runs, style, available_measure_pt).is_some()
+}
+
+fn powerpoint_hard_break_stack_settings(
+    lines: &[PowerPointHardBreakLine],
+    runs: &[Run],
+    style: &ParagraphStyle,
+    available_measure_pt: Option<f64>,
+) -> Option<(f64, PowerPointHardBreakLineMetrics)> {
+    let measure_pt: f64 = available_measure_pt
+        .map(|measure| {
+            measure
+                - style.indent_left.unwrap_or(0.0)
+                - style.indent_right.unwrap_or(0.0)
+                - style.indent_first_line.unwrap_or(0.0).max(0.0)
+        })
+        .filter(|measure| *measure > 0.0)?;
+    let line_metrics = if style.line_spacing.is_none() {
+        PowerPointHardBreakLineMetrics::PerLine(PowerPointRunLineMetrics::for_paragraph(
+            runs, style,
+        )?)
+    } else {
+        let (top_em, bottom_em): (f64, f64) = powerpoint_paragraph_line_box_em(runs, style)?;
+        PowerPointHardBreakLineMetrics::Paragraph { top_em, bottom_em }
+    };
+    if !lines
+        .iter()
+        .all(|line| powerpoint_hard_break_line_fits(line, measure_pt))
+    {
+        return None;
+    }
+    Some((measure_pt, line_metrics))
+}
+
+/// Emit the paragraph as ordinary inline markup, giving every hard-broken line
+/// but the last the letter-space PowerPoint measures after its own last glyph.
+///
+/// PowerPoint measures *each* line that way, not just the paragraph's final
+/// one, and places a centred or right-aligned line from that width
+/// ([`powerpoint_trailing_letter_space_pt`]). #1120 trailed the space once,
+/// after the whole paragraph, so a paragraph broken by `<a:br/>` reserved it on
+/// its last line alone: slide 13 of the #841 deck — one centred 38pt title at
+/// `spc="300"` — sat half a letter-space right of a native PowerPoint 16.112
+/// export on both of its visible lines (issue #1174).
+///
+/// The last line is deliberately absent: its space is written by the caller,
+/// after the paragraph's whole markup, so that a `no_wrap` box carries it
+/// inside its own width.
+///
+/// `lines` is the hard-break split the caller already computed, or `None` when
+/// the paragraph has no break at all. Splitting is otherwise pure overhead: a
+/// paragraph that needs no per-line space emits exactly the markup one pass
+/// over `runs` produces.
+#[allow(clippy::too_many_arguments)]
+fn generate_powerpoint_inline_runs(
+    out: &mut String,
+    runs: &[Run],
+    lines: Option<&[PowerPointHardBreakLine]>,
+    style: &ParagraphStyle,
+    tab_stops: Option<&[TabStop]>,
+    default_tab_width_pt: f64,
+    eojeol_wrap: EojeolWrap,
+    reserves_trailing_letter_space: bool,
+) {
+    if lines.is_none() {
+        let run_line_metrics = PowerPointRunLineMetrics::for_mixed_declared_sizes(runs, style)
+            .map(RunLineMetrics::PowerPoint);
+        generate_runs_with_tabs_and_metrics(
+            out,
+            runs,
+            tab_stops,
+            default_tab_width_pt,
+            eojeol_wrap,
+            run_line_metrics,
+        );
+        return;
+    }
+
+    let broken: Option<&[PowerPointHardBreakLine]> = reserves_trailing_letter_space
+        .then_some(lines)
+        .flatten()
+        .filter(|lines| {
+            lines.split_last().is_some_and(|(_, leading)| {
+                leading
+                    .iter()
+                    .any(|line| powerpoint_trailing_letter_space_pt(style, &line.runs).is_some())
+            })
+        });
+    let Some(lines) = broken else {
+        generate_runs_with_tabs(out, runs, tab_stops, default_tab_width_pt, eojeol_wrap);
+        return;
+    };
+
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            out.push_str("#linebreak()");
+        }
+        generate_runs_with_tabs(
+            out,
+            &line.runs,
+            tab_stops,
+            default_tab_width_pt,
+            eojeol_wrap,
+        );
+        if index + 1 < lines.len()
+            && let Some(spacing) = powerpoint_trailing_letter_space_pt(style, &line.runs)
+        {
+            let _ = write!(out, "#h({}pt)", format_f64(spacing));
+        }
+    }
+}
+
+/// Whether this explicit segment is safely narrower than its physical line.
+///
+/// The one-point reserve keeps font-substitution and PowerPoint's 1/8pt
+/// nominal-advance rounding from turning a borderline static measurement into
+/// an actual wrap. Unsupported width-affecting constructs decline correction
+/// instead of guessing.
+fn powerpoint_hard_break_line_fits(line: &PowerPointHardBreakLine, measure_pt: f64) -> bool {
+    const WRAP_RESERVE_PT: f64 = 1.0;
+    let mut advance_pt: f64 = 0.0;
+    for run in &line.runs {
+        if run.footnote.is_some()
+            || run.text.contains('\t')
+            || matches!(run.style.italic, Some(true))
+            || matches!(run.style.small_caps, Some(true))
+            || run.style.vertical_align.is_some()
+            || run.style.baseline_shift.is_some()
+            || run
+                .style
+                .letter_spacing
+                .is_some_and(|spacing| spacing != 0.0)
+        {
+            return false;
+        }
+        let source: String = if matches!(run.style.all_caps, Some(true)) {
+            run.text.to_uppercase()
+        } else {
+            run.text.clone()
+        };
+        let latin_family: &str = match run.style.font_family.as_deref() {
+            Some(family) => family,
+            None => return false,
+        };
+        let east_asian_family: &str = run
+            .style
+            .east_asian_font_family
+            .as_deref()
+            .unwrap_or(latin_family);
+        let font_size_pt: f64 = match run.style.font_size {
+            Some(size) => size,
+            None => return false,
+        };
+        let is_bold: bool = effective_font_weight(&run.style)
+            .is_some_and(|weight| weight != "regular" && weight != "light");
+        let mut segment: String = String::new();
+        let mut segment_is_east_asian: Option<bool> = None;
+        for character in source.chars() {
+            let is_east_asian: bool = is_cjk_like(character);
+            if segment_is_east_asian != Some(is_east_asian) && !segment.is_empty() {
+                let family: &str = if segment_is_east_asian == Some(true) {
+                    east_asian_family
+                } else {
+                    latin_family
+                };
+                let Some(advance_em) =
+                    crate::render::pdf::text_advance_em(family, is_bold, &segment)
+                else {
+                    return false;
+                };
+                advance_pt += advance_em * font_size_pt;
+                segment.clear();
+            }
+            segment_is_east_asian = Some(is_east_asian);
+            segment.push(character);
+        }
+        if !segment.is_empty() {
+            let family: &str = if segment_is_east_asian == Some(true) {
+                east_asian_family
+            } else {
+                latin_family
+            };
+            let Some(advance_em) = crate::render::pdf::text_advance_em(family, is_bold, &segment)
+            else {
+                return false;
+            };
+            advance_pt += advance_em * font_size_pt;
+        }
+    }
+    advance_pt + WRAP_RESERVE_PT <= measure_pt
+}
+
+/// One source line delimited by a PPTX `<a:br/>` marker or a literal newline.
+struct PowerPointHardBreakLine {
+    runs: Vec<Run>,
+    /// Style of the delimiter that opened an otherwise empty line.
+    fallback_font_size_pt: Option<f64>,
+}
+
+impl PowerPointHardBreakLine {
+    fn max_font_size_pt(&self) -> f64 {
+        self.runs
+            .iter()
+            .filter(|run| !run.text.is_empty() || run.footnote.is_some())
+            .filter_map(|run| run.style.font_size)
+            .reduce(f64::max)
+            .or(self.fallback_font_size_pt)
+            .unwrap_or(12.0)
+    }
+}
+
+/// Split without emitting the delimiter, preserving each visible fragment's
+/// run styling. A delimiter's style is only a blank-line fallback: when the
+/// next line has text, its own runs set its size (as PowerPoint does).
+fn split_runs_on_hard_breaks(runs: &[Run]) -> Option<Vec<PowerPointHardBreakLine>> {
+    if !runs.iter().any(|run| {
+        run.text
+            .chars()
+            .any(|ch| matches!(ch, '\n' | PPTX_SOFT_LINE_BREAK_CHAR))
+    }) {
+        return None;
+    }
+
+    let mut lines: Vec<PowerPointHardBreakLine> = vec![PowerPointHardBreakLine {
+        runs: Vec::new(),
+        fallback_font_size_pt: None,
+    }];
+    for run in runs {
+        let mut segment_start: usize = 0;
+        for (offset, ch) in run.text.char_indices() {
+            if !matches!(ch, '\n' | PPTX_SOFT_LINE_BREAK_CHAR) {
+                continue;
+            }
+            if segment_start < offset {
+                lines
+                    .last_mut()
+                    .expect("a line always exists")
+                    .runs
+                    .push(Run {
+                        text: run.text[segment_start..offset].to_string(),
+                        style: run.style.clone(),
+                        href: run.href.clone(),
+                        footnote: run.footnote.clone(),
+                        // A run carrying an inline text box carries no text, so
+                        // it never reaches a split segment; the box travels on
+                        // the whole-run clone below.
+                        inline_box: None,
+                    });
+            }
+            lines.push(PowerPointHardBreakLine {
+                runs: Vec::new(),
+                fallback_font_size_pt: run.style.font_size,
+            });
+            segment_start = offset + ch.len_utf8();
+        }
+        if segment_start < run.text.len() {
+            lines
+                .last_mut()
+                .expect("a line always exists")
+                .runs
+                .push(Run {
+                    text: run.text[segment_start..].to_string(),
+                    style: run.style.clone(),
+                    href: run.href.clone(),
+                    footnote: run.footnote.clone(),
+                    inline_box: None,
+                });
+        } else if segment_start == 0 {
+            lines
+                .last_mut()
+                .expect("a line always exists")
+                .runs
+                .push(run.clone());
+        }
+    }
+    Some(lines)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_word_runs_with_tabs_in_context(
+    out: &mut String,
+    runs: &[Run],
+    tab_stops: Option<&[TabStop]>,
+    default_tab_width_pt: f64,
+    eojeol_wrap: EojeolWrap,
+    style: &ParagraphStyle,
+    line_grid_pitch: Option<f64>,
+    tab_lines: Option<WordTabLines>,
+    exact_line_ascent_pt: Option<f64>,
+    ctx: &mut super::GenCtx,
+) -> Result<(), ConvertError> {
+    let metrics: Option<WordRunLineMetrics<'_>> =
+        WordRunLineMetrics::for_mixed_declared_families(runs, style, line_grid_pitch);
+    generate_runs_with_tabs_and_metrics_in_context(
+        out,
+        runs,
+        tab_stops,
+        default_tab_width_pt,
+        TabPen::from_word_lines(tab_lines),
+        eojeol_wrap,
+        metrics.map(RunLineMetrics::Word),
+        InlineBoxLine {
+            line_spacing: style.line_spacing,
+            exact_ascent_pt: exact_line_ascent_pt,
+        },
+        ctx,
+    )
+}
+
+/// Where a Word body paragraph's lines start and end, measured from the
+/// margin its tab stops count from (issue #2226).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct WordTabLines {
+    /// Where the first line starts: the left indent plus the signed
+    /// first-line indent.
+    pub(super) first_origin_pt: f64,
+    /// Where every later line starts: the left indent.
+    pub(super) continuation_origin_pt: f64,
+    /// Where every line ends, when the container's measure is known.
+    pub(super) end_pt: Option<f64>,
+}
+
+/// How a run list's tabs find their stops.
+#[derive(Clone, Copy, Debug, Default)]
+struct TabPen<'a> {
+    /// A Typst length expression for where the runs' first line starts,
+    /// measured from the origin the stops count from; `None` measures from
+    /// the runs' own start.
+    origin: Option<&'a str>,
+    /// Where a Word body paragraph's lines start and end. With it, each tab
+    /// carries its run's line height, and a tab that runs past the line's
+    /// end starts the next line.
+    word_lines: Option<WordTabLines>,
+}
+
+impl<'a> TabPen<'a> {
+    fn from_origin(origin: Option<&'a str>) -> Self {
+        Self {
+            origin,
+            word_lines: None,
+        }
+    }
+
+    fn from_word_lines(word_lines: Option<WordTabLines>) -> Self {
+        Self {
+            origin: None,
+            word_lines,
+        }
+    }
+}
+
+/// Bindings a tab segment needs to restart its line when its tab runs past
+/// the line's end.
+#[derive(Clone, Copy, Debug)]
+struct TabLineWrap {
+    continuation_origin_pt: f64,
+    end_pt: f64,
+    /// Whether the line before the tab already holds something. A tab that
+    /// opens the paragraph's first line has nothing to leave behind.
+    can_break: bool,
+    /// Whether `tab_lead_{index}` holds the segment's first word.
+    has_lead: bool,
+}
+
+/// What a paragraph's line box asks of the inline boxes riding its runs.
+#[derive(Clone, Copy, Default)]
+struct InlineBoxLine {
+    /// The paragraph's `w:spacing` rule: an expanded proportional line
+    /// reserves room below a tall inline diagram.
+    line_spacing: Option<LineSpacing>,
+    /// How far an exact line reaches above its baseline, from
+    /// [`exact_line_ascent_pt`].
+    exact_ascent_pt: Option<f64>,
+}
+
+/// How far above its baseline a paragraph's line reaches when the paragraph
+/// states `w:lineRule="exact"`: the top edge of its fixed line box,
+/// `line_box_top_em` at `font_size_pt`. Word keeps such a line at its stated
+/// height whatever it holds, so an inline box taller than this is clipped at
+/// the line's top instead of raising it (issue #2228). `None` for any other
+/// rule: an at-least line only sets a minimum and grows to hold the box.
+pub(super) fn exact_line_ascent_pt(
+    style: &ParagraphStyle,
+    line_box_top_em: Option<f64>,
+    font_size_pt: f64,
+) -> Option<f64> {
+    line_box_top_em
+        .filter(|_| {
+            matches!(
+                style.line_spacing,
+                Some(LineSpacing::Exact(points)) if points > 0.0
+            )
+        })
+        .map(|top_em| (top_em * font_size_pt).max(0.0))
+}
+
+fn word_inline_drawing_spacing_pt(run: &Run, line_spacing: Option<LineSpacing>) -> f64 {
+    let Some(LineSpacing::Proportional(proportion)) = line_spacing else {
+        return 0.0;
+    };
+    if proportion <= 1.0
+        || !run.inline_box.as_deref().is_some_and(|inline_box| {
+            inline_box
+                .content
+                .iter()
+                .any(|block| matches!(block, Block::DrawingGroup(_)))
+        })
+    {
+        return 0.0;
+    }
+    // Native Word reserves automatic spacing below tall inline diagrams,
+    // measured from the host run's natural line rather than the frame height.
+    word_line_advance_pt(std::slice::from_ref(run)).unwrap_or(0.0) * (proportion - 1.0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_runs_with_tabs_and_metrics_in_context(
+    out: &mut String,
+    runs: &[Run],
+    tab_stops: Option<&[TabStop]>,
+    default_tab_width_pt: f64,
+    tab_pen: TabPen<'_>,
+    eojeol_wrap: EojeolWrap,
+    run_line_metrics: Option<RunLineMetrics<'_>>,
+    inline_box_line: InlineBoxLine,
+    ctx: &mut super::GenCtx,
+) -> Result<(), ConvertError> {
+    if !paragraph_contains_tabs(runs) {
+        return generate_runs_with_metrics_in_context(
+            out,
+            runs,
+            eojeol_wrap,
+            run_line_metrics,
+            inline_box_line,
+            ctx,
+        );
+    }
+
+    let segments: Vec<Vec<Run>> = split_runs_on_tabs(runs);
+    let word_origin: Option<String> = tab_pen
+        .word_lines
+        .map(|lines| lines.first_origin_pt)
+        .filter(|origin| origin.abs() > 0.0001)
+        .map(|origin| format!("{}pt", format_f64(origin)));
+    let tab_origin: Option<&str> = tab_pen.origin.or(word_origin.as_deref());
+    let wrap: Option<(f64, f64)> = tab_pen.word_lines.and_then(|lines| {
+        lines
+            .end_pt
+            .map(|end_pt| (lines.continuation_origin_pt, end_pt))
+    });
+    let tab_styles: Vec<&TextStyle> = tab_run_styles(runs);
+    let struts: Vec<Run> = if wrap.is_some() {
+        tab_strut_runs(&tab_styles)
+    } else {
+        Vec::new()
+    };
+
+    out.push_str("#context {\n");
+    let mut write_runs = |out: &mut String, runs: &[Run]| {
+        generate_runs_with_metrics_in_context(
+            out,
+            runs,
+            eojeol_wrap,
+            run_line_metrics,
+            inline_box_line,
+            ctx,
+        )
+    };
+    for (index, segment) in segments.iter().enumerate() {
+        let _ = write!(out, "  let tab_segment_{index} = [");
+        write_runs(out, segment)?;
+        out.push_str("]\n");
+
+        if index == 0 {
+            out.push_str("  let tab_prefix_0 = tab_segment_0\n");
+            if wrap.is_some() {
+                let _ = writeln!(
+                    out,
+                    "  let tab_line_0 = tab_segment_0\n  let tab_line_origin_0 = {}\n  let tab_line_struts_0 = []",
+                    tab_origin.unwrap_or("0pt")
+                );
+            }
+            continue;
+        }
+
+        let line_wrap: Option<TabLineWrap> = match wrap {
+            Some((continuation_origin_pt, end_pt)) => {
+                let _ = write!(out, "  let tab_strut_{index} = [");
+                if let Some(strut) = struts.get(index - 1) {
+                    write_runs(out, std::slice::from_ref(strut))?;
+                }
+                out.push_str("]\n");
+                let lead: Vec<Run> = tab_segment_lead_runs(segment);
+                if !lead.is_empty() {
+                    let _ = write!(out, "  let tab_lead_{index} = [");
+                    write_runs(out, &lead)?;
+                    out.push_str("]\n");
+                }
+                Some(TabLineWrap {
+                    continuation_origin_pt,
+                    end_pt,
+                    can_break: index > 1 || !segments[0].is_empty(),
+                    has_lead: !lead.is_empty(),
+                })
+            }
+            None => None,
+        };
+        let mut leaders: Vec<(TabLeader, String)> = Vec::new();
+        for (leader, run) in tab_leader_runs(tab_stops, tab_styles.get(index - 1).copied()) {
+            let mut markup = String::new();
+            write_runs(&mut markup, std::slice::from_ref(&run))?;
+            leaders.push((leader, markup));
+        }
+        write_tab_segment_bindings(
+            out,
+            index,
+            segment,
+            tab_stops,
+            default_tab_width_pt,
+            tab_origin,
+            line_wrap,
+            &leaders,
+        );
+    }
+
+    let _ = writeln!(out, "  tab_prefix_{}", segments.len() - 1);
+    out.push('}');
+    Ok(())
+}
+
+/// The style of the run holding each tab of `runs`, in order, so tab
+/// `index - 1` is the one before segment `index` of [`split_runs_on_tabs`].
+/// A run carrying an object is not split there, so its text adds no tab.
+fn tab_run_styles(runs: &[Run]) -> Vec<&TextStyle> {
+    runs.iter()
+        .filter(|run| run.footnote.is_none() && run.inline_box.is_none())
+        .flat_map(|run| run.text.matches('\t').map(move |_| &run.style))
+        .collect()
+}
+
+/// One zero-width run per tab, in the tab's own run style. A tab is a
+/// character of its run, so a line that holds only tabs is as tall as their
+/// runs (issue #2226). U+2060 WORD JOINER paints nothing and adds no break
+/// opportunity.
+fn tab_strut_runs(tab_styles: &[&TextStyle]) -> Vec<Run> {
+    tab_styles
+        .iter()
+        .map(|style| Run {
+            text: "\u{2060}".to_string(),
+            style: (*style).clone(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        })
+        .collect()
+}
+
+/// The run that draws each leader `tab_stops` name, once per leader, for a
+/// tab in `tab_style`.
+///
+/// A leader is the tab character's own ink, so Word sets it in the face,
+/// size and colour of the run holding the tab rather than the engine's
+/// default face (issue #2244). The run's underline, strike and highlight are
+/// left off: they mark the tab's whole span, not each repeated leader mark.
+fn tab_leader_runs(
+    tab_stops: Option<&[TabStop]>,
+    tab_style: Option<&TextStyle>,
+) -> Vec<(TabLeader, Run)> {
+    let style = TextStyle {
+        underline: None,
+        strikethrough: None,
+        highlight: None,
+        ..tab_style.cloned().unwrap_or_default()
+    };
+    let mut leaders: Vec<(TabLeader, Run)> = Vec::new();
+    for stop in tab_stops.unwrap_or_default() {
+        let Some(text) = tab_leader_text(stop.leader) else {
+            continue;
+        };
+        if leaders.iter().all(|(leader, _)| *leader != stop.leader) {
+            leaders.push((
+                stop.leader,
+                Run {
+                    text: text.to_string(),
+                    style: style.clone(),
+                    href: None,
+                    footnote: None,
+                    inline_box: None,
+                },
+            ));
+        }
+    }
+    leaders
+}
+
+fn tab_leader_text(leader: TabLeader) -> Option<&'static str> {
+    match leader {
+        TabLeader::None => None,
+        TabLeader::Dot => Some("."),
+        TabLeader::Hyphen => Some("-"),
+        TabLeader::Underscore => Some("_"),
+    }
+}
+
+/// A tab segment's runs up to its first break opportunity: the word Word
+/// keeps on the tab's line, so the tab moves with it (issue #2226). An
+/// object ends the word, and an East Asian character is a word of its own.
+fn tab_segment_lead_runs(segment: &[Run]) -> Vec<Run> {
+    let mut lead: Vec<Run> = Vec::new();
+    for run in segment {
+        if run.footnote.is_some() || run.inline_box.is_some() {
+            break;
+        }
+        let end: Option<usize> = run.text.char_indices().find_map(|(at, ch)| {
+            if ch.is_whitespace() {
+                Some(at)
+            } else if is_cjk_like(ch) {
+                Some(at + ch.len_utf8())
+            } else {
+                None
+            }
+        });
+        match end {
+            Some(end) => {
+                if end > 0 {
+                    lead.push(Run {
+                        text: run.text[..end].to_string(),
+                        ..run.clone()
+                    });
+                }
+                break;
+            }
+            None => lead.push(run.clone()),
+        }
+    }
+    lead
+}
+
+pub(super) fn generate_runs_with_context(
+    out: &mut String,
+    runs: &[Run],
+    eojeol_wrap: EojeolWrap,
+    ctx: &mut super::GenCtx,
+) -> Result<(), ConvertError> {
+    generate_runs_with_metrics_in_context(
+        out,
+        runs,
+        eojeol_wrap,
+        None,
+        InlineBoxLine::default(),
+        ctx,
+    )
+}
+
+/// `exact_line_ascent_pt` is the paragraph's [`exact_line_ascent_pt`].
+pub(super) fn generate_runs_with_tabs_context(
+    out: &mut String,
+    runs: &[Run],
+    tab_stops: Option<&[TabStop]>,
+    default_tab_width_pt: f64,
+    eojeol_wrap: EojeolWrap,
+    exact_line_ascent_pt: Option<f64>,
+    ctx: &mut super::GenCtx,
+) -> Result<(), ConvertError> {
+    generate_runs_with_tabs_and_metrics_in_context(
+        out,
+        runs,
+        tab_stops,
+        default_tab_width_pt,
+        TabPen::default(),
+        eojeol_wrap,
+        None,
+        InlineBoxLine {
+            line_spacing: None,
+            exact_ascent_pt: exact_line_ascent_pt,
+        },
+        ctx,
+    )
+}
+
+/// As [`generate_runs_with_tabs_context`], for runs whose first line starts
+/// `tab_origin` (a Typst length expression) past the origin the stops count
+/// from, such as a Word list item's body after its marker.
+pub(super) fn generate_runs_with_tabs_from_origin_context(
+    out: &mut String,
+    runs: &[Run],
+    tab_stops: Option<&[TabStop]>,
+    default_tab_width_pt: f64,
+    tab_origin: &str,
+    eojeol_wrap: EojeolWrap,
+    ctx: &mut super::GenCtx,
+) -> Result<(), ConvertError> {
+    generate_runs_with_tabs_and_metrics_in_context(
+        out,
+        runs,
+        tab_stops,
+        default_tab_width_pt,
+        TabPen::from_origin(Some(tab_origin)),
+        eojeol_wrap,
+        None,
+        InlineBoxLine::default(),
+        ctx,
+    )
+}
+
+pub(super) fn generate_run_with_context(
+    out: &mut String,
+    run: &Run,
+    ctx: &mut super::GenCtx,
+) -> Result<(), ConvertError> {
+    if let Some(inline_box) = run.inline_box.as_deref() {
+        return write_inline_text_box(out, inline_box, 0.0, None, ctx);
+    }
+    if let Some(content) = run.footnote.as_deref() {
+        out.push_str("#footnote[");
+        generate_runs_with_context(out, content, EojeolWrap::Syllable, ctx)?;
+        out.push(']');
+        return Ok(());
+    }
+
+    generate_run(out, run);
+    Ok(())
+}
+
+fn run_needs_generation_context(run: &Run) -> bool {
+    run.inline_box.is_some()
+        || run
+            .footnote
+            .as_deref()
+            .is_some_and(|content| content.iter().any(run_needs_generation_context))
+}
+
+fn generate_runs_with_metrics_in_context(
+    out: &mut String,
+    runs: &[Run],
+    eojeol_wrap: EojeolWrap,
+    run_line_metrics: Option<RunLineMetrics<'_>>,
+    inline_box_line: InlineBoxLine,
+    ctx: &mut super::GenCtx,
+) -> Result<(), ConvertError> {
+    // A footnote can carry a box indirectly; its nested blocks still need the
+    // image registry and table context used by boxes in the anchor paragraph.
+    if runs.iter().any(run_needs_generation_context) {
+        for (index, run) in runs.iter().enumerate() {
+            if let Some(inline_box) = run.inline_box.as_deref() {
+                write_inline_text_box(
+                    out,
+                    inline_box,
+                    word_inline_drawing_spacing_pt(run, inline_box_line.line_spacing),
+                    inline_box_line.exact_ascent_pt,
+                    ctx,
+                )?;
+            } else if run.footnote.is_some() {
+                generate_run_with_context(out, run, ctx)?;
+            } else {
+                generate_run_at_with_metrics(out, run, index == 0, run_line_metrics);
+            }
+        }
+        return Ok(());
+    }
+
+    generate_runs_with_metrics(out, runs, eojeol_wrap, run_line_metrics);
+    Ok(())
+}
+
+fn generate_runs_with_tabs_and_metrics(
+    out: &mut String,
+    runs: &[Run],
+    tab_stops: Option<&[TabStop]>,
+    default_tab_width_pt: f64,
+    eojeol_wrap: EojeolWrap,
+    run_line_metrics: Option<RunLineMetrics<'_>>,
+) {
+    if !paragraph_contains_tabs(runs) {
+        generate_runs_with_metrics(out, runs, eojeol_wrap, run_line_metrics);
+        return;
+    }
+
+    let segments: Vec<Vec<Run>> = split_runs_on_tabs(runs);
+    write_measured_tab_segments(
+        out,
+        &segments,
+        &tab_run_styles(runs),
+        tab_stops,
+        default_tab_width_pt,
+        |out, index| {
+            generate_runs_with_metrics(out, &segments[index], eojeol_wrap, run_line_metrics)
+        },
+        |out, run| {
+            generate_runs_with_metrics(
+                out,
+                std::slice::from_ref(run),
+                eojeol_wrap,
+                run_line_metrics,
+            )
+        },
+    );
+}
+
+/// Lay tab-separated segments out on the paragraph's stops: each tab advances
+/// to the first stop past the measured width of everything before it, and the
+/// segment after it is aligned by that stop, or starts at the next default
+/// stop when none is left.
+///
+/// `segment_runs[index]` is segment `index`'s text, read for its decimal
+/// anchor; `write_segment` emits its content. `tab_styles[index - 1]` is the
+/// style of the tab before that segment, whose leader `write_run` emits as a
+/// run of that style.
+///
+/// Header and footer paragraphs come through here as well as body copy, so a
+/// tab lands in the same place in both. Their segments used to be matched
+/// against two running-head shapes instead, which sent a lone tab to the right
+/// margin whenever the last stop was a right stop, so a header centred on the
+/// Header style's centre stop printed right-aligned (issue #1821).
+pub(super) fn write_measured_tab_segments(
+    out: &mut String,
+    segment_runs: &[Vec<Run>],
+    tab_styles: &[&TextStyle],
+    tab_stops: Option<&[TabStop]>,
+    default_tab_width_pt: f64,
+    mut write_segment: impl FnMut(&mut String, usize),
+    mut write_run: impl FnMut(&mut String, &Run),
+) {
+    out.push_str("#context {\n");
+
+    for (index, segment) in segment_runs.iter().enumerate() {
+        let _ = write!(out, "  let tab_segment_{index} = [");
+        write_segment(out, index);
+        out.push_str("]\n");
+
+        if index == 0 {
+            out.push_str("  let tab_prefix_0 = tab_segment_0\n");
+            continue;
+        }
+
+        let leaders: Vec<(TabLeader, String)> =
+            tab_leader_runs(tab_stops, tab_styles.get(index - 1).copied())
+                .into_iter()
+                .map(|(leader, run)| {
+                    let mut markup = String::new();
+                    write_run(&mut markup, &run);
+                    (leader, markup)
+                })
+                .collect();
+        write_tab_segment_bindings(
+            out,
+            index,
+            segment,
+            tab_stops,
+            default_tab_width_pt,
+            None,
+            None,
+            &leaders,
+        );
+    }
+
+    let _ = writeln!(out, "  tab_prefix_{}", segment_runs.len() - 1);
+    out.push('}');
+}
+
+pub(super) fn generate_runs_with_tabs_no_wrap(
+    out: &mut String,
+    runs: &[Run],
+    tab_stops: Option<&[TabStop]>,
+    default_tab_width_pt: f64,
+) {
+    let transformed_runs: Vec<Run> = runs
+        .iter()
+        .map(|run| {
+            let mut transformed_run: Run = run.clone();
+            if transformed_run.footnote.is_none() {
+                transformed_run.text = no_wrap_text(&transformed_run.text);
+            }
+            transformed_run
+        })
+        .collect();
+
+    // Slide text keeps PowerPoint's own breaking, which splits Korean
+    // mid-word; this path additionally forbids every break outright.
+    generate_runs_with_tabs(
+        out,
+        &transformed_runs,
+        tab_stops,
+        default_tab_width_pt,
+        EojeolWrap::Syllable,
+    );
+}
+
+/// Emits Typst variable bindings for a non-first tab segment: measurement,
+/// decimal anchor (if applicable), default remainder, advance, fill, and
+/// the accumulated prefix content variable.
+///
+/// With `wrap`, the pen is measured on the current line only,
+/// `tab_line_{index}`. A tab whose left or default stop leaves no room for the
+/// segment's first word before the line's end breaks the line first and
+/// advances from the continuation origin, as Word moves the tab and that word
+/// to the next line (issue #2226). The line it closes may hold nothing but tabs, so it ends
+/// with their `tab_strut_*` runs and keeps their height. A pen already past
+/// the end belongs to a segment that wrapped by itself, whose line position
+/// the unwrapped measure does not know, so it never breaks.
+///
+/// `leaders` holds the markup of each leader the tab draws, from
+/// [`tab_leader_runs`].
+#[allow(clippy::too_many_arguments)]
+fn write_tab_segment_bindings(
+    out: &mut String,
+    index: usize,
+    segment: &[Run],
+    tab_stops: Option<&[TabStop]>,
+    default_tab_width_pt: f64,
+    tab_origin: Option<&str>,
+    wrap: Option<TabLineWrap>,
+    leaders: &[(TabLeader, String)],
+) {
+    let previous = index - 1;
+    let pen_var: String = match wrap {
+        Some(_) => format!("tab_pen_{index}"),
+        None => format!("tab_prefix_width_{index}"),
+    };
+    match wrap {
+        Some(_) => {
+            let _ = write!(
+                out,
+                "  let {pen_var} = measure(tab_line_{previous}).width + tab_line_origin_{previous}"
+            );
+        }
+        None => {
+            let _ = write!(
+                out,
+                "  let {pen_var} = measure(tab_prefix_{previous}).width"
+            );
+            // The stops and the default grid count from the origin, not from
+            // where these runs begin, so the pen is the measured prefix past
+            // that origin.
+            if let Some(origin) = tab_origin {
+                let _ = write!(out, " + {origin}");
+            }
+        }
+    }
+    out.push('\n');
+    let _ = writeln!(
+        out,
+        "  let tab_segment_width_{index} = measure(tab_segment_{index}).width"
+    );
+
+    if let Some(anchor_runs) = extract_decimal_anchor_runs(segment) {
+        let _ = write!(out, "  let tab_decimal_anchor_{index} = [");
+        // Measured for its width only, which a frame does not change, so the
+        // anchor stays the plain emission.
+        generate_runs(out, &anchor_runs, EojeolWrap::Syllable);
+        out.push_str("]\n");
+        let _ = writeln!(
+            out,
+            "  let tab_decimal_width_{index} = measure(tab_decimal_anchor_{index}).width"
+        );
+    }
+
+    let default_tab = format_f64(default_tab_width_pt);
+    if let Some(wrap) = wrap {
+        // A right stop on the margin ends its text exactly at the line's end,
+        // which measurement rounding must not push past it.
+        let end = format_f64(wrap.end_pt + 0.01);
+        let continuation = format_f64(wrap.continuation_origin_pt);
+        if wrap.can_break {
+            let _ = writeln!(
+                out,
+                "  let tab_pen_remainder_{index} = calc.rem-euclid({pen_var}.abs.pt(), {default_tab})"
+            );
+            let lead = if wrap.has_lead {
+                format!("measure(tab_lead_{index}).width")
+            } else {
+                "0pt".to_string()
+            };
+            let _ = writeln!(
+                out,
+                "  let tab_break_{index} = {pen_var} <= {end}pt and ({})",
+                build_tab_break_expr(
+                    &pen_var,
+                    &format!("tab_pen_remainder_{index}"),
+                    &lead,
+                    &format!("{end}pt"),
+                    tab_stops,
+                    default_tab_width_pt,
+                )
+            );
+        } else {
+            let _ = writeln!(out, "  let tab_break_{index} = false");
+        }
+        let _ = writeln!(
+            out,
+            "  let tab_prefix_width_{index} = if tab_break_{index} {{ {continuation}pt }} else {{ {pen_var} }}"
+        );
+    }
+
+    let _ = writeln!(
+        out,
+        "  let tab_default_remainder_{index} = calc.rem-euclid(tab_prefix_width_{index}.abs.pt(), {default_tab})"
+    );
+    let _ = writeln!(
+        out,
+        "  let tab_advance_{index} = {}",
+        build_tab_advance_expr(
+            &format!("tab_prefix_width_{index}"),
+            &format!("tab_default_remainder_{index}"),
+            index,
+            segment,
+            tab_stops,
+            default_tab_width_pt,
+        )
+    );
+    let _ = writeln!(
+        out,
+        "  let tab_fill_{index} = {}",
+        build_tab_fill_expr(index, tab_stops, leaders)
+    );
+    let tail = format!("#tab_fill_{index}#tab_segment_{index}");
+    match wrap {
+        Some(wrap) => {
+            let continuation = format_f64(wrap.continuation_origin_pt);
+            let _ = writeln!(
+                out,
+                "  let tab_line_{index} = if tab_break_{index} {{ [{tail}] }} else {{ [#tab_line_{previous}{tail}] }}"
+            );
+            let _ = writeln!(
+                out,
+                "  let tab_line_origin_{index} = if tab_break_{index} {{ {continuation}pt }} else {{ tab_line_origin_{previous} }}"
+            );
+            let _ = writeln!(
+                out,
+                "  let tab_line_struts_{index} = if tab_break_{index} {{ tab_strut_{index} }} else {{ [#tab_line_struts_{previous}#tab_strut_{index}] }}"
+            );
+            let _ = writeln!(
+                out,
+                "  let tab_prefix_{index} = if tab_break_{index} {{ [#tab_prefix_{previous}#tab_line_struts_{previous}#linebreak(){tail}] }} else {{ [#tab_prefix_{previous}{tail}] }}"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "  let tab_prefix_{index} = [#tab_prefix_{previous}{tail}]"
+            );
+        }
+    }
+}
+
+pub(super) fn paragraph_contains_tabs(runs: &[Run]) -> bool {
+    runs.iter().any(|run| run.text.contains('\t'))
+}
+
+/// Whether a run list keeps each Hangul eojeol — a space-delimited Korean
+/// word — whole when a line has to break (issue #626).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) enum EojeolWrap {
+    /// Typst's UAX #14 default, which permits a break between any two Hangul
+    /// syllable blocks. PowerPoint breaks Korean mid-word, and our output
+    /// already matches it there, so slides and sheets stay on this — as does
+    /// any Word paragraph whose effective `w:wordWrap` is off.
+    #[default]
+    Syllable,
+    /// Emit each eojeol inside an inline `#box`. A frame is a single object to
+    /// UAX #14, so no break opportunity survives inside it. Typst 0.15 still
+    /// offers no other lever for *removing* one: `text(lang: "ko")`,
+    /// `par(linebreaks:)` and `text(costs:)` were each measured to leave the
+    /// breakpoints untouched, because typst-layout builds its ICU4X segmenters
+    /// with default options and never consults `Lang::KOREAN`.
+    /// `par(linebreaks:)` only picks among the opportunities that exist, which
+    /// is what issue #1130 uses it for. The repo already uses the same
+    /// mechanism in the opposite direction, where `#box[]` *creates* a
+    /// contingent break for PowerPoint kinsoku (issue #438).
+    ///
+    /// A no-break marker between the syllables — U+2060 WORD JOINER, the
+    /// obvious alternative — does suppress the breaks, but it lands in the PDF
+    /// text layer and makes the text unsearchable. The no-wrap path emitted
+    /// exactly that until issue #664; the marker turned out to be redundant
+    /// there, because the paragraph was already inside a box. A frame leaves
+    /// the text layer untouched, so it is the mechanism here too.
+    ///
+    /// U+200B, the kinsoku break marker, is stripped before emission and
+    /// never reaches the text layer. U+E001 is stripped too, but what
+    /// replaces it does not: since issue #1193 the auto space is drawn with a
+    /// U+00A0, so a boundary does put a character in the text stream. That is
+    /// not the #664 hazard, because the gap already extracted as a space
+    /// without one — `pdftotext` reads the fixture's justified line
+    /// identically from Word's own export, from our output before the change
+    /// and from our output after it, and neither `pdftotext` nor `mutool`
+    /// reports a U+00A0 in any of the three.
+    ///
+    /// `line_box_em` is the paragraph's fixed `(top-edge, bottom-edge)` when
+    /// it declares them, so the frame can restore them; see
+    /// [`write_eojeol_frame_open`]. `measure_pt` is the width one line of the
+    /// paragraph has, which bounds how wide a token may be and still be
+    /// framed; see [`is_framed_eojeol`].
+    Eojeol {
+        line_box_em: Option<(f64, f64)>,
+        measure_pt: Option<f64>,
+    },
+}
+
+impl EojeolWrap {
+    /// Fall back to syllable breaking when `condition` holds.
+    ///
+    /// The eojeol path rebuilds a line out of Hangul tokens, so anything in the
+    /// runs that is not text disappears from it.
+    fn without_eojeol_frames_if(self, condition: bool) -> Self {
+        if condition { Self::Syllable } else { self }
+    }
+}
+
+/// The longest token still framed when its width cannot be measured, in
+/// characters.
+///
+/// A token wider than the line cannot break inside its frame, so it starts a
+/// line of its own and then overflows it — one line more than Word spends,
+/// plus ink outside the column. [`is_framed_eojeol`] therefore compares the
+/// token's measured advance against the paragraph's own measure. This cap is
+/// only the fallback for when one of the two is unknown: on `wasm32`, where
+/// [`text_advance_em`](crate::render::pdf::text_advance_em) always returns
+/// `None`, for a run that names no family or size, and for a container whose
+/// measure did not reach codegen. An eojeol is a stem plus its particles and
+/// rarely reaches ten syllables, so twenty is a generous ceiling.
+const MAX_UNMEASURED_EOJEOL_CHARS: usize = 20;
+
+/// How a paragraph breaks its Hangul lines.
+///
+/// Alignment is not part of the decision. A one-factor `w:jc` probe measured
+/// Word breaking the same Korean sentence at the same two eojeol boundaries
+/// for `left`, `both`, `center` and `right` when the package defines a default
+/// paragraph style, and at the same syllable boundary for all four when it
+/// defines none — the #732 style rule either way. The justified line is
+/// stretched 55.12pt to the measure rather than pulled tighter by borrowing a
+/// syllable, so keeping the eojeol whole is a deliberate choice Word makes
+/// under justification too. The contract fixture that once read as
+/// "justification breaks syllables" defines no paragraph style, so its
+/// paragraphs arrive here already carrying `word_wrap == Some(false)`
+/// (issue #1084).
+///
+/// `container_measure_pt` is the width the enclosing container gives a line —
+/// the page's text width, a table column, a text box — before this
+/// paragraph's own indents are taken off it.
+pub(super) fn paragraph_eojeol_wrap(
+    breaks_hangul_at_eojeol: bool,
+    style: &ParagraphStyle,
+    line_box_em: Option<(f64, f64)>,
+    container_measure_pt: Option<f64>,
+) -> EojeolWrap {
+    // `w:wordWrap w:val="0"` asks for character-level breaking outright, and
+    // it wins over the style chain, so it is checked before anything the
+    // paragraph inherits (issue #730).
+    if style.word_wrap == Some(false) {
+        return EojeolWrap::Syllable;
+    }
+    if !breaks_hangul_at_eojeol {
+        return EojeolWrap::Syllable;
+    }
+    // A hanging first line (`indent_first_line < 0`) is wider than the rest,
+    // so the continuation lines — the ones a frame can be pushed onto — are
+    // the binding measure and the negative first-line indent is ignored.
+    let measure_pt: Option<f64> = container_measure_pt
+        .map(|measure| {
+            measure - style.indent_left.unwrap_or(0.0) - style.indent_right.unwrap_or(0.0)
+        })
+        .filter(|measure| *measure > 0.0);
+    EojeolWrap::Eojeol {
+        line_box_em,
+        measure_pt,
+    }
+}
+
+pub(super) fn generate_runs(out: &mut String, runs: &[Run], eojeol_wrap: EojeolWrap) {
+    generate_runs_with_metrics(out, runs, eojeol_wrap, None);
+}
+
+fn generate_runs_with_metrics(
+    out: &mut String,
+    runs: &[Run],
+    eojeol_wrap: EojeolWrap,
+    run_line_metrics: Option<RunLineMetrics<'_>>,
+) {
+    // The eojeol path rebuilds the line from Hangul tokens, and a run carrying
+    // an inline text box holds no text to tokenise — it would be dropped, and
+    // the box with it. Such a paragraph keeps the plain path (issue #1690).
+    let EojeolWrap::Eojeol {
+        line_box_em,
+        measure_pt,
+    } = eojeol_wrap.without_eojeol_frames_if(runs.iter().any(|run| run.inline_box.is_some()))
+    else {
+        for (index, run) in runs.iter().enumerate() {
+            generate_run_at_with_metrics(out, run, index == 0, run_line_metrics);
+        }
+        return;
+    };
+
+    enum WordUnit {
+        Plain(Vec<EojeolPiece>),
+        FramedEojeol(Vec<EojeolPiece>),
+        OverlongLatin(Vec<Vec<EojeolPiece>>),
+    }
+
+    // Everything between a framed eojeol or an overlong Latin token is
+    // coalesced and spliced back into whole runs before it is emitted, so a
+    // paragraph whose tokens all fit keeps byte-identical markup.
+    let latin_metric_shell: Option<TextStyle> = overlong_latin_metric_shell(runs);
+    let mut units: Vec<WordUnit> = Vec::new();
+    for token in split_runs_into_eojeol_tokens(runs) {
+        if is_framed_eojeol(&token, measure_pt) {
+            units.push(WordUnit::FramedEojeol(token));
+        } else if let Some(chunks) = latin_metric_shell
+            .as_ref()
+            .and_then(|_| split_overlong_latin_token(&token, measure_pt))
+        {
+            units.push(WordUnit::OverlongLatin(chunks));
+        } else if let Some(WordUnit::Plain(unframed)) = units.last_mut() {
+            unframed.extend(token);
+        } else {
+            units.push(WordUnit::Plain(token));
+        }
+    }
+
+    let has_overlong_latin: bool = units
+        .iter()
+        .any(|unit| matches!(unit, WordUnit::OverlongLatin(_)));
+    if has_overlong_latin {
+        let shell = latin_metric_shell
+            .as_ref()
+            .expect("an overlong Latin unit requires its metric shell");
+        let paragraph_text: String = runs.iter().map(|run| run.text.as_str()).collect();
+        out.push_str("#text(");
+        write_text_params_for_text(out, shell, &paragraph_text);
+        out.push_str(")[");
+    }
+
+    for unit in &units {
+        match unit {
+            WordUnit::Plain(pieces) => {
+                write_eojeol_pieces(out, pieces, None, run_line_metrics);
+            }
+            WordUnit::FramedEojeol(pieces) => {
+                // A framed eojeol restores the paragraph's edges inside
+                // itself, so a synthetic-oblique box within it has to claim
+                // the same descent or the frame's baseline shift
+                // over-corrects by exactly that much.
+                let seat_bottom_pt = write_eojeol_frame_open(out, pieces, line_box_em);
+                write_eojeol_pieces(out, pieces, seat_bottom_pt, run_line_metrics);
+                write_eojeol_frame_close(out, line_box_em);
+            }
+            WordUnit::OverlongLatin(chunks) => {
+                for (index, chunk) in chunks.iter().enumerate() {
+                    write_eojeol_pieces(out, chunk, None, run_line_metrics);
+                    if index + 1 < chunks.len() {
+                        // The boundary was already measured against the real
+                        // line, so force it without adding a character to the
+                        // PDF text layer. Keeping it inside the metric shell
+                        // preserves the original line advance even when the
+                        // pieces have different colours or links (#1454).
+                        out.push_str("#linebreak()");
+                    }
+                }
+            }
+        }
+    }
+    if has_overlong_latin {
+        out.push(']');
+    }
+}
+
+/// A neutral outer text style that keeps Typst's line metrics stable while an
+/// overlong token is split into several styled inline items.
+///
+/// A centred fixed-height table cell computes a different intrinsic line box
+/// once one run becomes neighbouring `#text` nodes. One surrounding text scope
+/// retains the paragraph's original family, size, weight and style while the
+/// nested runs continue to carry their own colour, decoration and hyperlink.
+/// The conservative gate leaves mixed metric faces and non-Latin paragraphs on
+/// their existing path until their per-line shell can be modelled safely.
+fn overlong_latin_metric_shell(runs: &[Run]) -> Option<TextStyle> {
+    let visible: Vec<&Run> = runs
+        .iter()
+        .filter(|run| run.footnote.is_none() && !run.text.is_empty())
+        .collect();
+    let first: &Run = *visible.first()?;
+    let first_family = first.style.font_family.as_deref()?;
+    let first_size = first.style.font_size?;
+    let first_weight = effective_font_weight(&first.style);
+
+    let same_family = |left: Option<&str>, right: Option<&str>| match (left, right) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        (None, None) => true,
+        _ => false,
+    };
+    if runs.iter().any(|run| {
+        run.footnote.is_some()
+            || !run.text.is_ascii()
+            || run
+                .style
+                .letter_spacing
+                .is_some_and(|spacing| spacing != 0.0)
+            || run.style.vertical_align.is_some()
+            || run.style.baseline_shift.is_some()
+    }) || visible.iter().any(|run| {
+        !same_family(run.style.font_family.as_deref(), Some(first_family))
+            || !same_family(
+                run.style.east_asian_font_family.as_deref(),
+                first.style.east_asian_font_family.as_deref(),
+            )
+            || run.style.font_size != Some(first_size)
+            || effective_font_weight(&run.style) != first_weight
+            || run.style.italic != first.style.italic
+    }) {
+        return None;
+    }
+
+    Some(TextStyle {
+        font_family: first.style.font_family.clone(),
+        east_asian_font_family: first.style.east_asian_font_family.clone(),
+        font_size: first.style.font_size,
+        bold: first.style.bold,
+        italic: first.style.italic,
+        ..TextStyle::default()
+    })
+}
+
+/// A slice of one run, tagged with the run it was cut from.
+///
+/// The tag is what lets [`write_eojeol_pieces`] splice neighbouring slices
+/// back together: `escape_typst` reads its whole input — a run of spaces
+/// becomes a code-mode string, a leading `<digits>.` an escaped enum marker —
+/// so re-joining pieces of *different* runs could change the markup where
+/// concatenating pieces of the same run never can.
+struct EojeolPiece {
+    run_index: usize,
+    run: Run,
+}
+
+/// Split a basic-Latin token into the largest measured chunks that fit one
+/// Word line.
+///
+/// Typst keeps a Latin word unbroken even when it is wider than its container;
+/// Word instead moves the token to a fresh line and then breaks it at a
+/// character boundary. Only a token proven wider than the paragraph's real
+/// measure reaches this path. Fitting words therefore retain the engine's
+/// ordinary word-level breaking, kerning, and run emission.
+///
+/// Each returned chunk preserves the original run indices, styles and links.
+/// [`generate_runs_with_metrics`] places a markup line break between chunks,
+/// so no hidden character reaches the PDF text layer.
+fn split_overlong_latin_token(
+    token: &[EojeolPiece],
+    measure_pt: Option<f64>,
+) -> Option<Vec<Vec<EojeolPiece>>> {
+    let measure_pt = measure_pt.filter(|measure| *measure > 0.0)?;
+    if token.iter().any(|piece| {
+        piece.run.footnote.is_some()
+            || piece
+                .run
+                .style
+                .letter_spacing
+                .is_some_and(|spacing| spacing != 0.0)
+            || piece
+                .run
+                .text
+                .chars()
+                .any(|character| !character.is_ascii_graphic())
+    }) {
+        return None;
+    }
+
+    // Measure the face Typst will actually paint, not merely the family the
+    // DOCX declared. A present face may lack this script or weight, in which
+    // case Typst walks the emitted fallback list per glyph (issue #1239).
+    let mut measured_pieces: Vec<(&EojeolPiece, Vec<(char, f64)>)> = Vec::new();
+    let mut token_advance_pt: f64 = 0.0;
+    for piece in token {
+        if piece.run.text.is_empty() {
+            measured_pieces.push((piece, Vec::new()));
+            continue;
+        }
+        let declared_family = piece.run.style.font_family.as_deref()?;
+        let family_chain = font_subst::family_chain_for_text(
+            declared_family,
+            piece.run.style.east_asian_font_family.as_deref(),
+            &piece.run.text,
+        );
+        let font_size_pt = piece.run.style.font_size?;
+        let is_bold = effective_font_weight(&piece.run.style)
+            .is_some_and(|weight| weight != "regular" && weight != "light");
+        let glyphs: Vec<(char, f64)> = piece
+            .run
+            .text
+            .chars()
+            .zip(crate::render::pdf::glyph_advances_em_with_typst_fallback(
+                &family_chain,
+                is_bold,
+                &piece.run.text,
+            )?)
+            .map(|(character, advance_em)| (character, advance_em * font_size_pt))
+            .collect();
+        token_advance_pt += glyphs.iter().map(|(_, advance_pt)| advance_pt).sum::<f64>();
+        measured_pieces.push((piece, glyphs));
+    }
+    if token_advance_pt <= measure_pt {
+        return None;
+    }
+
+    let mut chunks: Vec<Vec<EojeolPiece>> = vec![Vec::new()];
+    let mut chunk_advance_pt: f64 = 0.0;
+    for (piece, glyphs) in measured_pieces {
+        if glyphs.is_empty() {
+            chunks
+                .last_mut()
+                .expect("an overlong token starts with one chunk")
+                .push(EojeolPiece {
+                    run_index: piece.run_index,
+                    run: piece.run.clone(),
+                });
+            continue;
+        }
+
+        for (character, advance_pt) in glyphs {
+            if chunk_advance_pt > 0.0 && chunk_advance_pt + advance_pt > measure_pt {
+                chunks.push(Vec::new());
+                chunk_advance_pt = 0.0;
+            }
+            push_overlong_character(
+                chunks
+                    .last_mut()
+                    .expect("an overlong token always has a current chunk"),
+                piece,
+                character,
+            );
+            chunk_advance_pt += advance_pt;
+        }
+    }
+
+    (chunks.len() > 1).then_some(chunks)
+}
+
+fn push_overlong_character(chunk: &mut Vec<EojeolPiece>, source: &EojeolPiece, character: char) {
+    if let Some(previous) = chunk.last_mut()
+        && previous.run_index == source.run_index
+    {
+        previous.run.text.push(character);
+        return;
+    }
+    chunk.push(EojeolPiece {
+        run_index: source.run_index,
+        run: Run {
+            text: character.to_string(),
+            style: source.run.style.clone(),
+            href: source.run.href.clone(),
+            footnote: None,
+            inline_box: None,
+        },
+    });
+}
+
+/// Emits pieces, re-joining every neighbouring pair cut from the same run.
+fn write_eojeol_pieces(
+    out: &mut String,
+    pieces: &[EojeolPiece],
+    seat_bottom_pt: Option<f64>,
+    run_line_metrics: Option<RunLineMetrics<'_>>,
+) {
+    let mut pending: Option<(usize, Run)> = None;
+    for piece in pieces {
+        match pending {
+            Some((run_index, ref mut previous)) if run_index == piece.run_index => {
+                previous.text.push_str(&piece.run.text);
+            }
+            _ => {
+                if let Some((_, previous)) = pending.take() {
+                    generate_run_seated_with_metrics(
+                        out,
+                        &previous,
+                        false,
+                        seat_bottom_pt,
+                        run_line_metrics,
+                    );
+                }
+                pending = Some((piece.run_index, piece.run.clone()));
+            }
+        }
+    }
+    if let Some((_, previous)) = pending {
+        generate_run_seated_with_metrics(out, &previous, false, seat_bottom_pt, run_line_metrics);
+    }
+}
+
+/// The characters that close an eojeol, so a frame never spans one.
+///
+/// Most are the characters a Word line may end at. A tab is among them, so a
+/// frame can never straddle a [`split_runs_on_tabs`] segment. A no-break
+/// space cannot host a break at all, but it still separates words, and
+/// treating it as a boundary keeps a whole run of them out of one token.
+///
+/// The East Asian auto space is the one entry that is not a break
+/// opportunity. It closes a token because a frame is laid out at its natural
+/// width, which freezes every gap inside it: left within the frame the auto
+/// space could take no part in the line's justification, and the whole of a
+/// stretched line's demand landed in its word spaces (issue #1193). Outside
+/// it the boundary is still unbreakable, because the space
+/// [`east_asian_auto_space`] emits there is U+00A0.
+fn is_eojeol_delimiter(ch: char) -> bool {
+    matches!(
+        ch,
+        ' ' | '\u{00A0}' | '\t' | '\n' | PPTX_SOFT_LINE_BREAK_CHAR | EAST_ASIAN_AUTO_SPACE_CHAR
+    )
+}
+
+/// Hangul: a precomposed syllable block, a conjoining jamo, or a
+/// compatibility jamo. Han and kana are deliberately absent — Chinese and
+/// Japanese really do break between characters, and framing them would
+/// destroy correct output.
+pub(super) fn is_hangul(ch: char) -> bool {
+    matches!(ch as u32, 0x1100..=0x11FF | 0x3130..=0x318F | 0xAC00..=0xD7A3)
+}
+
+/// Splits a run list into the tokens Word may break between: maximal stretches
+/// of delimiter-free text, each possibly spanning several runs, alternating
+/// with the delimiters themselves.
+///
+/// Grouping happens here, structurally, rather than through a marker pair in
+/// the text: [`extract_decimal_anchor_runs`] slices a run sub-list for a
+/// decimal tab stop and would sever an open/close pair, emitting unbalanced
+/// markup. Spanning runs matters because a bold or coloured fragment inside a
+/// word would otherwise leave a frame boundary — itself a break opportunity —
+/// in the middle of the word.
+///
+/// A footnote run is a token of its own: the reference is an anchor, not part
+/// of any word.
+fn split_runs_into_eojeol_tokens(runs: &[Run]) -> Vec<Vec<EojeolPiece>> {
+    let mut tokens: Vec<Vec<EojeolPiece>> = Vec::new();
+    let mut token: Vec<EojeolPiece> = Vec::new();
+
+    for (run_index, run) in runs.iter().enumerate() {
+        if run.footnote.is_some() {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+            tokens.push(vec![EojeolPiece {
+                run_index,
+                run: run.clone(),
+            }]);
+            continue;
+        }
+        // An empty run still emits its wrappers, so it must survive the split.
+        if run.text.is_empty() {
+            token.push(EojeolPiece {
+                run_index,
+                run: run.clone(),
+            });
+            continue;
+        }
+
+        let mut piece_start: usize = 0;
+        let mut piece_is_delimiter: bool = is_eojeol_delimiter(
+            run.text
+                .chars()
+                .next()
+                .expect("a non-empty run has a first char"),
+        );
+        for (offset, ch) in run.text.char_indices() {
+            let ch_is_delimiter: bool = is_eojeol_delimiter(ch);
+            if ch_is_delimiter == piece_is_delimiter {
+                continue;
+            }
+            push_eojeol_piece(
+                &mut tokens,
+                &mut token,
+                run_index,
+                run,
+                &run.text[piece_start..offset],
+                piece_is_delimiter,
+            );
+            piece_start = offset;
+            piece_is_delimiter = ch_is_delimiter;
+        }
+        push_eojeol_piece(
+            &mut tokens,
+            &mut token,
+            run_index,
+            run,
+            &run.text[piece_start..],
+            piece_is_delimiter,
+        );
+    }
+
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
+}
+
+fn push_eojeol_piece(
+    tokens: &mut Vec<Vec<EojeolPiece>>,
+    token: &mut Vec<EojeolPiece>,
+    run_index: usize,
+    run: &Run,
+    text: &str,
+    is_delimiter: bool,
+) {
+    let piece: EojeolPiece = EojeolPiece {
+        run_index,
+        run: Run {
+            text: text.to_string(),
+            style: run.style.clone(),
+            href: run.href.clone(),
+            footnote: None,
+            inline_box: None,
+        },
+    };
+    if !is_delimiter {
+        token.push(piece);
+        return;
+    }
+    if !token.is_empty() {
+        tokens.push(std::mem::take(token));
+    }
+    tokens.push(vec![piece]);
+}
+
+/// Whether a token is an eojeol Word would keep whole: it carries Hangul, it
+/// is long enough for a break to fall inside it, and it is narrow enough that
+/// a line can hold it.
+///
+/// `measure_pt` is the width one line of the paragraph has. A frame is opaque
+/// to line breaking, so a token wider than that would be pushed onto a line of
+/// its own and still overflow it — one line more than Word spends, with ink
+/// outside the column. Word itself breaks such a token at character level, so
+/// this returns `false` and the token keeps the engine's syllable breaking.
+fn is_framed_eojeol(token: &[EojeolPiece], measure_pt: Option<f64>) -> bool {
+    if token.iter().any(|piece| piece.run.footnote.is_some()) {
+        return false;
+    }
+    // Letter spacing survives a frame boundary by a rule this generator cannot
+    // predict. Measured on typst 0.14 at `tracking: 0.7pt`: framing the four
+    // Korean words of a 13pt centred heading made it 1.4pt *narrower*, while
+    // framing the four words of a 9pt one made it 3.0pt *wider* — the shaper
+    // does not simply trim one step per item. A tracked run is decorative
+    // display text, short enough that it does not wrap and so has nothing to
+    // gain here, so it keeps today's emission until the rule is measured.
+    if token
+        .iter()
+        .any(|piece| piece.run.style.letter_spacing.is_some_and(|s| s != 0.0))
+    {
+        return false;
+    }
+    let mut visible_chars: usize = 0;
+    let mut has_hangul: bool = false;
+    for ch in token.iter().flat_map(|piece| piece.run.text.chars()) {
+        // The in-text markers stand for spacing and break opportunities, not
+        // glyphs, so they cannot make a one-syllable token breakable.
+        if matches!(ch, EAST_ASIAN_AUTO_SPACE_CHAR | HANGUL_KINSOKU_BREAK_CHAR) {
+            continue;
+        }
+        has_hangul |= is_hangul(ch);
+        visible_chars += 1;
+    }
+    if !has_hangul || visible_chars < 2 {
+        return false;
+    }
+    match (measure_pt, eojeol_advance_pt(token)) {
+        (Some(measure), Some(advance)) => advance <= measure,
+        // Either the container's measure or the token's advance is unknown;
+        // fall back to the character ceiling, which at least keeps a
+        // pathologically long token out of a frame.
+        _ => visible_chars <= MAX_UNMEASURED_EOJEOL_CHARS,
+    }
+}
+
+/// The advance a token takes on a line, in points, measured with the same
+/// machinery the auto-layout column widths use (issue #624): each piece's
+/// resolved family — the `w:eastAsia` face for East Asian codepoints — its
+/// weight, and its own size.
+///
+/// `None` when a piece names no family or no size, or when a glyph is missing
+/// from the resolved face; on `wasm32`
+/// [`text_advance_em`](crate::render::pdf::text_advance_em) is always `None`,
+/// so the whole guard degrades to its character ceiling there.
+///
+/// The in-text markers are skipped: they stand for a `#h()` the shaper never
+/// sees as a glyph. That under-counts an auto-space boundary by a quarter em,
+/// which only matters for a token already within a quarter em of the measure.
+fn eojeol_advance_pt(token: &[EojeolPiece]) -> Option<f64> {
+    let mut advance_pt: f64 = 0.0;
+    for piece in token {
+        let latin_family: &str = piece.run.style.font_family.as_deref()?;
+        let east_asian_family: &str = piece
+            .run
+            .style
+            .east_asian_font_family
+            .as_deref()
+            .unwrap_or(latin_family);
+        let font_size_pt: f64 = piece.run.style.font_size?;
+        let is_bold: bool = effective_font_weight(&piece.run.style)
+            .is_some_and(|weight| weight != "regular" && weight != "light");
+        // One `text_advance_em` call per maximal same-face segment: the call
+        // takes a global face-cache lock, so a per-character loop would be
+        // needlessly hot on long Korean paragraphs.
+        let mut segment: String = String::new();
+        let mut segment_is_east_asian: Option<bool> = None;
+        for character in piece.run.text.chars() {
+            if matches!(
+                character,
+                EAST_ASIAN_AUTO_SPACE_CHAR | HANGUL_KINSOKU_BREAK_CHAR
+            ) {
+                continue;
+            }
+            let is_east_asian: bool = is_cjk_like(character);
+            if segment_is_east_asian != Some(is_east_asian) && !segment.is_empty() {
+                let family: &str = if segment_is_east_asian == Some(true) {
+                    east_asian_family
+                } else {
+                    latin_family
+                };
+                advance_pt +=
+                    crate::render::pdf::text_advance_em(family, is_bold, &segment)? * font_size_pt;
+                segment.clear();
+            }
+            segment_is_east_asian = Some(is_east_asian);
+            segment.push(character);
+        }
+        if !segment.is_empty() {
+            let family: &str = if segment_is_east_asian == Some(true) {
+                east_asian_family
+            } else {
+                latin_family
+            };
+            advance_pt +=
+                crate::render::pdf::text_advance_em(family, is_bold, &segment)? * font_size_pt;
+        }
+    }
+    Some(advance_pt)
+}
+
+/// Opens an eojeol's frame.
+///
+/// Since typst 0.15 a box sits on its content's baseline, but its height still
+/// follows the text edges inside it, so under Word's fixed line box (issues
+/// #354, #508) the frame restores the paragraph's edges inside itself and
+/// occupies exactly the line box the spaces around it do. typst 0.14 seated a
+/// box on its bottom edge and needed a matching `baseline` shift as well.
+///
+/// Those edges are re-emitted in points rather than the `em` the paragraph
+/// declares: an `em` resolves against each run's own size, so a size change
+/// inside one eojeol would give the frame a different line box from the text
+/// around it. Resolving them at the token's own largest size reproduces
+/// exactly what the same text contributes to the line unframed.
+fn write_eojeol_frame_open(
+    out: &mut String,
+    token: &[EojeolPiece],
+    line_box_em: Option<(f64, f64)>,
+) -> Option<f64> {
+    let Some((top_em, bottom_em)) = line_box_em else {
+        out.push_str("#box[");
+        return None;
+    };
+    let font_size_pt: f64 =
+        largest_font_size_pt(token.iter().filter_map(|piece| piece.run.style.font_size));
+    let top_pt: f64 = top_em * font_size_pt;
+    let bottom_pt: f64 = bottom_em * font_size_pt;
+    let _ = write!(
+        out,
+        "#box[#text(top-edge: {}pt, bottom-edge: -{}pt)[",
+        format_f64(top_pt),
+        format_f64(bottom_pt)
+    );
+    Some(bottom_pt)
+}
+
+fn write_eojeol_frame_close(out: &mut String, line_box_em: Option<(f64, f64)>) {
+    out.push_str(if line_box_em.is_some() { "]]" } else { "]" });
+}
+
+/// Strip the kinsoku break markers from a run bound for a no-wrap box.
+///
+/// The paragraph is already emitted inside a `#box[...]`, and a box is a
+/// single object to UAX #14, so no break opportunity survives inside it. This
+/// therefore has nothing to add to break suppression and only has to keep the
+/// zero-width kinsoku marker out of the text layer.
+///
+/// It used to also replace every space with U+00A0 and insert a U+2060 WORD
+/// JOINER between adjacent characters. Those were redundant with the enclosing
+/// box, and they reached the PDF text layer: slide text came out as
+/// `p<WJ>a<WJ>n<WJ>i<WJ>c`, which no search for `panic` can match (issue #664).
+fn no_wrap_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| *ch != HANGUL_KINSOKU_BREAK_CHAR)
+        .collect()
+}
+
+pub(crate) fn is_cjk_like(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x1100..=0x11FF
+            | 0x2E80..=0x2FFF
+            | 0x3000..=0x303F
+            | 0x3040..=0x30FF
+            | 0x3130..=0x318F
+            | 0x31F0..=0x31FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xAC00..=0xD7AF
+            | 0xF900..=0xFAFF
+            | 0xFF00..=0xFFEF
+    )
+}
+
+fn split_runs_on_tabs(runs: &[Run]) -> Vec<Vec<Run>> {
+    let mut segments: Vec<Vec<Run>> = vec![Vec::new()];
+
+    for run in runs {
+        // A run carrying a footnote or an inline text box has no text of its
+        // own, so the emptiness test below would drop it along with the box
+        // (issue #1690).
+        let carries_object: bool = run.footnote.is_some() || run.inline_box.is_some();
+        if carries_object || !run.text.contains('\t') {
+            if carries_object || !run.text.is_empty() {
+                segments
+                    .last_mut()
+                    .expect("split_runs_on_tabs should always have a segment")
+                    .push(run.clone());
+            }
+            continue;
+        }
+
+        for (index, part) in run.text.split('\t').enumerate() {
+            if index > 0 {
+                segments.push(Vec::new());
+            }
+
+            if !part.is_empty() {
+                segments
+                    .last_mut()
+                    .expect("split_runs_on_tabs should always have a segment")
+                    .push(Run {
+                        text: part.to_string(),
+                        style: run.style.clone(),
+                        href: run.href.clone(),
+                        footnote: None,
+                        inline_box: None,
+                    });
+            }
+        }
+    }
+
+    segments
+}
+
+fn extract_decimal_anchor_runs(runs: &[Run]) -> Option<Vec<Run>> {
+    let visible_text: String = runs
+        .iter()
+        .filter(|run| run.footnote.is_none())
+        .map(|run| run.text.as_str())
+        .collect();
+    let separator_offset: usize = find_decimal_separator_offset(&visible_text)?;
+
+    let mut anchor_runs: Vec<Run> = Vec::new();
+    let mut visible_offset: usize = 0;
+
+    for run in runs {
+        if run.footnote.is_some() {
+            anchor_runs.push(run.clone());
+            continue;
+        }
+
+        let run_end: usize = visible_offset + run.text.len();
+
+        // Entire run falls before the separator — include it whole.
+        if run_end <= separator_offset {
+            if !run.text.is_empty() {
+                anchor_runs.push(run.clone());
+            }
+            visible_offset = run_end;
+            continue;
+        }
+
+        // This run spans the separator — include only the portion before it.
+        let chars_before_separator: usize = separator_offset.saturating_sub(visible_offset);
+        if chars_before_separator > 0 {
+            anchor_runs.push(Run {
+                text: run.text[..chars_before_separator].to_string(),
+                style: run.style.clone(),
+                href: run.href.clone(),
+                footnote: None,
+                inline_box: None,
+            });
+        }
+
+        return Some(anchor_runs);
+    }
+
+    None
+}
+
+fn find_decimal_separator_offset(text: &str) -> Option<usize> {
+    let separator = text.char_indices().rev().find(|(offset, ch)| {
+        matches!(ch, '.' | ',')
+            && has_ascii_digit_before(text, *offset)
+            && has_ascii_digit_after(text, *offset + ch.len_utf8())
+    })?;
+
+    if is_grouped_integer(
+        &text
+            .chars()
+            .filter(|ch| ch.is_ascii_digit() || matches!(ch, '.' | ','))
+            .collect::<String>(),
+        separator.1,
+    ) {
+        return None;
+    }
+
+    Some(separator.0)
+}
+
+fn has_ascii_digit_before(text: &str, offset: usize) -> bool {
+    text[..offset].chars().rev().any(|ch| ch.is_ascii_digit())
+}
+
+fn has_ascii_digit_after(text: &str, offset: usize) -> bool {
+    text[offset..].chars().any(|ch| ch.is_ascii_digit())
+}
+
+fn is_grouped_integer(text: &str, separator: char) -> bool {
+    if text
+        .chars()
+        .any(|ch| matches!(ch, '.' | ',') && ch != separator)
+    {
+        return false;
+    }
+
+    let parts: Vec<&str> = text.split(separator).collect();
+    parts.len() > 1
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+        && parts[1..].iter().all(|part| part.len() == 3)
+}
+
+/// The advance of tab `index` from the pen held in `prefix_width_var`, whose
+/// remainder on the default grid `remainder_var` holds.
+fn build_tab_advance_expr(
+    prefix_width_var: &str,
+    remainder_var: &str,
+    index: usize,
+    segment: &[Run],
+    tab_stops: Option<&[TabStop]>,
+    default_tab_width_pt: f64,
+) -> String {
+    let segment_width_var = format!("tab_segment_width_{index}");
+    let decimal_width_var =
+        extract_decimal_anchor_runs(segment).map(|_| format!("tab_decimal_width_{index}"));
+    let default_expr = build_default_tab_advance_expr(remainder_var, default_tab_width_pt);
+
+    let Some(tab_stops) = tab_stops else {
+        return default_expr;
+    };
+
+    if tab_stops.is_empty() {
+        return default_expr;
+    }
+
+    let mut expr = String::new();
+    for (stop_index, stop) in tab_stops.iter().enumerate() {
+        let branch = format!(
+            "calc.max(0pt, {}pt - {prefix_width_var} - {})",
+            format_f64(stop.position),
+            tab_alignment_offset_expr(stop, &segment_width_var, decimal_width_var.as_deref())
+        );
+
+        if stop_index == 0 {
+            let _ = write!(
+                expr,
+                "if {prefix_width_var} < {}pt {{ {branch} }}",
+                format_f64(stop.position)
+            );
+        } else {
+            let _ = write!(
+                expr,
+                " else if {prefix_width_var} < {}pt {{ {branch} }}",
+                format_f64(stop.position)
+            );
+        }
+    }
+
+    let _ = write!(expr, " else {{ {default_expr} }}");
+    expr
+}
+
+/// Whether a tab at the pen in `prefix_width_var` lands where the segment's
+/// first word, `lead_width` wide, passes `end`: true for a left stop or a
+/// default stop past the explicit ones (issue #2226). An aligned stop (centre,
+/// right, decimal) never breaks here and keeps its field on the line:
+/// docxide-pdf lets such a field reach into the right indent, and Word's rule
+/// for one past the margin is not settled by the cases this was fitted on.
+fn build_tab_break_expr(
+    prefix_width_var: &str,
+    remainder_var: &str,
+    lead_width: &str,
+    end: &str,
+    tab_stops: Option<&[TabStop]>,
+    default_tab_width_pt: f64,
+) -> String {
+    let default_break = format!(
+        "{prefix_width_var} + ({}) + {lead_width} > {end}",
+        build_default_tab_advance_expr(remainder_var, default_tab_width_pt)
+    );
+    let mut expr = String::new();
+    for stop in tab_stops.unwrap_or_default() {
+        let position = format_f64(stop.position);
+        let branch = match stop.alignment {
+            TabAlignment::Left => format!("{position}pt + {lead_width} > {end}"),
+            TabAlignment::Center | TabAlignment::Right | TabAlignment::Decimal => {
+                "false".to_string()
+            }
+        };
+        let _ = write!(
+            expr,
+            "if {prefix_width_var} < {position}pt {{ {branch} }} else "
+        );
+    }
+    if expr.is_empty() {
+        // No explicit stops: the bare default branch.
+        return default_break;
+    }
+    let _ = write!(expr, "{{ {default_break} }}");
+    expr
+}
+
+fn build_tab_fill_expr(
+    index: usize,
+    tab_stops: Option<&[TabStop]>,
+    leaders: &[(TabLeader, String)],
+) -> String {
+    let Some(tab_stops) = tab_stops else {
+        return format!("h(tab_advance_{index})");
+    };
+
+    if tab_stops.is_empty() {
+        return format!("h(tab_advance_{index})");
+    }
+
+    let prefix_width_var = format!("tab_prefix_width_{index}");
+    let mut expr = String::new();
+    for (stop_index, stop) in tab_stops.iter().enumerate() {
+        let branch = tab_fill_content_expr(index, stop.leader, leaders);
+
+        if stop_index == 0 {
+            let _ = write!(
+                expr,
+                "if {prefix_width_var} < {}pt {{ {branch} }}",
+                format_f64(stop.position)
+            );
+        } else {
+            let _ = write!(
+                expr,
+                " else if {prefix_width_var} < {}pt {{ {branch} }}",
+                format_f64(stop.position)
+            );
+        }
+    }
+
+    let _ = write!(expr, " else {{ h(tab_advance_{index}) }}");
+    expr
+}
+
+/// The fill a tab to a stop with `leader` draws: `leaders`' markup for that
+/// leader repeated across the advance, or the bare mark when `leaders` has
+/// none for it.
+fn tab_fill_content_expr(
+    index: usize,
+    leader: TabLeader,
+    leaders: &[(TabLeader, String)],
+) -> String {
+    let Some(text) = tab_leader_text(leader) else {
+        return format!("h(tab_advance_{index})");
+    };
+    let leader_markup: String = leaders
+        .iter()
+        .find(|(drawn, _)| *drawn == leader)
+        .map(|(_, markup)| markup.clone())
+        .unwrap_or_else(|| escape_typst(text));
+
+    format!("box(width: tab_advance_{index}, repeat[{leader_markup}])")
+}
+
+fn build_default_tab_advance_expr(remainder_var: &str, default_tab_width_pt: f64) -> String {
+    format!(
+        "if {remainder_var} == 0 {{ {}pt }} else {{ ({} - {remainder_var}) * 1pt }}",
+        format_f64(default_tab_width_pt),
+        format_f64(default_tab_width_pt)
+    )
+}
+
+fn tab_alignment_offset_expr(
+    stop: &TabStop,
+    segment_width_var: &str,
+    decimal_width_var: Option<&str>,
+) -> String {
+    match stop.alignment {
+        TabAlignment::Left => "0pt".to_string(),
+        TabAlignment::Center => format!("{segment_width_var} / 2"),
+        TabAlignment::Right => segment_width_var.to_string(),
+        TabAlignment::Decimal => decimal_width_var.unwrap_or(segment_width_var).to_string(),
+    }
+}
+
+pub(super) fn generate_run(out: &mut String, run: &Run) {
+    generate_run_at(out, run, false);
+}
+
+/// As [`generate_run`], but stating whether this run opens its markup line.
+///
+/// Typst drops a space that opens a line, so a run leading the paragraph with
+/// exactly one loses it (issue #752). A run-leading space further along sits
+/// between siblings, survives literally, and must stay a break opportunity so
+/// the line can still wrap there — hence the flag rather than a blanket rule
+/// inside [`escape_typst`].
+///
+/// Two of the three paths that emit runs carry the flag: the plain loop in
+/// [`generate_runs`], and the segment split around PPTX break markers, where
+/// only the segment starting the run can open the line.
+///
+/// [`write_eojeol_pieces`] deliberately does not. Each eojeol is emitted into
+/// its own frame, so "first piece" there means first-in-frame rather than
+/// first-in-paragraph, and threading the flag through it put a code-mode
+/// space in front of every framed eojeol. A Korean paragraph opening with a
+/// single space therefore still loses it; that path needs a paragraph-level
+/// notion of line start, which this does not add.
+pub(super) fn generate_run_at(out: &mut String, run: &Run, opens_line: bool) {
+    generate_run_seated(out, run, opens_line, None);
+}
+
+fn generate_run_at_with_metrics(
+    out: &mut String,
+    run: &Run,
+    opens_line: bool,
+    run_line_metrics: Option<RunLineMetrics<'_>>,
+) {
+    generate_run_seated_with_metrics(out, run, opens_line, None, run_line_metrics);
+}
+
+/// Write an inline DrawingML text box, diagram or picture as one item on its
+/// paragraph's line.
+///
+/// A Typst `box` takes part in the line that holds it, so the line grows to the
+/// box's height and the text after it keeps the same baseline — which is how
+/// Word lays out a `wp:inline` drawing. On the issue's package that puts the
+/// anchor baseline at 108.00pt, the box on 72.00-108.00pt, and every line below
+/// it where Word puts it (issue #1690).
+///
+/// The content is placed out of flow because Typst otherwise aligns an inline
+/// box on the *first baseline of its content*, which leaves the box hanging
+/// below the line instead of standing on it: measured at 85.92pt for that same
+/// anchor baseline. With the content placed, the box's own bottom edge is its
+/// baseline. The anchored text box path uses the same `#place(top + left)`.
+///
+/// On an exact line the box may reach only `exact_line_ascent_pt` above the
+/// baseline. A taller box keeps its bottom on the baseline inside a clipping
+/// box of that height, so the line keeps its stated height and only the part
+/// inside the line is painted, as in Word (issue #2228).
+fn write_inline_text_box(
+    out: &mut String,
+    inline_box: &InlineTextBox,
+    inline_drawing_spacing_pt: f64,
+    exact_line_ascent_pt: Option<f64>,
+    ctx: &mut super::GenCtx,
+) -> Result<(), ConvertError> {
+    let padding: &Insets = &inline_box.padding;
+    let drawing_spacing_pt: f64 = if inline_box
+        .content
+        .iter()
+        .any(|block| matches!(block, Block::DrawingGroup(_)))
+    {
+        inline_drawing_spacing_pt
+    } else {
+        0.0
+    };
+    let box_height_pt: f64 = inline_box.height + drawing_spacing_pt;
+    let clip_height_pt: Option<f64> =
+        exact_line_ascent_pt.filter(|ascent_pt| box_height_pt > *ascent_pt);
+    if let Some(clip_height_pt) = clip_height_pt {
+        let _ = write!(
+            out,
+            "#box(width: {}pt, height: {}pt, clip: true)[#place(bottom + left)[",
+            format_f64(inline_box.width),
+            format_f64(clip_height_pt),
+        );
+    }
+    let inner_width: f64 = (inline_box.width - padding.left - padding.right).max(0.0);
+    let _ = write!(
+        out,
+        "#box(width: {}pt, height: {}pt, inset: {}",
+        format_f64(inline_box.width),
+        format_f64(box_height_pt),
+        super::format_insets(padding),
+    );
+    if drawing_spacing_pt > 0.0 {
+        // Keep accompanying text on the frame's original baseline while the
+        // extra height participates below it in Typst's line layout.
+        let _ = write!(out, ", baseline: {}pt", format_f64(drawing_spacing_pt));
+    }
+    if let Some(fill) = inline_box.fill {
+        let _ = write!(out, ", fill: {}", rgb(&fill));
+    }
+    super::write_shape_stroke(out, &inline_box.stroke);
+    let _ = write!(
+        out,
+        ")[#place(top + left)[#block(width: {}pt)[",
+        format_f64(inner_width)
+    );
+    let previous_measure_pt: Option<f64> = ctx.available_measure_pt;
+    let previous_line_grid_pitch: Option<f64> = ctx.line_grid_pitch;
+    let previous_default_tab_width_pt: f64 = ctx.default_tab_width_pt;
+    let previous_breaks_hangul_at_eojeol: bool = ctx.breaks_hangul_at_eojeol;
+    ctx.available_measure_pt = Some(inner_width);
+    ctx.line_grid_pitch = None;
+    ctx.default_tab_width_pt = DEFAULT_TAB_WIDTH_PT;
+    ctx.breaks_hangul_at_eojeol = false;
+    let result: Result<(), ConvertError> = super::generate_blocks(out, &inline_box.content, ctx);
+    ctx.available_measure_pt = previous_measure_pt;
+    ctx.line_grid_pitch = previous_line_grid_pitch;
+    ctx.default_tab_width_pt = previous_default_tab_width_pt;
+    ctx.breaks_hangul_at_eojeol = previous_breaks_hangul_at_eojeol;
+    result?;
+    out.push_str("]]]");
+    if clip_height_pt.is_some() {
+        out.push_str("]]");
+    }
+    Ok(())
+}
+
+fn write_inline_text_box_without_context(out: &mut String, inline_box: &InlineTextBox) {
+    // Legacy markup-only callers have no image registry or block-generation
+    // context. DOCX flow paragraphs, table cells, lists, and headers use the
+    // context-aware writer above; this path remains for paragraph-only metric
+    // helpers that cannot contain a table or picture.
+    debug_assert!(
+        inline_box
+            .content
+            .iter()
+            .all(|block| matches!(block, Block::Paragraph(_))),
+        "block-bearing inline text boxes require a generation context"
+    );
+    let padding: &Insets = &inline_box.padding;
+    let inner_width: f64 = (inline_box.width - padding.left - padding.right).max(0.0);
+    let _ = write!(
+        out,
+        "#box(width: {}pt, height: {}pt, inset: {}",
+        format_f64(inline_box.width),
+        format_f64(inline_box.height),
+        super::format_insets(padding),
+    );
+    if let Some(fill) = inline_box.fill {
+        let _ = write!(out, ", fill: {}", rgb(&fill));
+    }
+    super::write_shape_stroke(out, &inline_box.stroke);
+    let _ = write!(
+        out,
+        ")[#place(top + left)[#block(width: {}pt)[",
+        format_f64(inner_width)
+    );
+    for block in &inline_box.content {
+        if let Block::Paragraph(paragraph) = block {
+            generate_runs_with_tabs(
+                out,
+                &paragraph.runs,
+                paragraph.style.tab_stops.as_deref(),
+                paragraph_default_tab_width_pt(&paragraph.style, DEFAULT_TAB_WIDTH_PT),
+                EojeolWrap::Syllable,
+            );
+        }
+    }
+    out.push_str("]]]");
+}
+
+/// As [`generate_run_at`], plus the descent the run's line box carries below
+/// the baseline, in points, when the caller knows it.
+///
+/// Only the synthetic-oblique path reads it, and only to keep its slant box
+/// claiming the same space below the baseline the unslanted text would have.
+/// `None` means "not stated", and the box then ends at the baseline — exact
+/// wherever nothing outside it depends on that descent, which is every path
+/// but the eojeol frame's (issue #686).
+fn generate_run_seated(out: &mut String, run: &Run, opens_line: bool, seat_bottom_pt: Option<f64>) {
+    generate_run_seated_with_metrics(out, run, opens_line, seat_bottom_pt, None);
+}
+
+fn generate_run_seated_with_metrics(
+    out: &mut String,
+    run: &Run,
+    opens_line: bool,
+    seat_bottom_pt: Option<f64>,
+    run_line_metrics: Option<RunLineMetrics<'_>>,
+) {
+    // The box is the run's whole content: Word anchors a `wp:inline` drawing to
+    // a run that carries no text of its own (issue #1690).
+    if let Some(inline_box) = run.inline_box.as_deref() {
+        write_inline_text_box_without_context(out, inline_box);
+        return;
+    }
+
+    if let Some(ref content) = run.footnote {
+        // The note's runs carry the style its `w:pStyle` and `w:rPr` resolved
+        // to, so they emit through the ordinary run path rather than as a bare
+        // string that would take the engine's own footnote styling (#580).
+        out.push_str("#footnote[");
+        // The note's own line box is the engine's, not the referring
+        // paragraph's, so a frame here has no edges to restore.
+        generate_runs(out, content, EojeolWrap::Syllable);
+        out.push(']');
+        return;
+    }
+
+    let run_line_box: Option<RunLineBox> = run
+        .style
+        .line_box
+        .map(|edges| RunLineBox::Em {
+            top: edges.ascent_em,
+            bottom: edges.descent_em,
+        })
+        .or_else(|| run_line_metrics.and_then(|metrics| metrics.line_box(run)));
+    match run_line_box {
+        Some(RunLineBox::Em { top, bottom }) => {
+            let _ = write!(
+                out,
+                "#text(top-edge: {}em, bottom-edge: -{}em)[",
+                format_f64(top),
+                format_f64(bottom)
+            );
+        }
+        Some(RunLineBox::Points { top, bottom }) => {
+            let _ = write!(
+                out,
+                "#text(top-edge: {}pt, bottom-edge: -{}pt)[",
+                format_f64(top),
+                format_f64(bottom)
+            );
+        }
+        None => {}
+    }
+
+    if run.text.contains(PPTX_SOFT_LINE_BREAK_CHAR)
+        || run.text.contains(HANGUL_KINSOKU_BREAK_CHAR)
+        || run.text.contains(EAST_ASIAN_AUTO_SPACE_CHAR)
+        || run
+            .text
+            .contains([PAGE_NUMBER_FIELD_CHAR, TOTAL_PAGES_FIELD_CHAR])
+    {
+        write_run_with_break_markers(out, run, opens_line, seat_bottom_pt);
+    } else {
+        write_run_segment(out, run, &run.text, opens_line, seat_bottom_pt);
+    }
+
+    if run_line_box.is_some() {
+        out.push(']');
+    }
+}
+
+/// Expands the in-text markers. A PPTX soft line break becomes
+/// `#linebreak()`, and a PPTX kinsoku break marker (issue #438) becomes an
+/// empty `#box[]`. An inline frame is a Contingent Break in UAX #14
+/// (U+FFFC), so the line may end between a Hangul syllable and its
+/// trailing punctuation — which LB13 otherwise forbids. LB13 still glues
+/// the mark to the frame, so the two move to the next line together, and
+/// the zero-size frame neither disturbs line metrics nor leaves a
+/// zero-width space in the PDF text layer.
+///
+/// A DOCX East Asian auto space becomes [`east_asian_auto_space`]. A DOCX
+/// page field marker, [`PAGE_NUMBER_FIELD_CHAR`] or
+/// [`TOTAL_PAGES_FIELD_CHAR`], becomes the page counter, set in the run's
+/// own text properties as a header paragraph's field is (issue #2338).
+fn write_run_with_break_markers(
+    out: &mut String,
+    run: &Run,
+    opens_line: bool,
+    seat_bottom_pt: Option<f64>,
+) {
+    let mut segment_start: usize = 0;
+
+    for (offset, ch) in run.text.char_indices() {
+        let auto_space: String;
+        let page_field: String;
+        let replacement: &str = match ch {
+            PPTX_SOFT_LINE_BREAK_CHAR => "#linebreak()",
+            HANGUL_KINSOKU_BREAK_CHAR => "#box[]",
+            EAST_ASIAN_AUTO_SPACE_CHAR => {
+                auto_space = east_asian_auto_space(run);
+                &auto_space
+            }
+            PAGE_NUMBER_FIELD_CHAR | TOTAL_PAGES_FIELD_CHAR => {
+                page_field = page_field_markup(run, ch);
+                &page_field
+            }
+            _ => continue,
+        };
+        if segment_start < offset {
+            // Only the segment that starts the run can open the line; the
+            // ones after a marker are mid-line by construction (issue #752).
+            write_run_segment(
+                out,
+                run,
+                &run.text[segment_start..offset],
+                opens_line && segment_start == 0,
+                seat_bottom_pt,
+            );
+        }
+        out.push_str(replacement);
+        segment_start = offset + ch.len_utf8();
+    }
+
+    if segment_start < run.text.len() {
+        write_run_segment(
+            out,
+            run,
+            &run.text[segment_start..],
+            opens_line && segment_start == 0,
+            seat_bottom_pt,
+        );
+    }
+}
+
+/// The page counter a page field marker in `run` stands for, in the numeral
+/// format of the section whose story is being written. The page's own restart
+/// wins over the counter, which the page background reads before the body
+/// restarts it (see [`PAGE_RESTART_LABEL`]).
+fn page_field_markup(run: &Run, marker: char) -> String {
+    let field: String = if marker == TOTAL_PAGES_FIELD_CHAR {
+        "#context counter(page).final().first()".to_string()
+    } else {
+        let pattern: &str = PAGE_NUMBER_FORMAT
+            .with(std::cell::Cell::get)
+            .typst_pattern();
+        format!(
+            "#context {{ let restarts = query(<{PAGE_RESTART_LABEL}>).filter(restart => \
+             restart.location().page() == here().page()); if restarts.len() == 0 \
+             {{ counter(page).display(\"{pattern}\") }} else \
+             {{ numbering(\"{pattern}\", restarts.last().value) }} }}"
+        )
+    };
+    let mut markup: String = String::new();
+    super::write_hf_field(&mut markup, &run.style, &field);
+    markup
+}
+
+fn write_run_segment(
+    out: &mut String,
+    run: &Run,
+    text: &str,
+    opens_line: bool,
+    seat_bottom_pt: Option<f64>,
+) {
+    let baseline_move: Option<String> = baseline_shift_move(&run.style);
+    let paint_style: Option<TextStyle> = baseline_move.as_ref().map(|_| {
+        let mut style: TextStyle = run.style.clone();
+        style.baseline_shift = None;
+        style
+    });
+    let style: &TextStyle = paint_style.as_ref().unwrap_or(&run.style);
+    let has_baseline_displacement: bool = baseline_move.is_some();
+
+    let needs_all_caps: bool = matches!(style.all_caps, Some(true));
+    let source: String = if needs_all_caps {
+        text.to_uppercase()
+    } else {
+        text.to_string()
+    };
+    // A lone space opening the line has to become a code-mode string here,
+    // inside the run's own `#text(...)`, so it takes the run's font and size —
+    // emitted outside the wrapper it would be set in the ambient face and come
+    // out the wrong width (issue #752).
+    let escaped: String = match source.strip_prefix(' ') {
+        Some(rest) if opens_line && !rest.starts_with(' ') => {
+            format!("#\" \";{}", escape_typst(rest))
+        }
+        _ => escape_typst(&source),
+    };
+
+    let wrappers: Vec<String> = collect_formatting_wrappers(run);
+
+    if has_baseline_displacement {
+        // PowerPoint's baseline displacement changes the glyph position but
+        // does not enlarge the paragraph line box. The zero-height inline
+        // shell keeps the run's width while `move` relocates its paint.
+        out.push_str("#box(height: 0pt, baseline: 0pt)[");
+        let shift: &str = baseline_move
+            .as_deref()
+            .expect("a nonzero baseline shift has a paint offset");
+        let _ = write!(out, "#move(dy: {shift})[");
+    }
+    for wrapper in &wrappers {
+        out.push_str(wrapper);
+    }
+
+    match synthetic_oblique_units(style, &source) {
+        Some(units) => {
+            write_synthetic_oblique_content(out, style, &source, &units, opens_line, seat_bottom_pt)
+        }
+        // A tracked run keeps one shaped item: the grid path splits words and
+        // spaces into separate Typst items, and Typst trims tracking at every
+        // item boundary, so the inter-word gaps lost their tracking — the
+        // #841 deck's footer line came out 7.93pt narrow over two spaces
+        // while every intra-word advance matched (issue #1023). Tracked runs
+        // are short decorative display text, the same trade the framed-eojeol
+        // exemption makes, so forgoing 1/8pt snapping costs less than the
+        // gaps.
+        None if powerpoint_advance_grid_is_active()
+            && can_snap_powerpoint_run(&source)
+            && !style.letter_spacing.is_some_and(|spacing| spacing != 0.0) =>
+        {
+            write_powerpoint_grid_run_content(out, &source, &escaped, style)
+        }
+        None => write_run_content(out, &source, &escaped, style),
+    }
+
+    for _ in &wrappers {
+        out.push(']');
+    }
+    if has_baseline_displacement {
+        out.push(']');
+        out.push(']');
+    }
+}
+
+/// Convert DrawingML's relative displacement into the paint-only movement
+/// held outside Typst's inline line metrics.
+fn baseline_shift_move(style: &TextStyle) -> Option<String> {
+    let BaselineShiftEm(shift_em) = style.baseline_shift?;
+    if shift_em == 0.0 {
+        return None;
+    }
+
+    Some(match style.font_size {
+        Some(font_size_pt) => format!("{}pt", format_f64(-shift_em * font_size_pt)),
+        None => format!("{}em", format_f64(-shift_em)),
+    })
+}
+
+/// Whether this run can take the PowerPoint advance-grid treatment without
+/// changing its native break rules.
+///
+/// PowerPoint's Latin runs break at spaces and ASCII hyphens, both modelled by
+/// [`write_powerpoint_grid_run_content`]. Common Latin punctuation is safe to
+/// shape inside the same words, including the Latin mathematical signs ×, ÷,
+/// and ±. Native PowerPoint width probes keep these inside numeric expressions
+/// while retaining breaks at surrounding spaces and ASCII hyphens (#1581).
+/// CJK, bidi, and other Unicode scripts keep their
+/// existing Typst shaping and line breaking until the helper can preserve
+/// their script-specific opportunities just as precisely.
+fn can_snap_powerpoint_run(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().all(|ch| {
+            ch == ' '
+                || (ch.is_ascii_graphic() && ch != '\u{7f}')
+                || matches!(
+                    ch,
+                    '×' | '÷' | '±' | '\u{2010}'..='\u{2015}' | '\u{2018}'..='\u{201f}' | '\u{2026}'
+                )
+        })
+}
+
+/// Write one Latin slide run on PowerPoint's 1/8pt advance grid.
+///
+/// Words are shaped whole and scaled only by the accumulated nominal rounding
+/// delta. That retains pair kerning; a per-glyph box would lose it and
+/// fragment the PDF text layer. A zero-size box restores the native
+/// break opportunity after a hyphen without adding a character to extraction.
+fn write_powerpoint_grid_run_content(
+    out: &mut String,
+    source: &str,
+    escaped: &str,
+    style: &TextStyle,
+) {
+    let wrapped = has_text_properties(style) || needs_kerning_wrapper(style, escaped, source);
+    if wrapped {
+        out.push_str("#text(");
+        write_text_params_for_run(out, style, escaped, source);
+        out.push_str(")[");
+    }
+
+    let mut token_start = 0;
+    for (offset, ch) in source.char_indices() {
+        match ch {
+            ' ' => {
+                write_powerpoint_grid_word(out, &source[token_start..offset]);
+                let left = source[..offset]
+                    .chars()
+                    .next_back()
+                    .map(|ch| ch.to_string())
+                    .unwrap_or_default();
+                let right = source[offset + ch.len_utf8()..]
+                    .chars()
+                    .next()
+                    .map(|ch| ch.to_string())
+                    .unwrap_or_default();
+                let _ = write!(
+                    out,
+                    "#o2p-pptx-space(\"{}\", \"{}\")",
+                    escape_typst_string(&left),
+                    escape_typst_string(&right)
+                );
+                token_start = offset + ch.len_utf8();
+            }
+            '-' => {
+                let end = offset + ch.len_utf8();
+                write_powerpoint_grid_word(out, &source[token_start..end]);
+                if end < source.len() {
+                    out.push_str("#box[]");
+                }
+                token_start = end;
+            }
+            _ => {}
+        }
+    }
+    write_powerpoint_grid_word(out, &source[token_start..]);
+
+    if wrapped {
+        out.push(']');
+    }
+}
+
+fn write_powerpoint_grid_word(out: &mut String, word: &str) {
+    if word.is_empty() {
+        return;
+    }
+    let _ = write!(out, "#o2p-pptx-word([{}], (", escape_typst(word));
+    for glyph in word.chars() {
+        let _ = write!(out, "\"{}\",", escape_typst_string(&glyph.to_string()));
+    }
+    out.push_str("))");
+}
+
+/// The shear Word and PowerPoint apply to a run marked italic whose resolved
+/// face ships no italic member.
+///
+/// Measured off a native Word export of a Malgun Gothic `<w:i/>` run: its text
+/// matrix reads `trm="38 0 12.91406 38"`, a slope of 12.91406/38 = 0.340
+/// (issue #686). Typst has no synthetic style of its own — it selects the
+/// upright face and the emphasis disappears without a warning.
+///
+/// Typst's `skew` takes an angle, so the slope is carried as `atan(0.34)` =
+/// 18.778 degrees, whose tangent is 0.3399994 — 6.5e-7 of slope from the
+/// measured value.
+const SYNTHETIC_OBLIQUE_ANGLE_DEG: f64 = 18.778;
+
+/// One stretch of a run that the synthetic-oblique path treats alike.
+enum ObliqueUnit<'a> {
+    /// Shaped by a family that has a real italic face; the engine handles it.
+    RealItalic(&'a str),
+    /// Slanted by hand, inside one atomic box.
+    Slanted(&'a str),
+    /// Whitespace, kept outside the boxes so a line can still break on it.
+    Space(&'a str),
+}
+
+/// How `text` has to be split so every part is slanted the way its own face
+/// requires, or `None` when the ordinary `style: "italic"` path covers it.
+///
+/// `None` is the overwhelmingly common answer — a non-italic run, or an italic
+/// one on a face that has the variant — and keeps those runs emitting exactly
+/// what they emitted before.
+fn synthetic_oblique_units<'a>(style: &TextStyle, text: &'a str) -> Option<Vec<ObliqueUnit<'a>>> {
+    if !matches!(style.italic, Some(true)) || text.is_empty() {
+        return None;
+    }
+    let family: Option<&str> = style.font_family.as_deref();
+    let east_asian: Option<&str> = style.east_asian_font_family.as_deref();
+    let latin_needs_slant: bool = font_subst::needs_synthetic_oblique(
+        family,
+        east_asian,
+        text,
+        font_subst::TextScript::Latin,
+    );
+    // The East Asian half of a mixed run resolves to a different face than its
+    // Latin half, so the two are asked separately — that split is exactly what
+    // the issue measured: Calibri-Italic for the Latin, a synthesised slant
+    // for the Hangul.
+    let east_asian_script: font_subst::TextScript = font_subst::text_script(text);
+    let east_asian_needs_slant: bool = east_asian_script != font_subst::TextScript::Latin
+        && font_subst::needs_synthetic_oblique(family, east_asian, text, east_asian_script);
+    if !latin_needs_slant && !east_asian_needs_slant {
+        return None;
+    }
+
+    let needs_slant = |character: char| -> bool {
+        if font_subst::is_east_asian_char(character) {
+            east_asian_needs_slant
+        } else {
+            latin_needs_slant
+        }
+    };
+    Some(split_oblique_units(text, needs_slant))
+}
+
+/// Group `text` into [`ObliqueUnit`]s.
+///
+/// A slant box is a single object to UAX #14, so nothing inside one can break.
+/// The grouping therefore keeps every break opportunity the text already had:
+/// whitespace stays outside the boxes, each East Asian character gets its own
+/// box — Korean and Japanese break between characters — and a Latin word,
+/// which is atomic anyway, stays whole so its kerning and ligatures survive.
+fn split_oblique_units(text: &str, needs_slant: impl Fn(char) -> bool) -> Vec<ObliqueUnit<'_>> {
+    fn push_unit<'a>(units: &mut Vec<ObliqueUnit<'a>>, chunk: &'a str, kind: (bool, bool)) {
+        if chunk.is_empty() {
+            return;
+        }
+        units.push(match kind {
+            (true, _) => ObliqueUnit::Space(chunk),
+            (false, true) => ObliqueUnit::Slanted(chunk),
+            (false, false) => ObliqueUnit::RealItalic(chunk),
+        });
+    }
+
+    let mut units: Vec<ObliqueUnit<'_>> = Vec::new();
+    let mut start: usize = 0;
+    let mut current: Option<(bool, bool)> = None; // (is_space, is_slanted)
+
+    for (offset, character) in text.char_indices() {
+        let is_space: bool = character.is_whitespace();
+        let is_slanted: bool = !is_space && needs_slant(character);
+        let kind: (bool, bool) = (is_space, is_slanted);
+        // An East Asian character is its own break opportunity, so it always
+        // starts a new box rather than joining the one before it.
+        let breaks_group: bool =
+            current != Some(kind) || (is_slanted && font_subst::is_east_asian_char(character));
+        if breaks_group {
+            if let Some(kind) = current {
+                push_unit(&mut units, &text[start..offset], kind);
+            }
+            start = offset;
+            current = Some(kind);
+        }
+    }
+    if let Some(kind) = current {
+        push_unit(&mut units, &text[start..], kind);
+    }
+    units
+}
+
+/// Write a run whose slant the engine cannot supply on its own.
+///
+/// One outer `#text(...)` carries the run's font list, size and colour — minus
+/// the italic the resolved face cannot honour — so the whitespace between the
+/// boxes keeps the run's own metrics, and each part inside picks the slant it
+/// needs.
+fn write_synthetic_oblique_content(
+    out: &mut String,
+    style: &TextStyle,
+    source: &str,
+    units: &[ObliqueUnit<'_>],
+    opens_line: bool,
+    seat_bottom_pt: Option<f64>,
+) {
+    let upright_style: TextStyle = TextStyle {
+        italic: None,
+        ..style.clone()
+    };
+    out.push_str("#text(");
+    write_text_params_for_text(out, &upright_style, source);
+    out.push_str(")[");
+
+    for (index, unit) in units.iter().enumerate() {
+        match unit {
+            // The line-opening space has to be a code-mode string for the same
+            // reason it does on the ordinary path: markup collapses a space at
+            // the start of a line (issue #752).
+            ObliqueUnit::Space(spaces) if index == 0 && opens_line => {
+                let _ = write!(out, "#\"{spaces}\";");
+            }
+            ObliqueUnit::Space(spaces) => out.push_str(&escape_typst(spaces)),
+            ObliqueUnit::RealItalic(chunk) => {
+                let _ = write!(out, "#text(style: \"italic\")[{}]", escape_typst(chunk));
+            }
+            ObliqueUnit::Slanted(chunk) => {
+                // Three details keep the box from moving the text it slants.
+                //
+                // `bottom-edge: "baseline"` makes the box end at the baseline,
+                // so `origin: bottom + left` pivots the shear on it and the
+                // glyphs lean without sliding — the default centre pivot moved a 11pt
+                // Malgun Gothic syllable 1.34pt left, and a descender pivot
+                // moved it 0.88pt right.
+                //
+                // A stated seat adds the frame's descent back as padding below
+                // the box, so it occupies exactly what the unslanted text did
+                // inside an eojeol frame (issue #626). Since typst 0.15 a box
+                // sits on its content's baseline whatever its inset, so the
+                // padding needs none of the matching `baseline` shift 0.14 did.
+                let seat: String = match seat_bottom_pt {
+                    Some(bottom_pt) => format!(
+                        "inset: (bottom: {bottom}pt), ",
+                        bottom = format_f64(bottom_pt)
+                    ),
+                    None => String::new(),
+                };
+                let _ = write!(
+                    out,
+                    "#box({seat}skew(ax: -{}deg, origin: bottom + left)[#text(bottom-edge: \"baseline\")[{}]])",
+                    format_f64(SYNTHETIC_OBLIQUE_ANGLE_DEG),
+                    escape_typst(chunk)
+                );
+            }
+        }
+    }
+    out.push(']');
+}
+
+/// Builds the ordered list of `#command[` openers that wrap a run's content.
+/// The order matches the original nesting: link > highlight > strike >
+/// underline > super/sub > smallcaps.
+fn collect_formatting_wrappers(run: &Run) -> Vec<String> {
+    let style: &TextStyle = &run.style;
+    let mut wrappers: Vec<String> = Vec::new();
+
+    if let Some(ref href) = run.href {
+        wrappers.push(format!("#link(\"{href}\")["));
+    }
+    if let Some(ref highlight) = style.highlight {
+        let edges: Option<(f64, f64)> = DRAWINGML_HIGHLIGHT
+            .with(std::cell::Cell::get)
+            .then(|| {
+                let family = font_subst::painted_family_for_text(
+                    style
+                        .font_family
+                        .as_deref()
+                        .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_FAMILY),
+                    style.east_asian_font_family.as_deref(),
+                    &run.text,
+                );
+                let weight = effective_font_weight(style).map(|weight| {
+                    typst::text::FontWeight::from_number(match weight {
+                        "thin" => 100,
+                        "extralight" => 200,
+                        "light" => 300,
+                        "medium" => 500,
+                        "semibold" => 600,
+                        "bold" => 700,
+                        "extrabold" => 800,
+                        "black" => 900,
+                        _ => 400,
+                    })
+                });
+                crate::render::pdf::font_highlight_edges_em(
+                    &family,
+                    weight,
+                    style.italic == Some(true),
+                )
+            })
+            .flatten();
+        if let Some((top, bottom)) = edges {
+            wrappers.push(format!(
+                "#highlight(fill: {}, top-edge: {}em, bottom-edge: -{}em)[",
+                rgb(highlight),
+                format_f64(top),
+                format_f64(bottom)
+            ));
+        } else {
+            wrappers.push(format!("#highlight(fill: {})[", rgb(highlight)));
+        }
+    }
+    if matches!(style.strikethrough, Some(true)) {
+        wrappers.push("#strike[".to_string());
+    }
+    if matches!(style.underline, Some(true)) {
+        // Word draws the rule as one filled rectangle straight through any
+        // descender that crosses it. Typst's `underline` skips ink by default,
+        // which broke a single run's rule into segments: on the audited offer
+        // letter it emitted three pieces totalling 84.49pt where Word draws
+        // one 89.28pt rectangle (issue #641).
+        wrappers.push("#underline(evade: false)[".to_string());
+    }
+    if matches!(style.vertical_align, Some(VerticalTextAlign::Superscript)) {
+        wrappers.push("#super[".to_string());
+    }
+    if matches!(style.vertical_align, Some(VerticalTextAlign::Subscript)) {
+        wrappers.push("#sub[".to_string());
+    }
+    if matches!(style.small_caps, Some(true)) {
+        wrappers.push("#smallcaps[".to_string());
+    }
+
+    wrappers
+}
+
+/// Writes the innermost content of a run: either `#text(params)[escaped]`
+/// when text properties are present, or the escaped text directly (with a
+/// `#[...]` safety wrapper when needed to prevent Typst syntax ambiguity).
+fn write_run_content(out: &mut String, source: &str, escaped: &str, style: &TextStyle) {
+    if has_text_properties(style)
+        || needs_kerning_wrapper(style, escaped, source)
+        || needs_ligature_wrapper(style, escaped)
+    {
+        out.push_str("#text(");
+        write_text_params_for_run(out, style, escaped, source);
+        out.push_str(")[");
+        out.push_str(escaped);
+        out.push(']');
+        return;
+    }
+
+    // Markup that follows an embedded expression keeps parsing it: after a
+    // content block (`]`) or a call (`)`), a leading `(` is an argument
+    // list, `[` a trailing content argument, and `.name` a field access, so
+    // "(07) Western" after `#linebreak()` failed the whole document with
+    // "expected function, found content". A `#[...]` block ends the
+    // expression and renders the text unchanged.
+    let needs_safety_wrap: bool = !escaped.is_empty()
+        && (out.ends_with(']') || out.ends_with(')'))
+        && !out.ends_with("\\]")
+        && matches!(escaped.as_bytes()[0], b'(' | b'.' | b'[');
+
+    if needs_safety_wrap {
+        out.push_str("#[");
+        out.push_str(escaped);
+        out.push(']');
+    } else {
+        out.push_str(escaped);
+    }
+}
+
+pub(super) fn has_text_properties(style: &TextStyle) -> bool {
+    matches!(style.bold, Some(true))
+        || matches!(style.italic, Some(true))
+        || style.font_size.is_some()
+        || style.color.is_some()
+        || style.font_family.is_some()
+        || style.letter_spacing.is_some()
+        || style.baseline_shift.is_some()
+}
+
+/// The Typst weight name a family name's style suffix states, so the run asks
+/// for the member the name denotes: `Calibri Light` for `weight: "light"`.
+///
+/// Shares its parse with the availability check, so the weight a run states
+/// is the one [`font_subst::is_primary_font_available`] vouched for. A name
+/// stating no weight, or `Regular`, states nothing the run does not already
+/// inherit.
+fn inferred_font_weight(font_family: &str) -> Option<&'static str> {
+    let weight: typst::text::FontWeight = font_subst::weight_stated_by_family_name(font_family)?;
+    Some(match weight {
+        typst::text::FontWeight::THIN => "thin",
+        typst::text::FontWeight::EXTRALIGHT => "extralight",
+        typst::text::FontWeight::LIGHT => "light",
+        typst::text::FontWeight::MEDIUM => "medium",
+        typst::text::FontWeight::SEMIBOLD => "semibold",
+        typst::text::FontWeight::BOLD => "bold",
+        typst::text::FontWeight::EXTRABOLD => "extrabold",
+        typst::text::FontWeight::BLACK => "black",
+        _ => return None,
+    })
+}
+
+fn font_weight_rank(weight: &str) -> u8 {
+    match weight {
+        "thin" => 1,
+        "extralight" => 2,
+        "light" => 3,
+        "medium" => 4,
+        "semibold" => 5,
+        "bold" => 6,
+        "extrabold" => 7,
+        "black" => 8,
+        _ => 0,
+    }
+}
+
+fn effective_font_weight(style: &TextStyle) -> Option<&'static str> {
+    // Only infer weight from font family name when the font (or its alias)
+    // is actually available.  When using fallback fonts, uncommonly heavy
+    // weights (e.g. "extrabold" = 800) may not exist in the substitute,
+    // causing Typst to fall back to its built-in serif font instead.
+    let inferred = style.font_family.as_deref().and_then(|family| {
+        if font_subst::is_primary_font_available(family) {
+            inferred_font_weight(family)
+        } else {
+            None
+        }
+    });
+    let explicit = matches!(style.bold, Some(true)).then_some("bold");
+    match (explicit, inferred) {
+        (Some(explicit), Some(inferred)) => {
+            if font_weight_rank(explicit) >= font_weight_rank(inferred) {
+                Some(explicit)
+            } else {
+                Some(inferred)
+            }
+        }
+        (Some(explicit), None) => Some(explicit),
+        (None, Some(inferred)) => Some(inferred),
+        (None, None) => None,
+    }
+}
+
+/// Emit text parameters for content the caller cannot name.
+///
+/// The text matters to two of the parameters — the font fallback list and the
+/// kerning decision — so a caller that cannot name it gets the answer that is
+/// safe for any script: the fallback list of the family alone, and kerning
+/// left on. See [`kerning_param`] for why "on" is the safe side.
+pub(super) fn write_text_params(out: &mut String, style: &TextStyle) {
+    write_text_params_inner(out, style, KerningText::Unknown);
+}
+
+/// As [`write_text_params`], but told what the run holds.
+///
+/// The font list has to answer for the script the text is written in, not only
+/// for the family it names: a run can declare a face that has no glyph for its
+/// own content (issues #537, #543).
+pub(super) fn write_text_params_for_text(out: &mut String, style: &TextStyle, text: &str) {
+    write_text_params_inner(out, style, KerningText::known(text));
+}
+
+/// As [`write_text_params_for_text`], but for a run whose markup form differs
+/// from the text the engine will shape.
+///
+/// The escaping a run goes through adds backslashes and can lift a leading
+/// space into a code-mode string, so the markup is the wrong thing to measure
+/// advances on even though it still answers for the script.
+fn write_text_params_for_run(out: &mut String, style: &TextStyle, escaped: &str, shaped: &str) {
+    write_text_params_inner(out, style, KerningText::Known { escaped, shaped });
+}
+
+/// What the emitter knows about the text a `#text(...)` will cover.
+#[derive(Clone, Copy)]
+enum KerningText<'a> {
+    /// The exact text, so its script decides. `escaped` is the markup form;
+    /// `shaped` is what the engine lays out, and the only one whose glyphs can
+    /// be measured.
+    Known { escaped: &'a str, shaped: &'a str },
+    /// The emission site cannot name the text — a list marker's numbering
+    /// result, a header field's page number — so the safe answer stands.
+    Unknown,
+}
+
+impl<'a> KerningText<'a> {
+    /// Text whose markup and shaped forms are the same.
+    fn known(text: &'a str) -> Self {
+        KerningText::Known {
+            escaped: text,
+            shaped: text,
+        }
+    }
+}
+
+fn write_text_params_inner(out: &mut String, style: &TextStyle, kerning_text: KerningText<'_>) {
+    let mut first = true;
+    let text: &str = match kerning_text {
+        KerningText::Known { escaped, .. } => escaped,
+        KerningText::Unknown => "",
+    };
+
+    if let Some(ref family) = style.font_family {
+        let font_value = match style.east_asian_font_family {
+            Some(ref east_asian) if !east_asian.eq_ignore_ascii_case(family) => {
+                font_subst::font_with_east_asian_fallbacks(family, east_asian, text)
+            }
+            _ => font_subst::font_with_fallbacks_for_text(family, text),
+        };
+        write_param(out, &mut first, &format!("font: {font_value}"));
+    }
+    if let Some(size) = style.font_size {
+        write_param(out, &mut first, &format!("size: {}pt", format_f64(size)));
+    }
+    if let Some(weight) = effective_font_weight(style) {
+        write_param(out, &mut first, &format!("weight: \"{weight}\""));
+    }
+    // A width member — `Arial Narrow` — is filed under its base family at
+    // that stretch, which the font list reaches; the stretch selects it.
+    if let Some(stretch) = style
+        .font_family
+        .as_deref()
+        .and_then(font_subst::stretch_stated_by_family_name)
+    {
+        write_param(
+            out,
+            &mut first,
+            &format!("stretch: {}%", format_f64(stretch.to_ratio().get() * 100.0)),
+        );
+    }
+    if matches!(style.italic, Some(true)) {
+        write_param(out, &mut first, "style: \"italic\"");
+    }
+    if let Some(ref color) = style.color {
+        write_param(out, &mut first, &format_run_fill(color, style.color_alpha));
+    }
+    let tracking: Option<f64> = effective_letter_spacing(style, kerning_text);
+    if let Some(spacing) = tracking {
+        write_param(
+            out,
+            &mut first,
+            &format!("tracking: {}pt", format_f64(spacing)),
+        );
+        // Tracking and ligation are mutually exclusive: a ligature replaces
+        // several glyphs with one and swallows the inter-glyph spacing the
+        // tracking should have added. PowerPoint disables ligatures under
+        // `a:rPr/@spc` for that reason, which is also the ordinary
+        // typographic rule. Leaving `liga` on merged the `ffi` of "office2pdf"
+        // into one glyph, so the tracking between those three letters was
+        // never applied and the text layer extracted as "o ffi c e 2 p d f" —
+        // 17 characters instead of 10, matching no search for the word. On the
+        // audited deck that affected 24 of 52 occurrences (issue #684).
+        //
+        // Zero is not tracking. PowerPoint writes `spc="0"` routinely, so
+        // keying this on `is_some()` would strip ligatures from whole decks
+        // that never asked for it.
+        if spacing != 0.0 {
+            write_param(out, &mut first, "ligatures: false");
+        }
+    }
+    if !tracking.is_some_and(|spacing| spacing != 0.0)
+        && let Some(ligatures) = style.ligatures
+    {
+        write_ligature_params(out, &mut first, ligatures);
+    }
+    if let Some(BaselineShiftEm(shift_em)) = style.baseline_shift {
+        // Typst's text baseline parameter is positive downward, opposite to
+        // DrawingML. Resolve against the effective run size when available.
+        let shift: String = match style.font_size {
+            Some(font_size_pt) => format!("{}pt", format_f64(-shift_em * font_size_pt)),
+            None => format!("{}em", format_f64(-shift_em)),
+        };
+        write_param(out, &mut first, &format!("baseline: {shift}"));
+    }
+    if let Some(param) = kerning_param(style, kerning_text) {
+        write_param(out, &mut first, &param);
+    }
+}
+
+/// The ligature classes a run states, as Typst parameters (issue #2205).
+///
+/// `ligatures:` is always written, because a stated answer must hold whatever
+/// an enclosing `#set text` says — a Word text box inside a slide-like fixed
+/// group sits under the PowerPoint rule. Typst switches `liga` and `clig`
+/// together, so the standard class decides it: Word offers contextual
+/// ligatures only together with standard ones, and a lone `clig` request is
+/// dropped rather than letting it fuse every `fi` the way the standard class
+/// would. Historical and discretionary ligatures are off unless requested.
+///
+/// A document that shapes right-to-left keeps the standard class on. Word
+/// joins the lam-alef of Arabic text in a document that states no ligatures,
+/// and a face that encodes it under `liga` loses it with the feature off: the
+/// Word export of docxide's scraped Arabic article draws 42, and the DejaVu
+/// Sans that sets its Arabic here kept 10 of them with the feature off. The
+/// exemption is the kerning rule's (see [`with_rtl_shaping_exemption`]), so
+/// it covers every run of the document for the same bidi reason.
+fn write_ligature_params(out: &mut String, first: &mut bool, ligatures: crate::ir::Ligatures) {
+    write_param(
+        out,
+        first,
+        &format!("ligatures: {}", standard_ligatures_apply(ligatures)),
+    );
+    if ligatures.historical {
+        write_param(out, first, "historical-ligatures: true");
+    }
+    if ligatures.discretional {
+        write_param(out, first, "discretionary-ligatures: true");
+    }
+}
+
+/// The `kerning:` parameter this text needs, or `None` when the format states
+/// no rule and the engine's own default stands.
+///
+/// The threshold is resolved here rather than in the parser because it is
+/// compared against the run's *effective* size, which only exists once the
+/// style chain has been merged.
+///
+/// Every emission carries the decision explicitly rather than leaning on an
+/// enclosing rule: the whole point of the RTL exemption below is that some
+/// text must not take the surrounding answer, and a parameter that is merely
+/// omitted takes whatever the nearest `#set text` says.
+fn kerning_param(style: &TextStyle, kerning_text: KerningText<'_>) -> Option<String> {
+    // A tracked run whose format answers the kerning question for itself takes
+    // that answer, not the fallback below: PowerPoint reads `kern` and `spc`
+    // off the same `a:rPr` and applies both, so a 38pt title under the deck's
+    // `kern="1200"` is kerned *and* tracked (issue #1073).
+    if !tracked_run_states_its_own_kerning(style) {
+        // Otherwise a tracked run states only its own inter-glyph spacing. A
+        // pair kern lands on top of that, and where the face is a substitute
+        // its pairs are not the ones the document was set in — the combined
+        // advance can exceed the gap a PDF text extractor reads as a word
+        // break. On the deck in issue #864 that split five titles: `ANSATTE`
+        // extracted as `ANSAT TE` while the glyphs rendered continuously,
+        // because the T/T pair came to 0.115em against the reference's
+        // 0.078em.
+        //
+        // The RTL exemption still wins: switching the `kern` feature off there
+        // costs glyphs, which is worse than a word break.
+        //
+        // A spreadsheet run's grid correction is measured from the face's bare
+        // `hmtx` sum, which is also what Excel accumulates: leaving pair
+        // kerning on would move every glyph after a kerned pair off the grid
+        // the correction just put it on (issue #1088).
+        if effective_letter_spacing(style, kerning_text).is_some_and(|spacing| spacing != 0.0)
+            && !rtl_shaping_exemption_is_active()
+            && matches!(kerning_text, KerningText::Known { .. })
+        {
+            return Some("kerning: false".to_string());
+        }
+    }
+    let pair_kerning: PairKerning = style.pair_kerning?;
+    let kerns: bool = pair_kerning.applies_at(style.font_size)
+        || rtl_shaping_exemption_is_active()
+        || match kerning_text {
+            KerningText::Known { .. } => false,
+            // Unknown text may be RTL, and switching kerning off there costs
+            // glyphs; switching it on costs a fraction of a point of advance.
+            KerningText::Unknown => true,
+        };
+    Some(format!("kerning: {kerns}"))
+}
+
+/// Whether a tracked run's own format already decides pair kerning, so the
+/// blanket rule of issue #864 must stand aside for it.
+///
+/// Two things have to hold together. The format must state a threshold at all
+/// — `w:kern`, or DrawingML's `kern`, which every PowerPoint master writes on
+/// its `titleStyle` — because absence leaves us guessing and the guess that
+/// protects the text layer is "do not kern". And the run's own face must be
+/// present, because #864's failure is specifically a *substitute's* kern pairs
+/// riding on top of tracking the document sized for a different face: the
+/// stated threshold says what PowerPoint would do with the real font, and says
+/// nothing about the one we actually reach for.
+fn tracked_run_states_its_own_kerning(style: &TextStyle) -> bool {
+    style.pair_kerning.is_some()
+        && style
+            .font_family
+            .as_deref()
+            .is_some_and(font_subst::is_primary_font_available)
+}
+
+thread_local! {
+    static DRAWINGML_HIGHLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the document being generated is one the `kern` feature may not
+    /// be switched off in. See [`with_rtl_shaping_exemption`].
+    static RTL_SHAPING_EXEMPTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether run emission is currently inside a fixed PowerPoint page and
+    /// should use the 1/8pt nominal-advance grid (issue #661).
+    static POWERPOINT_ADVANCE_GRID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The numeral format of the section whose header and footer stories run
+    /// emission is writing, for the page field markers in their tables. See
+    /// [`with_page_number_format`].
+    static PAGE_NUMBER_FORMAT: std::cell::Cell<PageNumberFormat> =
+        const { std::cell::Cell::new(PageNumberFormat::Decimal) };
+    /// The printed-to-declared scale while run emission is inside a
+    /// spreadsheet coordinate system. `None` off a sheet; `Some(1.0)` on an
+    /// unscaled sheet or inside a drawing that is scaled as a whole.
+    static SHEET_ADVANCE_GRID_SCALE: std::cell::Cell<Option<f64>> =
+        const { std::cell::Cell::new(None) };
+    /// Whether the document being generated is laid out by Word's pre-2013
+    /// engine, whose East Asian justification never compresses a line to fit
+    /// one more token. See [`with_legacy_word_justification`].
+    static LEGACY_WORD_JUSTIFICATION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Run `operation` with Word's pre-2013 justification in the requested state,
+/// restoring the enclosing state even when generation panics.
+///
+/// This is a *document*-wide switch because `compatibilityMode` is declared
+/// once for the package, in `word/settings.xml`. Which paragraphs it then
+/// governs is a per-paragraph question, answered where the setting is emitted;
+/// see [`write_par_settings`].
+pub(super) fn with_legacy_word_justification<T>(active: bool, operation: impl FnOnce() -> T) -> T {
+    LEGACY_WORD_JUSTIFICATION.with(|legacy| {
+        let previous: bool = legacy.replace(active);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
+        legacy.set(previous);
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
+fn legacy_word_justification_is_active() -> bool {
+    LEGACY_WORD_JUSTIFICATION.with(std::cell::Cell::get)
+}
+
+/// Run `operation` with Excel's whole-point advance grid at `print_scale`,
+/// restoring the enclosing state even when generation panics.
+pub(super) fn with_sheet_advance_grid<T>(
+    print_scale: Option<f64>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    SHEET_ADVANCE_GRID_SCALE.with(|grid| {
+        let previous: Option<f64> = grid.replace(print_scale.filter(|scale| *scale > 0.0));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
+        grid.set(previous);
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
+/// Whether codegen is currently inside a sheet's grid — [`with_sheet_advance_grid`]'s
+/// active scope. Excel's own text engine facts (like issue #1627's Hangul
+/// substitution weight) must not leak onto DOCX/PPTX tables, which share the
+/// same cell-emission code but never enter this scope.
+pub(super) fn sheet_advance_grid_scale() -> Option<f64> {
+    SHEET_ADVANCE_GRID_SCALE.with(std::cell::Cell::get)
+}
+
+/// The uniform inter-glyph spacing that puts `text` on
+/// [`SHEET_ADVANCE_GRID_PT`] in sheet space, or `None` when this run is not one
+/// the grid applies to. A fitted cell rounds at its declared size and scales
+/// that grid onto the page (issue #1238).
+///
+/// Typst lays a run out on the face's exact advances, and its source language
+/// offers no per-glyph override; `tracking` is the one lever there, and it is
+/// uniform. What it buys is the *reservation*: spreading the run's rounding
+/// delta over its gaps makes the run measure the width Excel gives it, so
+/// wrapping, the spill clip and every seat placed from that width are the
+/// quantized ones, and the 5% deficit stops accumulating.
+///
+/// Where each glyph then lands inside that width is settled on the completed
+/// frame, which does carry one advance per glyph — see `excel_glyph_pacing`.
+/// The spread alone got the average right but not the individual origin:
+/// measured against the ten golden-mock exports, the worst landed 1.35pt from
+/// the native one and the median 0.13pt, where the unquantized line reached
+/// 19.5pt (issue #1659).
+///
+/// The delta is summed over the advances that *carry a gap* — every glyph but
+/// the last — so the run's last origin lands exactly where Excel puts it. The
+/// last glyph's own advance is deliberately left out: folding it in would make
+/// the run's total width exact at the cost of pushing that whole rounding into
+/// the visible gaps, which on a two-glyph cell is the entire correction in the
+/// one gap there is (`OK` at Arial 10 came out 8.33pt against the export's
+/// 8.00pt). [`sheet_trailing_advance_space_pt`] carries that final rounding
+/// separately for a right-aligned cell, so it changes the width the line is
+/// placed from without moving any visible glyph origin (issue #1233).
+///
+/// A one-glyph run gets `None`: Typst drops the tracking after a shaped item's
+/// last glyph, so there is no gap to carry the correction.
+fn sheet_advance_grid_tracking_pt(style: &TextStyle, text: &str) -> Option<f64> {
+    let scale: f64 = sheet_advance_grid_scale()?;
+    let size_pt: f64 = style.font_size.filter(|size| *size > 0.0)?;
+    let sheet_size_pt: f64 = size_pt / scale;
+    let advances_em: Vec<f64> = sheet_advance_grid_glyph_advances_em(style, text)?;
+    let gap_advances_em: &[f64] = advances_em.split_last()?.1;
+    if gap_advances_em.is_empty() {
+        return None;
+    }
+
+    let natural_pt: f64 = gap_advances_em
+        .iter()
+        .map(|advance| advance * size_pt)
+        .sum();
+    let quantized_pt: f64 = gap_advances_em
+        .iter()
+        .map(|advance| {
+            round_half_up_to_grid(advance * sheet_size_pt, SHEET_ADVANCE_GRID_PT) * scale
+        })
+        .sum();
+    let gaps: f64 = gap_advances_em.len() as f64;
+    let tracking_pt: f64 = (quantized_pt - natural_pt) / gaps;
+    // An exact fit needs no correction, and emitting `tracking: 0pt` would
+    // still cost the run its ligatures and kerning below.
+    (tracking_pt != 0.0).then_some(tracking_pt)
+}
+
+/// The final rounded glyph advance Excel includes when placing a right-aligned
+/// sheet line from the cell's trailing edge.
+///
+/// The inter-glyph tracking above stops at the last glyph so every visible
+/// origin stays on Excel's whole-point sheet grid. Typst therefore measures
+/// the line's final advance at its natural width, while Excel includes that
+/// advance rounded to [`SHEET_ADVANCE_GRID_PT`] before applying any print
+/// scale. A trailing `#h` carries only the printed difference: positive values
+/// move a right-aligned line left, and the rarer negative values move it right,
+/// without disturbing glyph pitch.
+///
+/// Native Excel-for-Mac traces across the ten business workbooks predict the
+/// measured right-aligned origin residual run by run from this value (issue
+/// #1233). Centred lines take no reserve: their whole-point origin is seated
+/// by [`centered_sheet_line_start_shift_pt`] instead (issue #1600).
+///
+/// A cell whose number-format section reserves glyphs it never paints (a
+/// `_)` positive section holding room for its paired negative section's
+/// closing parenthesis) adds their full rounded advance on top: Typst draws
+/// none of that width naturally, unlike the visible run's own final glyph
+/// above, which only needs its rounding delta (issue #1631).
+pub(super) fn sheet_trailing_advance_space_pt(style: &ParagraphStyle, runs: &[Run]) -> Option<f64> {
+    let scale: f64 = sheet_advance_grid_scale()?;
+    if !matches!(style.alignment, Some(Alignment::Right)) {
+        return None;
+    }
+
+    // This call site can append only one reserve after the whole paragraph.
+    // An explicit line or tab boundary would need a reserve at each segment's
+    // own trailing edge, so decline the paragraph instead of correcting only
+    // its final segment and leaving the earlier ones inconsistent.
+    if runs.iter().any(|run| {
+        run.text
+            .chars()
+            .any(|ch| matches!(ch, '\n' | '\t' | PPTX_SOFT_LINE_BREAK_CHAR))
+    }) {
+        return None;
+    }
+
+    let run: &Run = runs.iter().rev().find(|run| !run.text.is_empty())?;
+    if matches!(run.style.small_caps, Some(true)) {
+        return None;
+    }
+    let all_caps: String;
+    let shaped: &str = if matches!(run.style.all_caps, Some(true)) {
+        all_caps = run.text.to_uppercase();
+        &all_caps
+    } else {
+        &run.text
+    };
+    let size_pt: f64 = run.style.font_size.filter(|size| *size > 0.0)?;
+    let sheet_size_pt: f64 = size_pt / scale;
+    let advances_em: Vec<f64> = sheet_advance_grid_glyph_advances_em(&run.style, shaped)?;
+    let natural_pt: f64 = advances_em.last()? * size_pt;
+    let rounded_pt: f64 =
+        round_half_up_to_grid(advances_em.last()? * sheet_size_pt, SHEET_ADVANCE_GRID_PT) * scale;
+    let mut space_pt: f64 = rounded_pt - natural_pt;
+
+    if let Some(reserved_glyphs) = style.sheet_number_format_reserved_glyphs.as_deref()
+        && let Some(reserved_advances_em) =
+            sheet_advance_grid_glyph_advances_em(&run.style, reserved_glyphs)
+    {
+        space_pt += reserved_advances_em
+            .iter()
+            .map(|advance| {
+                round_half_up_to_grid(advance * sheet_size_pt, SHEET_ADVANCE_GRID_PT) * scale
+            })
+            .sum::<f64>();
+    }
+
+    (space_pt != 0.0).then_some(space_pt)
+}
+
+/// The full sheet-grid advance for glyphs reserved but not painted by a
+/// number-format control at a cell edge.
+pub(super) fn sheet_number_format_reserved_width_pt(
+    style: &TextStyle,
+    reserved_glyphs: &str,
+) -> Option<f64> {
+    let scale: f64 = sheet_advance_grid_scale()?;
+    let size_pt: f64 = style.font_size.filter(|size| *size > 0.0)?;
+    let sheet_size_pt: f64 = size_pt / scale;
+    let advances_em: Vec<f64> = sheet_advance_grid_glyph_advances_em(style, reserved_glyphs)?;
+    Some(
+        advances_em
+            .iter()
+            .map(|advance| {
+                round_half_up_to_grid(advance * sheet_size_pt, SHEET_ADVANCE_GRID_PT) * scale
+            })
+            .sum(),
+    )
+}
+
+/// The gridline-to-gridline box of a spreadsheet cell, in printed points,
+/// with the inset pair its text is laid out inside and the cell's `wrapText`
+/// flag.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct SheetCellBox {
+    pub(super) width_pt: f64,
+    pub(super) inset_left_pt: f64,
+    pub(super) inset_right_pt: f64,
+    pub(super) wraps_text: bool,
+}
+
+/// How far a centred sheet line has to move from Typst's exact centring to
+/// the whole-point origin Excel prints it at, in printed points, or `None`
+/// when this paragraph is not one the seat applies to.
+///
+/// Excel lays sheet text out on whole-point glyph advances (the grid above)
+/// and starts a centred line on a whole sheet point from the cell's left
+/// gridline: `floor((column - W + 2) / 2)` in an unwrapped cell and
+/// `floor((column - W + 1) / 2)` in a wrapped one, where `W` is the sum of the
+/// line's rounded advances. Probe-measured on 15 strings of even and odd `W`
+/// at 11, 14, 20 and 24pt in 65, 66, 80, 81, 99 and 100pt columns, every row
+/// exact; the same rule reproduces all 191 centred string cells of the ten
+/// business golden mocks (all wrapped) and the reported workbook's unwrapped
+/// headers, whose centres it had left up to 1.41pt short (issue #1600). The
+/// inset pair does not enter: a 20pt cell font, whose box steps to 4/3pt,
+/// seats exactly where the 11pt one does.
+///
+/// Typst centres the tracked line — the rounded gap advances plus the last
+/// glyph's natural one, see [`sheet_advance_grid_tracking_pt`] — inside the
+/// inset measure, so the seat is the difference between the two origins,
+/// evaluated at the declared size and scaled like the grid (issue #1238). A
+/// line the measure cannot hold wraps in Typst and keeps its symmetric
+/// centring, as does a hard-broken block, a small-caps run, or a face the
+/// measurement cannot read. So does a cell whose inset pair is not the
+/// symmetric split the XLSX parser gives a centred cell: an icon-set cell
+/// reserves the icon's advance on its left (issue #652), and where Excel
+/// seats a centred value beside an icon is unmeasured.
+pub(super) fn centered_sheet_line_start_shift_pt(
+    style: &ParagraphStyle,
+    runs: &[Run],
+    cell_box: &SheetCellBox,
+) -> Option<f64> {
+    let scale: f64 = sheet_advance_grid_scale()?;
+    if !matches!(style.alignment, Some(Alignment::Center))
+        || matches!(style.direction, Some(TextDirection::Rtl))
+        || (cell_box.inset_left_pt - cell_box.inset_right_pt).abs() > 1e-6
+    {
+        return None;
+    }
+    let shaped_runs: Vec<&Run> = runs.iter().filter(|run| !run.text.is_empty()).collect();
+    if shaped_runs.is_empty()
+        || shaped_runs.iter().any(|run| {
+            run.text
+                .chars()
+                .any(|ch| matches!(ch, '\n' | '\t' | PPTX_SOFT_LINE_BREAK_CHAR))
+        })
+    {
+        return None;
+    }
+
+    let mut whole_point_width_sheet_pt: f64 = 0.0;
+    let mut laid_out_width_sheet_pt: f64 = 0.0;
+    for run in shaped_runs {
+        if matches!(run.style.small_caps, Some(true)) {
+            return None;
+        }
+        let all_caps: String;
+        let shaped: &str = if matches!(run.style.all_caps, Some(true)) {
+            all_caps = run.text.to_uppercase();
+            &all_caps
+        } else {
+            &run.text
+        };
+        let size_pt: f64 = run.style.font_size.filter(|size| *size > 0.0)?;
+        let sheet_size_pt: f64 = size_pt / scale;
+        let advances_em: Vec<f64> = sheet_advance_grid_glyph_advances_em(&run.style, shaped)?;
+        let (last_advance_em, gap_advances_em) = advances_em.split_last()?;
+        let rounded_sheet_pt = |advance_em: &f64| -> f64 {
+            round_half_up_to_grid(advance_em * sheet_size_pt, SHEET_ADVANCE_GRID_PT)
+        };
+        let gaps_sheet_pt: f64 = gap_advances_em.iter().map(rounded_sheet_pt).sum();
+        whole_point_width_sheet_pt += gaps_sheet_pt + rounded_sheet_pt(last_advance_em);
+        laid_out_width_sheet_pt += gaps_sheet_pt + last_advance_em * sheet_size_pt;
+    }
+
+    let column_sheet_pt: f64 = cell_box.width_pt / scale;
+    let inset_left_sheet_pt: f64 = cell_box.inset_left_pt / scale;
+    let measure_sheet_pt: f64 =
+        column_sheet_pt - inset_left_sheet_pt - cell_box.inset_right_pt / scale;
+    if measure_sheet_pt <= 0.0 || laid_out_width_sheet_pt > measure_sheet_pt {
+        return None;
+    }
+    let seat_term: f64 = if cell_box.wraps_text { 1.0 } else { 2.0 };
+    let excel_start_sheet_pt: f64 =
+        ((column_sheet_pt - whole_point_width_sheet_pt + seat_term) / 2.0).floor();
+    let typst_start_sheet_pt: f64 =
+        inset_left_sheet_pt + (measure_sheet_pt - laid_out_width_sheet_pt) / 2.0;
+    let shift_pt: f64 = (excel_start_sheet_pt - typst_start_sheet_pt) * scale;
+    (shift_pt.abs() > 1e-9).then_some(shift_pt)
+}
+
+fn sheet_advance_grid_glyph_advances_em(style: &TextStyle, text: &str) -> Option<Vec<f64>> {
+    let bold: bool = matches!(style.bold, Some(true));
+    let family: &str = style.font_family.as_deref()?;
+    // A Korean cell names its face in `font_family` like any other, but a run
+    // that carries a separate East Asian family is measured on the face its
+    // glyphs will actually come from — the Latin one has no glyph for them and
+    // reports nothing.
+    crate::render::pdf::glyph_advances_em(family, bold, text).or_else(|| {
+        let east_asian: &str = style.east_asian_font_family.as_deref()?;
+        (!east_asian.eq_ignore_ascii_case(family))
+            .then(|| crate::render::pdf::glyph_advances_em(east_asian, bold, text))
+            .flatten()
+    })
+}
+
+/// `value` rounded to the nearest multiple of `grid`, halves away from zero —
+/// the rule Excel's own column metrics take (issue #621).
+fn round_half_up_to_grid(value_pt: f64, grid_pt: f64) -> f64 {
+    (value_pt / grid_pt).round() * grid_pt
+}
+
+/// The inter-glyph spacing this run is set with: what the source states, or
+/// the spreadsheet grid's correction where the source states nothing.
+///
+/// Both answers reach the emitted `tracking:` and the kerning decision through
+/// this one function, so a grid-corrected run takes the same "tracking states
+/// its own spacing" rule a `spc`-tracked slide run does.
+fn effective_letter_spacing(style: &TextStyle, kerning_text: KerningText<'_>) -> Option<f64> {
+    if let Some(spacing) = style.letter_spacing {
+        return Some(spacing);
+    }
+    match kerning_text {
+        KerningText::Known { shaped, .. } => sheet_advance_grid_tracking_pt(style, shaped),
+        KerningText::Unknown => None,
+    }
+}
+
+/// Keep natural highlight coverage local to DrawingML text boxes, including
+/// cached diagrams in flowing DOCX documents. Restore it on errors or panics.
+pub(super) fn with_drawingml_highlight<T>(operation: impl FnOnce() -> T) -> T {
+    DRAWINGML_HIGHLIGHT.with(|active| {
+        let previous = active.replace(true);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
+        active.set(previous);
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
+/// Run `operation` with page field markers counting in `format`, restoring
+/// the enclosing format even when generation panics. The markers sit in runs,
+/// whose emission has no [`super::GenCtx`] to read the section's format from.
+pub(super) fn with_page_number_format<T>(
+    format: PageNumberFormat,
+    operation: impl FnOnce() -> T,
+) -> T {
+    PAGE_NUMBER_FORMAT.with(|current| {
+        let previous = current.replace(format);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
+        current.set(previous);
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
+/// Run `operation` with PowerPoint advance snapping in the requested state,
+/// restoring the enclosing state even when generation panics.
+pub(super) fn with_powerpoint_advance_grid<T>(active: bool, operation: impl FnOnce() -> T) -> T {
+    POWERPOINT_ADVANCE_GRID.with(|grid| {
+        let previous = grid.replace(active);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
+        grid.set(previous);
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
+fn powerpoint_advance_grid_is_active() -> bool {
+    POWERPOINT_ADVANCE_GRID.with(std::cell::Cell::get)
+}
+
+/// Run `operation` with the RTL kerning exemption in the given state, then
+/// restore whatever it was.
+///
+/// TODO(typst mis-orders RTL glyph ranges without `kern`, still in 0.15.1;
+/// report upstream): shaping a right-to-left segment of two or more characters with
+/// the feature disabled walks `infos` backwards from index 0 and hands the
+/// first glyph the whole segment's text range, leaving the next glyph an
+/// inverted one. A debug build trips `assert_glyph_ranges_in_order` in
+/// `typst-layout`'s `inline/shaping.rs`; a release build keeps the broken
+/// ranges, which are what krilla writes `ActualText` from — krilla 0.6.0 then
+/// panics with "byte range starts at 3 but ends at 0", which is how
+/// FDO76312.docx failed the bulk gate; typst 0.15.1's krilla 0.8.2 panics on
+/// the same ranges. Measured on Arabic and Hebrew at two
+/// characters and up; a single character, Latin, Hangul, Han, Thai and
+/// Devanagari all shape correctly, and every one of them is fine with the
+/// feature left on. Word's own kerning rule is therefore honoured everywhere
+/// except in documents that shape right-to-left, where it would cost correct
+/// text to gain at most a fraction of a point of advance. The defect is
+/// upstream's, not ours — per the reference-project rule it belongs in a typst
+/// issue with this reproduction, and the exemption here should be removed once
+/// a release carries the fix.
+///
+/// The exemption is a *document*-wide switch rather than a per-run one because
+/// bidi reordering is decided over a whole shaped paragraph: the run that
+/// loses its glyph order need carry no right-to-left codepoint at all. It is
+/// enough that a sibling run does (`مرحبا` between two Latin runs), or that
+/// the paragraph's base direction is right-to-left and the run holds two
+/// neutral characters — `w:bidi` plus a row of full stops, which is exactly
+/// FDO76312.docx. Narrower scopes have to model which emissions end up in one
+/// shaped paragraph; this one does not, so no emission site can bypass it.
+pub(super) fn with_rtl_shaping_exemption<T>(active: bool, operation: impl FnOnce() -> T) -> T {
+    RTL_SHAPING_EXEMPTION.with(|exemption| {
+        let previous: bool = exemption.replace(active);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
+        exemption.set(previous);
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
+fn rtl_shaping_exemption_is_active() -> bool {
+    RTL_SHAPING_EXEMPTION.with(std::cell::Cell::get)
+}
+
+/// Whether generated Typst markup will be shaped right-to-left anywhere.
+///
+/// This reads the emitted source rather than the IR it came from, because the
+/// source is what the engine shapes: no IR shape, and no future emission site,
+/// can carry a right-to-left segment past it. Both routes to one are visible
+/// there — a `dir: rtl` the emitter wrote for a paragraph whose base direction
+/// is right-to-left, and the strong right-to-left codepoints themselves, which
+/// `escape_typst` passes through unchanged.
+///
+/// Text that merely *reads* `dir: rtl` costs the document its kerning rule and
+/// nothing else, which is the side to be wrong on.
+pub(super) fn source_shapes_right_to_left(source: &str) -> bool {
+    // The strong right-to-left blocks, as `xlsx_cells::strong_direction` reads
+    // them: Hebrew, Arabic and its supplements, Syriac, Thaana, and the Arabic
+    // presentation forms.
+    source
+        .chars()
+        .any(|ch| matches!(ch as u32, 0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF))
+        || source.contains("dir: rtl")
+}
+
+/// Whether a run needs a `#text(...)` of its own purely to state kerning.
+///
+/// A run that states no other text property is emitted bare, and bare text
+/// takes the engine's default — which kerns. That is the wrong answer for the
+/// body text of a document Word does not kern, so the decision is stated on
+/// the run rather than document-wide: a document-wide `kerning: false` would
+/// also reach the emission sites that cannot name their text.
+fn needs_kerning_wrapper(style: &TextStyle, escaped: &str, shaped: &str) -> bool {
+    !escaped.is_empty()
+        && kerning_param(style, KerningText::Known { escaped, shaped })
+            .is_some_and(|param| param.ends_with("false"))
+}
+
+/// Whether a run needs a `#text(...)` of its own purely to state ligatures.
+///
+/// The same reasoning as [`needs_kerning_wrapper`]: bare text takes the
+/// engine's default of standard ligatures on and the other classes off, which
+/// is wrong for a Word run that states anything else (issue #2205).
+fn needs_ligature_wrapper(style: &TextStyle, escaped: &str) -> bool {
+    !escaped.is_empty()
+        && style.ligatures.is_some_and(|ligatures| {
+            !standard_ligatures_apply(ligatures) || ligatures.historical || ligatures.discretional
+        })
+}
+
+/// Whether a run's text is shaped with the standard ligature class.
+fn standard_ligatures_apply(ligatures: crate::ir::Ligatures) -> bool {
+    ligatures.standard || rtl_shaping_exemption_is_active()
+}
+
+pub(super) fn write_param(out: &mut String, first: &mut bool, param: &str) {
+    if !*first {
+        out.push_str(", ");
+    }
+    out.push_str(param);
+    *first = false;
+}
+
+pub(super) fn format_color(color: &Color) -> String {
+    format!("fill: {}", rgb(color))
+}
+
+/// A run's fill, composited at the opacity its colour declares.
+///
+/// PowerPoint draws a run whose `a:solidFill` colour carries `<a:alpha>` at
+/// exactly that fraction of the backdrop, so the ink has to reach the page with
+/// its alpha channel intact rather than as the flattened base colour
+/// (issue #1121).
+fn format_run_fill(color: &Color, alpha: Option<f64>) -> String {
+    match alpha {
+        Some(alpha) => format!(
+            "fill: {}",
+            rgb_with_alpha(color, (alpha.clamp(0.0, 1.0) * 255.0).round() as u8)
+        ),
+        None => format_color(color),
+    }
+}
+
+/// The char index Typst reads a *line-leading* markup marker at.
+///
+/// Typst recognises those markers through one leading space, so the scan
+/// steps over one. Which text lands at the start of an escaping unit is the
+/// generator's choice, not the document's: a run is cut at every tab, at
+/// every in-text marker, and since #626 at every eojeol boundary, so a
+/// paragraph's ` + ` or ` = ` reaches [`escape_typst`] as a unit of its own.
+///
+/// Exactly one space, because that is the only leading whitespace
+/// [`escape_typst`] emits as markup. A run of two or more — and any run after
+/// a hard break — leaves as a code-mode string, which cannot open a marker.
+/// Measured on typst: `[ 2026. 7. 17.]`, `[ + x]` and `[ = x]` become an
+/// enumeration, a list item and a heading; `[#"  ";+ x]`, `[#"  ";= x]` and a
+/// leading U+00A0 do not.
+fn line_leading_markup_index(text: &str) -> usize {
+    usize::from(text.starts_with(' ') && !text[1..].starts_with(' '))
+}
+
+/// Whether `text` opens with a Typst line-leading marker whose first
+/// character must be escaped to neutralise it.
+///
+/// The full set of Typst markup that is only meaningful at a line start:
+///
+/// | Marker | Handling |
+/// | --- | --- |
+/// | `- ` bullet list | here, and also escaped everywhere else (`--` ligates) |
+/// | `+ ` numbered list | here — `+` is otherwise a literal |
+/// | `= ` heading (any run of `=`) | here — `=` is otherwise a literal |
+/// | `/ ` term list | already escaped unconditionally below |
+/// | `<digits>. ` enumeration | [`enum_marker_dot`], which escapes the dot |
+///
+/// Every other Typst shorthand (`#`, `*`, `_`, `` ` ``, `$`, `<`, `>`, `@`,
+/// `~`, `\`, `[`, `]`, `{`, `}`, `"`, `'`) is markup wherever it appears and
+/// is escaped unconditionally, so a line start needs no extra rule for it.
+///
+/// A marker also needs trailing whitespace to be one: `[ =x]` and `[+]` stay
+/// literal. Escaping only the *first* character of a `==`-style run is
+/// enough — measured on typst, `[ \== ]` renders ` == ` — because what
+/// remains no longer starts the line.
+fn opens_line_leading_marker(text: &str) -> bool {
+    match text.chars().next() {
+        // A one-byte marker char, so the byte slice is safe.
+        Some('-' | '+') => text[1..].chars().next().is_some_and(char::is_whitespace),
+        Some('=') => text
+            .trim_start_matches('=')
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace),
+        _ => false,
+    }
+}
+
+pub(super) fn escape_typst(text: &str) -> String {
+    let normalized_text: String = text.nfc().collect();
+    let leading_space: usize = line_leading_markup_index(&normalized_text);
+    let after_space: &str = &normalized_text[leading_space..];
+
+    // A leading `-`/`+` bullet or `=` heading run would be re-typeset as that
+    // marker, deleting the character from the page: ` + ` between two Korean
+    // eojeol became an enumeration item and ` = ` an empty heading (#626).
+    let line_leading_marker: Option<usize> =
+        opens_line_leading_marker(after_space).then_some(leading_space);
+
+    // A leading "<digits>. " would be re-typeset as a Typst numbered-list
+    // marker (e.g. "2026. 07. 17." became "2026. 7. 17."); escape its dot.
+    // `"시행일자: 2026. 7. 17."` reached this function as `" 2026. 7. 17."`
+    // once #626 cut the run at the eojeol boundary, and Typst put the date on
+    // an enumeration line of its own.
+    let enum_marker_dot: Option<usize> = {
+        let digit_count = after_space
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        let rest = &after_space[digit_count..];
+        if digit_count > 0 && (rest.starts_with(". ") || rest == ".") {
+            Some(leading_space + digit_count)
+        } else {
+            None
+        }
+    };
+
+    let mut result = String::with_capacity(normalized_text.len());
+    let mut chars = normalized_text.chars().peekable();
+    let mut char_index: usize = 0;
+
+    let mut after_linebreak = false;
+    while let Some(ch) = chars.next() {
+        let should_escape_list_prefix: bool = line_leading_marker == Some(char_index);
+
+        match ch {
+            // A hard line break (`<w:br/>`, carried through the IR as '\n') must
+            // force a new line. A bare newline in Typst markup collapses to a
+            // space, which silently merged code lines like `echo` / `printf`
+            // (issue #176). The semicolon ends the code expression: the rest
+            // of this same string is bare markup, and a leading `(`, `[`, or
+            // `.name` in it would chain onto the break's content as a call or
+            // field access, failing the whole document with "expected
+            // function, found content".
+            '\n' => result.push_str("#linebreak();"),
+            '\r' => {}
+            // Word preserves literal space runs (xml:space="preserve") that
+            // documents use for manual alignment and code indentation; Typst
+            // markup collapses consecutive and line-leading spaces to one.
+            // Emit runs of two or more — and post-break indentation — as a
+            // code-mode string, which markup cannot collapse (issue #352).
+            // Single run-leading spaces stay literal: they sit between
+            // sibling runs in the same markup line and survive as-is.
+            ' ' if after_linebreak || chars.peek().is_some_and(|next| *next == ' ') => {
+                let mut run_len: usize = 1;
+                while chars.peek().is_some_and(|next| *next == ' ') {
+                    chars.next();
+                    run_len += 1;
+                    char_index += 1;
+                }
+                result.push_str("#\"");
+                result.push_str(&" ".repeat(run_len));
+                // The semicolon ends the code expression: without it, a
+                // following `(` or `[` in the text would chain onto the
+                // string as a function call (`#"  "(SIB)`).
+                result.push_str("\";");
+            }
+            // Quotes and hyphens are Typst markup shorthands: smartquote
+            // curls straight quotes, `--` ligates to an en dash, and a
+            // hyphen before digits becomes a Unicode minus. Word stores the
+            // literal characters the author typed, so all of them must
+            // render verbatim (issue #353).
+            '#' | '*' | '_' | '`' | '<' | '>' | '@' | '\\' | '~' | '/' | '$' | '[' | ']' | '{'
+            | '}' | '"' | '\'' | '-'
+                if !should_escape_list_prefix =>
+            {
+                result.push('\\');
+                result.push(ch);
+            }
+            _ if should_escape_list_prefix => {
+                result.push('\\');
+                result.push(ch);
+            }
+            '.' if enum_marker_dot == Some(char_index) => {
+                result.push('\\');
+                result.push('.');
+            }
+            _ => result.push(ch),
+        }
+
+        after_linebreak = ch == '\n';
+        char_index += 1;
+    }
+    result
+}
+
+/// The Typst label a heading's contents-entry marker carries.
+pub(super) const TOC_ENTRY_LABEL: &str = "o2p-toc";
+
+/// A heading's text with no markup, for the contents entry that points at it.
+fn paragraph_plain_text(runs: &[Run]) -> String {
+    runs.iter().map(|run| run.text.as_str()).collect()
+}
+
+/// Escape a Rust string for use inside a Typst double-quoted string literal.
+fn escape_typst_string(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// The family the heading's first run names, for the contents entry's own
+/// fallback chain — a Korean entry needs the Korean face even though the entry
+/// is laid out at body size (issue #610).
+fn first_run_family(runs: &[Run]) -> Option<&str> {
+    runs.iter().find_map(|run| run.style.font_family.as_deref())
+}

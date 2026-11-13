@@ -1,0 +1,1176 @@
+use super::*;
+
+fn build_xlsx_with_cond_fmt(setup: impl FnOnce(&mut umya_spreadsheet::Worksheet)) -> Vec<u8> {
+    let mut book = umya_spreadsheet::new_file();
+    {
+        let sheet = book.get_sheet_mut(&0).unwrap();
+        sheet.set_name("Sheet1");
+        setup(sheet);
+    }
+    let mut cursor = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut cursor).unwrap();
+    cursor.into_inner()
+}
+
+#[test]
+fn test_cond_fmt_greater_than_background() {
+    let data = build_xlsx_with_cond_fmt(|sheet| {
+        sheet.get_cell_mut("A1").set_value_number(10.0);
+        sheet.get_cell_mut("A2").set_value_number(60.0);
+        sheet.get_cell_mut("A3").set_value_number(50.0);
+
+        let mut rule = umya_spreadsheet::ConditionalFormattingRule::default();
+        rule.set_type(umya_spreadsheet::ConditionalFormatValues::CellIs);
+        rule.set_operator(umya_spreadsheet::ConditionalFormattingOperatorValues::GreaterThan);
+        rule.set_priority(1);
+        let mut style = umya_spreadsheet::Style::default();
+        style.set_background_color("FFFF0000");
+        rule.set_style(style);
+        let mut formula = umya_spreadsheet::Formula::default();
+        formula.set_string_value("50");
+        rule.set_formula(formula);
+
+        let mut seq = umya_spreadsheet::SequenceOfReferences::default();
+        seq.set_sqref("A1:A3");
+        let mut cf = umya_spreadsheet::ConditionalFormatting::default();
+        cf.set_sequence_of_references(seq);
+        cf.add_conditional_collection(rule);
+        sheet.set_conditional_formatting_collection(vec![cf]);
+    });
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    assert!(
+        tp.table.rows[0].cells[0].background.is_none(),
+        "A1 (10) should NOT match >50"
+    );
+    assert_eq!(
+        tp.table.rows[1].cells[0].background,
+        Some(Color::new(255, 0, 0)),
+        "A2 (60) should match >50 and get red bg"
+    );
+    assert!(
+        tp.table.rows[2].cells[0].background.is_none(),
+        "A3 (50) should NOT match >50"
+    );
+}
+
+#[test]
+fn test_cond_fmt_less_than_font_color() {
+    let data = build_xlsx_with_cond_fmt(|sheet| {
+        sheet.get_cell_mut("A1").set_value_number(15.0);
+        sheet.get_cell_mut("A2").set_value_number(25.0);
+
+        let mut rule = umya_spreadsheet::ConditionalFormattingRule::default();
+        rule.set_type(umya_spreadsheet::ConditionalFormatValues::CellIs);
+        rule.set_operator(umya_spreadsheet::ConditionalFormattingOperatorValues::LessThan);
+        rule.set_priority(1);
+        let mut style = umya_spreadsheet::Style::default();
+        style.get_font_mut().get_color_mut().set_argb("FF0000FF");
+        rule.set_style(style);
+        let mut formula = umya_spreadsheet::Formula::default();
+        formula.set_string_value("20");
+        rule.set_formula(formula);
+
+        let mut seq = umya_spreadsheet::SequenceOfReferences::default();
+        seq.set_sqref("A1:A2");
+        let mut cf = umya_spreadsheet::ConditionalFormatting::default();
+        cf.set_sequence_of_references(seq);
+        cf.add_conditional_collection(rule);
+        sheet.set_conditional_formatting_collection(vec![cf]);
+    });
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    let style_a1 = first_run_style(&tp.table.rows[0].cells[0]);
+    assert_eq!(
+        style_a1.color,
+        Some(Color::new(0, 0, 255)),
+        "A1 (15) should match <20 and get blue color"
+    );
+    let style_a2 = first_run_style(&tp.table.rows[1].cells[0]);
+    assert!(style_a2.color.is_none(), "A2 (25) should NOT match <20");
+}
+
+#[test]
+fn test_cond_fmt_equal_bold() {
+    let data = build_xlsx_with_cond_fmt(|sheet| {
+        sheet.get_cell_mut("A1").set_value_number(100.0);
+        sheet.get_cell_mut("A2").set_value_number(99.0);
+
+        let mut rule = umya_spreadsheet::ConditionalFormattingRule::default();
+        rule.set_type(umya_spreadsheet::ConditionalFormatValues::CellIs);
+        rule.set_operator(umya_spreadsheet::ConditionalFormattingOperatorValues::Equal);
+        rule.set_priority(1);
+        let mut style = umya_spreadsheet::Style::default();
+        style.get_font_mut().set_bold(true);
+        rule.set_style(style);
+        let mut formula = umya_spreadsheet::Formula::default();
+        formula.set_string_value("100");
+        rule.set_formula(formula);
+
+        let mut seq = umya_spreadsheet::SequenceOfReferences::default();
+        seq.set_sqref("A1:A2");
+        let mut cf = umya_spreadsheet::ConditionalFormatting::default();
+        cf.set_sequence_of_references(seq);
+        cf.add_conditional_collection(rule);
+        sheet.set_conditional_formatting_collection(vec![cf]);
+    });
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    let style_a1 = first_run_style(&tp.table.rows[0].cells[0]);
+    assert_eq!(style_a1.bold, Some(true), "A1 (100) should be bold");
+    let style_a2 = first_run_style(&tp.table.rows[1].cells[0]);
+    assert!(
+        style_a2.bold.is_none() || style_a2.bold == Some(false),
+        "A2 (99) should NOT be bold"
+    );
+}
+
+#[test]
+fn test_cond_fmt_between() {
+    let data = build_xlsx_with_cond_fmt(|sheet| {
+        sheet.get_cell_mut("A1").set_value_number(5.0);
+        sheet.get_cell_mut("A2").set_value_number(20.0);
+        sheet.get_cell_mut("A3").set_value_number(35.0);
+        sheet.get_cell_mut("A4").set_value_number(10.0);
+
+        let mut rule = umya_spreadsheet::ConditionalFormattingRule::default();
+        rule.set_type(umya_spreadsheet::ConditionalFormatValues::CellIs);
+        rule.set_operator(umya_spreadsheet::ConditionalFormattingOperatorValues::Between);
+        rule.set_priority(1);
+        let mut style = umya_spreadsheet::Style::default();
+        style.set_background_color("FF00FF00");
+        rule.set_style(style);
+        let mut formula = umya_spreadsheet::Formula::default();
+        formula.set_string_value("10");
+        rule.set_formula(formula);
+
+        let mut seq = umya_spreadsheet::SequenceOfReferences::default();
+        seq.set_sqref("A1:A4");
+        let mut cf = umya_spreadsheet::ConditionalFormatting::default();
+        cf.set_sequence_of_references(seq);
+        cf.add_conditional_collection(rule);
+        sheet.set_conditional_formatting_collection(vec![cf]);
+    });
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    assert!(tp.table.rows[0].cells[0].background.is_none());
+    assert_eq!(
+        tp.table.rows[1].cells[0].background,
+        Some(Color::new(0, 255, 0))
+    );
+    assert_eq!(
+        tp.table.rows[2].cells[0].background,
+        Some(Color::new(0, 255, 0))
+    );
+    assert_eq!(
+        tp.table.rows[3].cells[0].background,
+        Some(Color::new(0, 255, 0))
+    );
+}
+
+#[test]
+fn test_cond_fmt_color_scale_two_color() {
+    let data = build_xlsx_with_cond_fmt(|sheet| {
+        sheet.get_cell_mut("A1").set_value_number(0.0);
+        sheet.get_cell_mut("A2").set_value_number(50.0);
+        sheet.get_cell_mut("A3").set_value_number(100.0);
+
+        let mut rule = umya_spreadsheet::ConditionalFormattingRule::default();
+        rule.set_type(umya_spreadsheet::ConditionalFormatValues::ColorScale);
+        rule.set_priority(1);
+
+        let mut cs = umya_spreadsheet::ColorScale::default();
+
+        let mut cfvo_min = umya_spreadsheet::ConditionalFormatValueObject::default();
+        cfvo_min.set_type(umya_spreadsheet::ConditionalFormatValueObjectValues::Min);
+        cs.add_cfvo_collection(cfvo_min);
+
+        let mut cfvo_max = umya_spreadsheet::ConditionalFormatValueObject::default();
+        cfvo_max.set_type(umya_spreadsheet::ConditionalFormatValueObjectValues::Max);
+        cs.add_cfvo_collection(cfvo_max);
+
+        let mut color_min = umya_spreadsheet::Color::default();
+        color_min.set_argb("FFFFFFFF");
+        cs.add_color_collection(color_min);
+
+        let mut color_max = umya_spreadsheet::Color::default();
+        color_max.set_argb("FFFF0000");
+        cs.add_color_collection(color_max);
+
+        rule.set_color_scale(cs);
+
+        let mut seq = umya_spreadsheet::SequenceOfReferences::default();
+        seq.set_sqref("A1:A3");
+        let mut cf = umya_spreadsheet::ConditionalFormatting::default();
+        cf.set_sequence_of_references(seq);
+        cf.add_conditional_collection(rule);
+        sheet.set_conditional_formatting_collection(vec![cf]);
+    });
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    let bg_a1 = tp.table.rows[0].cells[0]
+        .background
+        .expect("A1 should have color scale bg");
+    assert_eq!(bg_a1, Color::new(255, 255, 255));
+
+    let bg_a3 = tp.table.rows[2].cells[0]
+        .background
+        .expect("A3 should have color scale bg");
+    assert_eq!(bg_a3, Color::new(255, 0, 0));
+
+    let bg_a2 = tp.table.rows[1].cells[0]
+        .background
+        .expect("A2 should have color scale bg");
+    assert_eq!(bg_a2.r, 255);
+    assert!(
+        bg_a2.g > 100 && bg_a2.g < 150,
+        "Expected ~128, got {}",
+        bg_a2.g
+    );
+    assert!(
+        bg_a2.b > 100 && bg_a2.b < 150,
+        "Expected ~128, got {}",
+        bg_a2.b
+    );
+}
+
+#[test]
+fn test_cond_fmt_no_rules_unchanged() {
+    let data = build_xlsx_bytes("Sheet1", &[("A1", "42")]);
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    assert!(tp.table.rows[0].cells[0].background.is_none());
+}
+
+#[test]
+fn test_cond_fmt_non_numeric_cell_skipped() {
+    let data = build_xlsx_with_cond_fmt(|sheet| {
+        sheet.get_cell_mut("A1").set_value("hello");
+        sheet.get_cell_mut("A2").set_value_number(60.0);
+
+        let mut rule = umya_spreadsheet::ConditionalFormattingRule::default();
+        rule.set_type(umya_spreadsheet::ConditionalFormatValues::CellIs);
+        rule.set_operator(umya_spreadsheet::ConditionalFormattingOperatorValues::GreaterThan);
+        rule.set_priority(1);
+        let mut style = umya_spreadsheet::Style::default();
+        style.set_background_color("FFFF0000");
+        rule.set_style(style);
+        let mut formula = umya_spreadsheet::Formula::default();
+        formula.set_string_value("50");
+        rule.set_formula(formula);
+
+        let mut seq = umya_spreadsheet::SequenceOfReferences::default();
+        seq.set_sqref("A1:A2");
+        let mut cf = umya_spreadsheet::ConditionalFormatting::default();
+        cf.set_sequence_of_references(seq);
+        cf.add_conditional_collection(rule);
+        sheet.set_conditional_formatting_collection(vec![cf]);
+    });
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    assert!(tp.table.rows[0].cells[0].background.is_none());
+    assert_eq!(
+        tp.table.rows[1].cells[0].background,
+        Some(Color::new(255, 0, 0))
+    );
+}
+
+#[test]
+fn test_cond_fmt_data_bar() {
+    let data = build_xlsx_with_cond_fmt(|sheet| {
+        sheet.get_cell_mut("A1").set_value_number(10.0);
+        sheet.get_cell_mut("A2").set_value_number(50.0);
+        sheet.get_cell_mut("A3").set_value_number(100.0);
+
+        let mut rule = umya_spreadsheet::ConditionalFormattingRule::default();
+        rule.set_type(umya_spreadsheet::ConditionalFormatValues::DataBar);
+        rule.set_priority(1);
+
+        let mut db = umya_spreadsheet::DataBar::default();
+        let mut cfvo_min = umya_spreadsheet::ConditionalFormatValueObject::default();
+        cfvo_min.set_type(umya_spreadsheet::ConditionalFormatValueObjectValues::Min);
+        let mut cfvo_max = umya_spreadsheet::ConditionalFormatValueObject::default();
+        cfvo_max.set_type(umya_spreadsheet::ConditionalFormatValueObjectValues::Max);
+        db.add_cfvo_collection(cfvo_min);
+        db.add_cfvo_collection(cfvo_max);
+        let mut bar_color = umya_spreadsheet::Color::default();
+        bar_color.set_argb("FF638EC6");
+        db.add_color_collection(bar_color);
+        rule.set_data_bar(db);
+
+        let mut seq = umya_spreadsheet::SequenceOfReferences::default();
+        seq.set_sqref("A1:A3");
+        let mut cf = umya_spreadsheet::ConditionalFormatting::default();
+        cf.set_sequence_of_references(seq);
+        cf.add_conditional_collection(rule);
+        sheet.set_conditional_formatting_collection(vec![cf]);
+    });
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    // Excel maps the cfvo range onto [minLength, maxLength] percent of the
+    // cell width — spec defaults 10 and 90 — so the minimum value still shows
+    // a short bar, exactly as Excel prints it.
+    let db1 = tp.table.rows[0].cells[0]
+        .data_bar
+        .as_ref()
+        .expect("A1 should have data_bar");
+    assert!(
+        (db1.fill_pct - 10.0).abs() < 0.01,
+        "Min value should fill minLength (10%), got {}",
+        db1.fill_pct
+    );
+
+    let db2 = tp.table.rows[1].cells[0]
+        .data_bar
+        .as_ref()
+        .expect("A2 should have data_bar");
+    let expected_mid: f64 = 10.0 + 80.0 * (50.0 - 10.0) / (100.0 - 10.0);
+    assert!(
+        (db2.fill_pct - expected_mid).abs() < 1.0,
+        "Mid value should fill ~{expected_mid}%, got {}",
+        db2.fill_pct
+    );
+
+    let db3 = tp.table.rows[2].cells[0]
+        .data_bar
+        .as_ref()
+        .expect("A3 should have data_bar");
+    assert!(
+        (db3.fill_pct - 90.0).abs() < 0.01,
+        "Max value should fill maxLength (90%), got {}",
+        db3.fill_pct
+    );
+
+    assert_eq!(db1.color, Color::new(0x63, 0x8E, 0xC6));
+}
+
+#[test]
+fn test_cond_fmt_data_bar_fixed_num_cfvos_and_lengths() {
+    // Mirrors the classified workbook: explicit num cfvos 0..140000 with
+    // minLength=10 maxLength=90 — values scale against the fixed axis, not
+    // the observed min/max of the range.
+    let data = build_xlsx_with_cond_fmt(|sheet| {
+        sheet.get_cell_mut("A1").set_value_number(103125.0);
+        sheet.get_cell_mut("A2").set_value_number(129600.0);
+        sheet.get_cell_mut("A3").set_value_number(17850.0);
+
+        let mut rule = umya_spreadsheet::ConditionalFormattingRule::default();
+        rule.set_type(umya_spreadsheet::ConditionalFormatValues::DataBar);
+        rule.set_priority(1);
+
+        let mut db = umya_spreadsheet::DataBar::default();
+        db.set_min_length(10);
+        db.set_max_length(90);
+        let mut cfvo_min = umya_spreadsheet::ConditionalFormatValueObject::default();
+        cfvo_min.set_type(umya_spreadsheet::ConditionalFormatValueObjectValues::Number);
+        cfvo_min.set_val("0");
+        let mut cfvo_max = umya_spreadsheet::ConditionalFormatValueObject::default();
+        cfvo_max.set_type(umya_spreadsheet::ConditionalFormatValueObjectValues::Number);
+        cfvo_max.set_val("140000");
+        db.add_cfvo_collection(cfvo_min);
+        db.add_cfvo_collection(cfvo_max);
+        let mut bar_color = umya_spreadsheet::Color::default();
+        bar_color.set_argb("FF638EC6");
+        db.add_color_collection(bar_color);
+        rule.set_data_bar(db);
+
+        let mut seq = umya_spreadsheet::SequenceOfReferences::default();
+        seq.set_sqref("A1:A3");
+        let mut cf = umya_spreadsheet::ConditionalFormatting::default();
+        cf.set_sequence_of_references(seq);
+        cf.add_conditional_collection(rule);
+        sheet.set_conditional_formatting_collection(vec![cf]);
+    });
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    let pct = |row: usize| {
+        tp.table.rows[row].cells[0]
+            .data_bar
+            .as_ref()
+            .expect("cell should have data_bar")
+            .fill_pct
+    };
+    assert!((pct(0) - (10.0 + 80.0 * 103125.0 / 140000.0)).abs() < 0.5);
+    assert!((pct(1) - (10.0 + 80.0 * 129600.0 / 140000.0)).abs() < 0.5);
+    assert!((pct(2) - (10.0 + 80.0 * 17850.0 / 140000.0)).abs() < 0.5);
+}
+
+#[test]
+fn test_cond_fmt_icon_set() {
+    let data = build_xlsx_with_cond_fmt(|sheet| {
+        sheet.get_cell_mut("A1").set_value_number(10.0);
+        sheet.get_cell_mut("A2").set_value_number(50.0);
+        sheet.get_cell_mut("A3").set_value_number(90.0);
+
+        let mut rule = umya_spreadsheet::ConditionalFormattingRule::default();
+        rule.set_type(umya_spreadsheet::ConditionalFormatValues::IconSet);
+        rule.set_priority(1);
+
+        let mut is = umya_spreadsheet::IconSet::default();
+        let mut cfvo0 = umya_spreadsheet::ConditionalFormatValueObject::default();
+        cfvo0.set_type(umya_spreadsheet::ConditionalFormatValueObjectValues::Percent);
+        cfvo0.set_val("0");
+        let mut cfvo1 = umya_spreadsheet::ConditionalFormatValueObject::default();
+        cfvo1.set_type(umya_spreadsheet::ConditionalFormatValueObjectValues::Percent);
+        cfvo1.set_val("33");
+        let mut cfvo2 = umya_spreadsheet::ConditionalFormatValueObject::default();
+        cfvo2.set_type(umya_spreadsheet::ConditionalFormatValueObjectValues::Percent);
+        cfvo2.set_val("67");
+        is.add_cfvo_collection(cfvo0);
+        is.add_cfvo_collection(cfvo1);
+        is.add_cfvo_collection(cfvo2);
+        rule.set_icon_set(is);
+
+        let mut seq = umya_spreadsheet::SequenceOfReferences::default();
+        seq.set_sqref("A1:A3");
+        let mut cf = umya_spreadsheet::ConditionalFormatting::default();
+        cf.set_sequence_of_references(seq);
+        cf.add_conditional_collection(rule);
+        sheet.set_conditional_formatting_collection(vec![cf]);
+    });
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    // No iconSet attribute → OOXML default is 3TrafficLights1 (colored circles),
+    // not arrows.
+    let cell1 = &tp.table.rows[0].cells[0];
+    assert_eq!(
+        cell1.icon_text.as_deref(),
+        Some("●"),
+        "Low value should get a circle icon"
+    );
+    assert_eq!(
+        cell1.icon_color,
+        Some(Color::new(214, 85, 50)),
+        "Low value circle should be red"
+    );
+
+    let cell2 = &tp.table.rows[1].cells[0];
+    assert_eq!(cell2.icon_text.as_deref(), Some("●"));
+    assert_eq!(
+        cell2.icon_color,
+        Some(Color::new(234, 191, 87)),
+        "Mid value circle should be yellow"
+    );
+
+    let cell3 = &tp.table.rows[2].cells[0];
+    assert_eq!(cell3.icon_text.as_deref(), Some("●"));
+    assert_eq!(
+        cell3.icon_color,
+        Some(Color::new(98, 193, 122)),
+        "High value circle should be green"
+    );
+
+    // The icon is drawn out of layout, so its advance has to be reserved as
+    // padding or the value aligns in the whole cell instead of the space to
+    // the icon's right (issue #652).
+    let icon_padding = cell1
+        .padding
+        .expect("an icon-set cell reserves the icon's advance");
+    assert!(
+        icon_padding.left > XLSX_CELL_PADDING.left,
+        "the icon cell's left inset must exceed the plain one, got {} against {}",
+        icon_padding.left,
+        XLSX_CELL_PADDING.left
+    );
+    assert_eq!(
+        icon_padding.right, XLSX_CELL_PADDING.right,
+        "only the left inset is reserved; the right is unchanged"
+    );
+}
+
+/// Helper: build a 3-band percent icon set rule over A1:A3 with the given type.
+fn build_icon_set_fixture(icon_set_type: Option<&str>) -> Vec<u8> {
+    build_xlsx_with_cond_fmt(|sheet| {
+        sheet.get_cell_mut("A1").set_value_number(10.0);
+        sheet.get_cell_mut("A2").set_value_number(50.0);
+        sheet.get_cell_mut("A3").set_value_number(90.0);
+
+        let mut rule = umya_spreadsheet::ConditionalFormattingRule::default();
+        rule.set_type(umya_spreadsheet::ConditionalFormatValues::IconSet);
+        rule.set_priority(1);
+
+        let mut is = umya_spreadsheet::IconSet::default();
+        if let Some(set_type) = icon_set_type {
+            is.set_icon_set_type(set_type);
+        }
+        for pct in ["0", "33", "67"] {
+            let mut cfvo = umya_spreadsheet::ConditionalFormatValueObject::default();
+            cfvo.set_type(umya_spreadsheet::ConditionalFormatValueObjectValues::Percent);
+            cfvo.set_val(pct);
+            is.add_cfvo_collection(cfvo);
+        }
+        rule.set_icon_set(is);
+
+        let mut seq = umya_spreadsheet::SequenceOfReferences::default();
+        seq.set_sqref("A1:A3");
+        let mut cf = umya_spreadsheet::ConditionalFormatting::default();
+        cf.set_sequence_of_references(seq);
+        cf.add_conditional_collection(rule);
+        sheet.set_conditional_formatting_collection(vec![cf]);
+    })
+}
+
+#[test]
+fn test_cond_fmt_icon_set_traffic_lights_explicit() {
+    let data = build_icon_set_fixture(Some("3TrafficLights1"));
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    let cell3 = &tp.table.rows[2].cells[0];
+    assert_eq!(cell3.icon_text.as_deref(), Some("●"));
+    assert_eq!(cell3.icon_color, Some(Color::new(98, 193, 122)));
+}
+
+#[test]
+fn test_cond_fmt_icon_set_arrows_explicit() {
+    let data = build_icon_set_fixture(Some("3Arrows"));
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    let cell1 = &tp.table.rows[0].cells[0];
+    assert_eq!(
+        cell1.icon_text.as_deref(),
+        Some("\u{25BC}"),
+        "3Arrows uses a solid down-triangle for the low band (issue #377)"
+    );
+    assert_eq!(cell1.icon_color, Some(Color::new(231, 121, 121)));
+
+    let cell3 = &tp.table.rows[2].cells[0];
+    assert_eq!(
+        cell3.icon_text.as_deref(),
+        Some("\u{25B2}"),
+        "3Arrows uses a solid up-triangle for the high band (issue #377)"
+    );
+    assert_eq!(cell3.icon_color, Some(Color::new(89, 176, 109)));
+}
+
+/// Excel prints a `3Arrows` icon as a shaded sprite, so each band carries the
+/// ramp and the outline colour measured off the native export rather than one
+/// flat colour the renderer has to derive an outline from (issue #1134).
+#[test]
+fn test_cond_fmt_icon_set_arrows_carry_excels_shading() {
+    let data = build_icon_set_fixture(Some("3Arrows"));
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    let bands: [(usize, Color, Color, Color); 3] = [
+        (
+            0,
+            Color::new(0xFC, 0xD1, 0xD2),
+            Color::new(0xF0, 0x39, 0x3C),
+            Color::new(0x90, 0x27, 0x1B),
+        ),
+        (
+            1,
+            Color::new(0xFE, 0xFC, 0xF3),
+            Color::new(0xFE, 0xC5, 0x00),
+            Color::new(0xD8, 0x71, 0x03),
+        ),
+        (
+            2,
+            Color::new(0x9F, 0xD8, 0xAE),
+            Color::new(0x28, 0xA5, 0x4A),
+            Color::new(0x25, 0x5E, 0x1B),
+        ),
+    ];
+    for (row, fill_start, fill_end, outline) in bands {
+        assert_eq!(
+            tp.table.rows[row].cells[0].icon_shading,
+            Some(crate::ir::IconShading {
+                fill_start,
+                fill_end,
+                outline,
+            }),
+            "band {row} must carry Excel's measured sprite paint"
+        );
+    }
+}
+
+/// Only the set with a native export to measure is shaded — the grey arrows
+/// have none, so they must not borrow another band's ramp.
+#[test]
+fn test_cond_fmt_unmeasured_icon_sets_carry_no_shading() {
+    for set_type in ["3ArrowsGray", "3TrafficLights1", "3Symbols"] {
+        let data = build_icon_set_fixture(Some(set_type));
+        let parser = XlsxParser;
+        let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+        let tp = get_sheet_page(&doc, 0);
+        for row in 0..3 {
+            assert_eq!(
+                tp.table.rows[row].cells[0].icon_shading, None,
+                "{set_type} band {row} has no export to measure"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_cond_fmt_icon_set_symbols_explicit() {
+    let data = build_icon_set_fixture(Some("3Symbols"));
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    let cell1 = &tp.table.rows[0].cells[0];
+    assert_eq!(cell1.icon_text.as_deref(), Some("✗"));
+    let cell3 = &tp.table.rows[2].cells[0];
+    assert_eq!(cell3.icon_text.as_deref(), Some("✓"));
+}
+
+#[test]
+fn test_cond_fmt_contains_text_background() {
+    let data = build_xlsx_with_cond_fmt(|sheet| {
+        sheet.get_cell_mut("B1").set_value("Whole Grain Bread");
+        sheet.get_cell_mut("B2").set_value("Rice");
+
+        let mut rule = umya_spreadsheet::ConditionalFormattingRule::default();
+        rule.set_type(umya_spreadsheet::ConditionalFormatValues::ContainsText);
+        rule.set_text("Grain");
+        rule.set_priority(1);
+        let mut style = umya_spreadsheet::Style::default();
+        style.set_background_color("FFFFE699");
+        rule.set_style(style);
+
+        let mut cf = umya_spreadsheet::ConditionalFormatting::default();
+        let mut sqref = umya_spreadsheet::SequenceOfReferences::default();
+        sqref.set_sqref("B1:B2");
+        cf.set_sequence_of_references(sqref);
+        cf.set_conditional_collection(vec![rule]);
+        sheet.add_conditional_formatting_collection(cf);
+    });
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+    assert!(
+        tp.table.rows[0].cells[1].background.is_some(),
+        "matching cell must gain the rule fill"
+    );
+    assert!(
+        tp.table.rows[1].cells[1].background.is_none(),
+        "non-matching cell must stay unfilled"
+    );
+}
+
+/// Rewrites self-closing `<cfvo .../>` and `<color .../>` children of
+/// `<dataBar>` into start/end pairs (`<color ...></color>`), the form
+/// produced by writers such as openpyxl.
+fn rewrite_data_bar_children_as_start_end_tags(xlsx_bytes: &[u8]) -> Vec<u8> {
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(xlsx_bytes.to_vec())).expect("read zip");
+    let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).expect("zip entry");
+        let name: String = file.name().expect("entry name should decode").into_owned();
+        let mut content: Vec<u8> = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut content).expect("read entry");
+        if name.starts_with("xl/worksheets/") {
+            let xml = String::from_utf8(content).expect("sheet xml utf8");
+            let rewritten = regex_like_expand_self_closing(&xml);
+            content = rewritten.into_bytes();
+        }
+        out.start_file(name, zip::write::SimpleFileOptions::default())
+            .expect("start entry");
+        std::io::Write::write_all(&mut out, &content).expect("write entry");
+    }
+    out.finish().expect("finish zip").into_inner()
+}
+
+/// Expands every self-closing `<cfvo .../>` and `<color .../>` into
+/// `<cfvo ...></cfvo>` / `<color ...></color>` without a regex dependency.
+fn regex_like_expand_self_closing(xml: &str) -> String {
+    let mut result = xml.to_string();
+    for tag in ["cfvo", "color"] {
+        let open = format!("<{tag} ");
+        let mut rewritten = String::with_capacity(result.len());
+        let mut rest: &str = &result;
+        while let Some(start) = rest.find(&open) {
+            let after_start = &rest[start..];
+            let end = after_start.find("/>").expect("self-closing tag");
+            rewritten.push_str(&rest[..start]);
+            rewritten.push_str(&after_start[..end]);
+            rewritten.push_str(&format!("></{tag}>"));
+            rest = &after_start[end + 2..];
+        }
+        rewritten.push_str(rest);
+        result = rewritten;
+    }
+    result
+}
+
+#[test]
+fn test_cond_fmt_data_bar_color_from_start_end_tag_children() {
+    // Real-world dashboards (openpyxl output) write the dataBar rule color
+    // as <color rgb="FF1E2761"></color>; the bar must render that navy, not
+    // the default steel blue (issue #371).
+    let data = build_xlsx_with_cond_fmt(|sheet| {
+        sheet.get_cell_mut("A1").set_value_number(0.0);
+        sheet.get_cell_mut("A2").set_value_number(700.0);
+        sheet.get_cell_mut("A3").set_value_number(1400.0);
+
+        let mut rule = umya_spreadsheet::ConditionalFormattingRule::default();
+        rule.set_type(umya_spreadsheet::ConditionalFormatValues::DataBar);
+        rule.set_priority(1);
+
+        let mut db = umya_spreadsheet::DataBar::default();
+        let mut cfvo_min = umya_spreadsheet::ConditionalFormatValueObject::default();
+        cfvo_min.set_type(umya_spreadsheet::ConditionalFormatValueObjectValues::Number);
+        cfvo_min.set_val("0");
+        let mut cfvo_max = umya_spreadsheet::ConditionalFormatValueObject::default();
+        cfvo_max.set_type(umya_spreadsheet::ConditionalFormatValueObjectValues::Number);
+        cfvo_max.set_val("1400");
+        db.add_cfvo_collection(cfvo_min);
+        db.add_cfvo_collection(cfvo_max);
+        let mut bar_color = umya_spreadsheet::Color::default();
+        bar_color.set_argb("FF1E2761");
+        db.add_color_collection(bar_color);
+        rule.set_data_bar(db);
+
+        let mut seq = umya_spreadsheet::SequenceOfReferences::default();
+        seq.set_sqref("A1:A3");
+        let mut cf = umya_spreadsheet::ConditionalFormatting::default();
+        cf.set_sequence_of_references(seq);
+        cf.add_conditional_collection(rule);
+        sheet.set_conditional_formatting_collection(vec![cf]);
+    });
+    let data = rewrite_data_bar_children_as_start_end_tags(&data);
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    let db3 = tp.table.rows[2].cells[0]
+        .data_bar
+        .as_ref()
+        .expect("A3 should have data_bar");
+    assert_eq!(
+        db3.color,
+        Color::new(0x1E, 0x27, 0x61),
+        "bar must use the rule color, not the default blue"
+    );
+    assert!(
+        (db3.fill_pct - 90.0).abs() < 0.01,
+        "max value should fill maxLength (90%), got {}",
+        db3.fill_pct
+    );
+}
+
+#[test]
+fn test_cond_fmt_icon_set_num_thresholds_from_start_end_cfvos() {
+    // openpyxl writes iconSet cfvos as <cfvo ...></cfvo> pairs; umya drops
+    // them and office2pdf fell back to equal-thirds, mis-banding cells. With
+    // the raw-XML cfvo (type=num) thresholds [0, 0.9, 1.0], 0.84 is red-down,
+    // 0.93 yellow-side, 1.07 green-up (issue #406).
+    let data = build_xlsx_with_cond_fmt(|sheet| {
+        sheet.get_cell_mut("A1").set_value_number(0.84);
+        sheet.get_cell_mut("A2").set_value_number(0.93);
+        sheet.get_cell_mut("A3").set_value_number(1.07);
+
+        let mut rule = umya_spreadsheet::ConditionalFormattingRule::default();
+        rule.set_type(umya_spreadsheet::ConditionalFormatValues::IconSet);
+        rule.set_priority(1);
+
+        let mut is = umya_spreadsheet::IconSet::default();
+        is.set_icon_set_type("3Arrows");
+        for val in ["0", "0.9", "1"] {
+            let mut cfvo = umya_spreadsheet::ConditionalFormatValueObject::default();
+            cfvo.set_type(umya_spreadsheet::ConditionalFormatValueObjectValues::Number);
+            cfvo.set_val(val);
+            is.add_cfvo_collection(cfvo);
+        }
+        rule.set_icon_set(is);
+
+        let mut seq = umya_spreadsheet::SequenceOfReferences::default();
+        seq.set_sqref("A1:A3");
+        let mut cf = umya_spreadsheet::ConditionalFormatting::default();
+        cf.set_sequence_of_references(seq);
+        cf.add_conditional_collection(rule);
+        sheet.set_conditional_formatting_collection(vec![cf]);
+    });
+    let data = rewrite_data_bar_children_as_start_end_tags(&data);
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    // 0.84 < 0.9 -> low band (red down)
+    assert_eq!(
+        tp.table.rows[0].cells[0].icon_color,
+        Some(Color::new(231, 121, 121))
+    );
+    // 0.93 in [0.9, 1.0) -> middle band (yellow)
+    assert_eq!(
+        tp.table.rows[1].cells[0].icon_color,
+        Some(Color::new(249, 208, 106))
+    );
+    // 1.07 >= 1.0 -> high band (green up)
+    assert_eq!(
+        tp.table.rows[2].cells[0].icon_color,
+        Some(Color::new(89, 176, 109))
+    );
+}
+
+/// Excel inventory sheets flag restock rows with `cellIs equal "REORDER"`, whose
+/// operand is a quoted string rather than a number.
+#[test]
+fn test_cond_fmt_cell_is_equal_text_applies_differential_style() {
+    let data = build_xlsx_with_cond_fmt(|sheet| {
+        sheet.get_cell_mut("A1").set_value_string("REORDER");
+        sheet.get_cell_mut("A2").set_value_string("OK");
+        sheet.get_cell_mut("A3").set_value_string("REORDER");
+
+        let mut rule = umya_spreadsheet::ConditionalFormattingRule::default();
+        rule.set_type(umya_spreadsheet::ConditionalFormatValues::CellIs);
+        rule.set_operator(umya_spreadsheet::ConditionalFormattingOperatorValues::Equal);
+        rule.set_priority(1);
+        let mut style = umya_spreadsheet::Style::default();
+        style.set_background_color("FFFFC7CE");
+        style.get_font_mut().set_bold(true);
+        style.get_font_mut().get_color_mut().set_argb("FF9C0006");
+        rule.set_style(style);
+        let mut formula = umya_spreadsheet::Formula::default();
+        formula.set_string_value("\"REORDER\"");
+        rule.set_formula(formula);
+
+        let mut seq = umya_spreadsheet::SequenceOfReferences::default();
+        seq.set_sqref("A1:A3");
+        let mut cf = umya_spreadsheet::ConditionalFormatting::default();
+        cf.set_sequence_of_references(seq);
+        cf.add_conditional_collection(rule);
+        sheet.set_conditional_formatting_collection(vec![cf]);
+    });
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    assert_eq!(
+        tp.table.rows[0].cells[0].background,
+        Some(Color::new(255, 199, 206)),
+        "A1 (REORDER) should get the differential fill"
+    );
+    let style_a1 = first_run_style(&tp.table.rows[0].cells[0]);
+    assert_eq!(
+        style_a1.color,
+        Some(Color::new(156, 0, 6)),
+        "A1 (REORDER) should get the differential font color"
+    );
+    assert_eq!(style_a1.bold, Some(true), "A1 (REORDER) should be bold");
+    assert!(
+        tp.table.rows[1].cells[0].background.is_none(),
+        "A2 (OK) must not match"
+    );
+    assert_eq!(
+        tp.table.rows[2].cells[0].background,
+        Some(Color::new(255, 199, 206)),
+        "A3 (REORDER) should get the differential fill"
+    );
+}
+
+/// Excel string comparison is case-insensitive, so `equal "reorder"` must also
+/// match a cell holding `REORDER`.
+#[test]
+fn test_cond_fmt_cell_is_text_equality_is_case_insensitive() {
+    let data = build_xlsx_with_cond_fmt(|sheet| {
+        sheet.get_cell_mut("A1").set_value_string("REORDER");
+        sheet.get_cell_mut("A2").set_value_string("Backorder");
+
+        let mut rule = umya_spreadsheet::ConditionalFormattingRule::default();
+        rule.set_type(umya_spreadsheet::ConditionalFormatValues::CellIs);
+        rule.set_operator(umya_spreadsheet::ConditionalFormattingOperatorValues::Equal);
+        rule.set_priority(1);
+        let mut style = umya_spreadsheet::Style::default();
+        style.set_background_color("FF00FF00");
+        rule.set_style(style);
+        let mut formula = umya_spreadsheet::Formula::default();
+        formula.set_string_value("\"reorder\"");
+        rule.set_formula(formula);
+
+        let mut seq = umya_spreadsheet::SequenceOfReferences::default();
+        seq.set_sqref("A1:A2");
+        let mut cf = umya_spreadsheet::ConditionalFormatting::default();
+        cf.set_sequence_of_references(seq);
+        cf.add_conditional_collection(rule);
+        sheet.set_conditional_formatting_collection(vec![cf]);
+    });
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    assert_eq!(
+        tp.table.rows[0].cells[0].background,
+        Some(Color::new(0, 255, 0)),
+        "case-insensitive match expected"
+    );
+    assert!(tp.table.rows[1].cells[0].background.is_none());
+}
+
+/// `notEqual` against a quoted string must style every non-matching cell.
+#[test]
+fn test_cond_fmt_cell_is_not_equal_text() {
+    let data = build_xlsx_with_cond_fmt(|sheet| {
+        sheet.get_cell_mut("A1").set_value_string("OK");
+        sheet.get_cell_mut("A2").set_value_string("REORDER");
+
+        let mut rule = umya_spreadsheet::ConditionalFormattingRule::default();
+        rule.set_type(umya_spreadsheet::ConditionalFormatValues::CellIs);
+        rule.set_operator(umya_spreadsheet::ConditionalFormattingOperatorValues::NotEqual);
+        rule.set_priority(1);
+        let mut style = umya_spreadsheet::Style::default();
+        style.set_background_color("FF0000FF");
+        rule.set_style(style);
+        let mut formula = umya_spreadsheet::Formula::default();
+        formula.set_string_value("\"OK\"");
+        rule.set_formula(formula);
+
+        let mut seq = umya_spreadsheet::SequenceOfReferences::default();
+        seq.set_sqref("A1:A2");
+        let mut cf = umya_spreadsheet::ConditionalFormatting::default();
+        cf.set_sequence_of_references(seq);
+        cf.add_conditional_collection(rule);
+        sheet.set_conditional_formatting_collection(vec![cf]);
+    });
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    assert!(
+        tp.table.rows[0].cells[0].background.is_none(),
+        "A1 (OK) equals the operand, so notEqual must not match"
+    );
+    assert_eq!(
+        tp.table.rows[1].cells[0].background,
+        Some(Color::new(0, 0, 255)),
+        "A2 (REORDER) differs from the operand"
+    );
+}
+
+/// A numeric operand must never match a text cell that merely looks similar,
+/// and a quoted operand must not hijack numeric rules.
+#[test]
+fn test_cond_fmt_cell_is_text_operand_does_not_affect_numeric_cells() {
+    let data = build_xlsx_with_cond_fmt(|sheet| {
+        sheet.get_cell_mut("A1").set_value_number(5.0);
+        sheet.get_cell_mut("A2").set_value_string("5");
+
+        let mut rule = umya_spreadsheet::ConditionalFormattingRule::default();
+        rule.set_type(umya_spreadsheet::ConditionalFormatValues::CellIs);
+        rule.set_operator(umya_spreadsheet::ConditionalFormattingOperatorValues::Equal);
+        rule.set_priority(1);
+        let mut style = umya_spreadsheet::Style::default();
+        style.set_background_color("FFFF00FF");
+        rule.set_style(style);
+        let mut formula = umya_spreadsheet::Formula::default();
+        formula.set_string_value("\"5\"");
+        rule.set_formula(formula);
+
+        let mut seq = umya_spreadsheet::SequenceOfReferences::default();
+        seq.set_sqref("A1:A2");
+        let mut cf = umya_spreadsheet::ConditionalFormatting::default();
+        cf.set_sequence_of_references(seq);
+        cf.add_conditional_collection(rule);
+        sheet.set_conditional_formatting_collection(vec![cf]);
+    });
+
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let tp = get_sheet_page(&doc, 0);
+
+    assert!(
+        tp.table.rows[0].cells[0].background.is_none(),
+        "numeric 5 must not match the text operand \"5\""
+    );
+    assert_eq!(
+        tp.table.rows[1].cells[0].background,
+        Some(Color::new(255, 0, 255)),
+        "text \"5\" must match the text operand"
+    );
+}
+
+/// Build a 3-colour scale over `values` whose middle stop is the given cfvo.
+///
+/// White at the minimum, green in the middle, red at the maximum, so the
+/// colour a cell gets names its anchor unambiguously.
+fn color_scale_with_middle_cfvo(
+    values: &[f64],
+    middle: umya_spreadsheet::ConditionalFormatValueObjectValues,
+    middle_val: &str,
+) -> Vec<u8> {
+    let values: Vec<f64> = values.to_vec();
+    build_xlsx_with_cond_fmt(move |sheet| {
+        for (index, value) in values.iter().enumerate() {
+            sheet
+                .get_cell_mut(format!("A{}", index + 1).as_str())
+                .set_value_number(*value);
+        }
+
+        let mut rule = umya_spreadsheet::ConditionalFormattingRule::default();
+        rule.set_type(umya_spreadsheet::ConditionalFormatValues::ColorScale);
+        rule.set_priority(1);
+
+        let mut cs = umya_spreadsheet::ColorScale::default();
+
+        let mut cfvo_min = umya_spreadsheet::ConditionalFormatValueObject::default();
+        cfvo_min.set_type(umya_spreadsheet::ConditionalFormatValueObjectValues::Min);
+        cs.add_cfvo_collection(cfvo_min);
+
+        let mut cfvo_mid = umya_spreadsheet::ConditionalFormatValueObject::default();
+        cfvo_mid.set_type(middle.clone());
+        cfvo_mid.set_val(middle_val);
+        cs.add_cfvo_collection(cfvo_mid);
+
+        let mut cfvo_max = umya_spreadsheet::ConditionalFormatValueObject::default();
+        cfvo_max.set_type(umya_spreadsheet::ConditionalFormatValueObjectValues::Max);
+        cs.add_cfvo_collection(cfvo_max);
+
+        for argb in ["FFFFFFFF", "FF00FF00", "FFFF0000"] {
+            let mut color = umya_spreadsheet::Color::default();
+            color.set_argb(argb);
+            cs.add_color_collection(color);
+        }
+
+        rule.set_color_scale(cs);
+
+        let mut seq = umya_spreadsheet::SequenceOfReferences::default();
+        seq.set_sqref(format!("A1:A{}", values.len()).as_str());
+        let mut cf = umya_spreadsheet::ConditionalFormatting::default();
+        cf.set_sequence_of_references(seq);
+        cf.add_conditional_collection(rule);
+        sheet.set_conditional_formatting_collection(vec![cf]);
+    })
+}
+
+fn cell_background(data: &[u8], row_index: usize) -> Color {
+    let parser = XlsxParser;
+    let (doc, _warnings) = parser.parse(data, &ConvertOptions::default()).unwrap();
+    get_sheet_page(&doc, 0).table.rows[row_index].cells[0]
+        .background
+        .expect("cell should have a color scale background")
+}
+
+#[test]
+fn test_color_scale_percentile_cfvo_anchors_on_the_data_not_the_midpoint() {
+    // Skewed on purpose: [0, 1, 2, 3, 100] has median 2 but a midpoint of 50.
+    // The 50th percentile IS the value 2, so that cell must land exactly on
+    // the middle colour. Treating the cfvo as a linear position instead puts
+    // the middle stop at 50 and renders the cell almost white (issue #653).
+    let data = color_scale_with_middle_cfvo(
+        &[0.0, 1.0, 2.0, 3.0, 100.0],
+        umya_spreadsheet::ConditionalFormatValueObjectValues::Percentile,
+        "50",
+    );
+
+    assert_eq!(
+        cell_background(&data, 2),
+        Color::new(0, 255, 0),
+        "the 50th percentile of the data is 2, so A3 sits on the middle stop"
+    );
+    assert_eq!(
+        cell_background(&data, 0),
+        Color::new(255, 255, 255),
+        "the minimum keeps the first stop"
+    );
+    assert_eq!(
+        cell_background(&data, 4),
+        Color::new(255, 0, 0),
+        "the maximum keeps the last stop"
+    );
+}
+
+#[test]
+fn test_color_scale_percent_cfvo_stays_a_linear_position() {
+    // Triangulation: `percent` is a fraction of the range, not of the data, so
+    // on the same skewed values the middle stop stays at 50 — which is the
+    // value in A6 here, not the median.
+    let data = color_scale_with_middle_cfvo(
+        &[0.0, 1.0, 2.0, 3.0, 100.0, 50.0],
+        umya_spreadsheet::ConditionalFormatValueObjectValues::Percent,
+        "50",
+    );
+
+    assert_eq!(
+        cell_background(&data, 5),
+        Color::new(0, 255, 0),
+        "50% of the 0..100 range is 50, so A6 sits on the middle stop"
+    );
+}
+
+/// The arrow sets carry their own fills, not the traffic lights' (issue #651).
+///
+/// Excel ships different sprite artwork per icon set: `#62C17A` is the
+/// traffic-light green measured in #536, and `#59B06D` is 3Arrows'. Sharing one
+/// palette made whichever set was measured last wrong for the other.
+#[test]
+fn test_arrow_icons_do_not_take_the_traffic_light_palette() {
+    let arrows = build_icon_set_fixture(Some("3Arrows"));
+    let lights = build_icon_set_fixture(Some("3TrafficLights1"));
+    let arrow_doc = XlsxParser
+        .parse(&arrows, &ConvertOptions::default())
+        .unwrap()
+        .0;
+    let light_doc = XlsxParser
+        .parse(&lights, &ConvertOptions::default())
+        .unwrap()
+        .0;
+
+    let arrow_colors: Vec<Option<Color>> = get_sheet_page(&arrow_doc, 0)
+        .table
+        .rows
+        .iter()
+        .filter_map(|row| row.cells.first().map(|cell| cell.icon_color))
+        .collect();
+    let light_colors: Vec<Option<Color>> = get_sheet_page(&light_doc, 0)
+        .table
+        .rows
+        .iter()
+        .filter_map(|row| row.cells.first().map(|cell| cell.icon_color))
+        .collect();
+
+    assert!(
+        arrow_colors.iter().any(|c| c.is_some()),
+        "the arrow fixture carries icon colours at all"
+    );
+    assert_ne!(
+        arrow_colors, light_colors,
+        "the two sets were measured separately and differ"
+    );
+    // The traffic-light green from #536 must survive unchanged.
+    assert!(
+        light_colors.contains(&Some(Color::new(98, 193, 122))),
+        "traffic lights keep their measured green, got {light_colors:?}"
+    );
+}

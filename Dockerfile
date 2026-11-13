@@ -1,9 +1,10 @@
 # Full image: native engine plus the Linux-capable external toolchain.
-FROM rust:1.90-bookworm AS builder
+FROM rust:1.100-bookworm AS builder
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 COPY catalog ./catalog
 COPY docs ./docs
 RUN cargo build --release --locked -p docforge-server

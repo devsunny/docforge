@@ -18,7 +18,7 @@ If no route exists, the API lists the direct catalog hint and the optional tools
 
 ### OCR
 
-OCR is opt-in (`options.ocr=true`) and catalog rows 67–69 set it automatically. When OCR is requested, non-OCR routes out of raster/PDF sources are skipped, forcing an OCR-capable engine (Tesseract). `PDF (OCR) → PDF (Searchable)` requires `pdftoppm`, `tesseract`, and `pdfunite`.
+OCR is opt-in (`options.ocr=true`) and catalog rows 67–69 set it automatically. When OCR is requested, non-OCR routes out of raster/PDF sources are skipped, forcing an OCR-capable engine. Native `ocrs` handles English/Latin images and PDF pages without external tools; Tesseract remains preferred when installed for higher accuracy, languages, and searchable PDF. `PDF (OCR) → PDF (Searchable)` requires `pdftoppm`, `tesseract`, and `pdfunite`.
 
 ### Multi-hop examples
 
@@ -45,13 +45,16 @@ EPUB -> DOCX     EPUB -> HTML (native/Pandoc) -> DOCX
 The pure-Rust engine handles:
 
 - **Documents:** PDF → text/Markdown/HTML/DOCX/RTF/ODT/EPUB/PPTX/TeX (text layer only); DOCX/ODT/RTF/HTML/Markdown/TXT/EPUB/PPTX/EML/TeX → PDF/DOCX/ODT/RTF/HTML/Markdown/TXT/EPUB/PPTX/TeX.
+- **Office → PDF:** DOCX/PPTX/XLSX → PDF through `office2pdf`/Typst, with the structural document/workbook renderer as fallback.
+- **PDF raster:** PDF → PNG/JPG/TIFF through the pure-Rust `pdf-render` engine, selected page or first page.
+- **OCR:** English/Latin image/PDF OCR through embedded `ocrs` models; no external binary required.
 - **Structured data:** JSON ↔ YAML/TOML/XML/CSV/XLSX, XML ↔ JSON/CSV, CSV ↔ TSV/JSON/XML/VCF/ICS, JSON/CSV → XLSX/PDF/DOCX.
 - **Spreadsheets:** CSV/TSV/XLSX/XLS/ODS → CSV/TSV/XLSX/ODS/JSON/XML/HTML/Markdown/PDF/DOCX.
 - **Contacts/calendar:** VCF/ICS ↔ CSV, and as document tables.
 - **Images:** JPG/PNG/TIFF/WEBP/BMP → each other and PDF; SVG → PNG/JPG/PDF; CBZ → PDF.
 - **Email:** EML and Outlook MSG → PDF/DOCX/HTML/Markdown/TXT. MSG parsing reads the Outlook MAPI body (HTML, plain text, or RTF fallback), sender/recipients/date, and attachment names; `MSG → Markdown` is available even though it is not one of the 100 ranked catalog rows.
 
-Native PDF output embeds a Unicode font (Roboto Medium, OFL) and produces a structured text layout, not a pixel clone. Native DOCX/ODT/EPUB/PPTX writers produce standards-compliant ZIP packages.
+Native PDF output embeds a Unicode font (Roboto Medium, OFL) and produces a structured text layout, not a pixel clone. `office2pdf` uses Typst for layout and embedded fonts; it is substantially richer than the structural fallback but is not a pixel-perfect LibreOffice replacement. Native DOCX/ODT/EPUB/PPTX writers produce standards-compliant ZIP packages.
 
 ## External engines and tool matrix
 
@@ -63,7 +66,7 @@ Native PDF output embeds a Unicode font (Roboto Medium, OFL) and produces a stru
 | `gs` | PS → PDF, PDF → PS/PNG/JPG/TIFF, XPS (with gxps) |
 | `magick` | HEIC/SVG/image conversions, PDF raster |
 | `ebook-convert` | EPUB ↔ MOBI, EPUB → PDF/DOCX |
-| `tesseract` | Image OCR, PDF searchable output |
+| `tesseract` | Higher-accuracy/multi-language OCR, PDF searchable output |
 | `7z` | CBR extraction → PDF |
 | `ddjvu`, `cjb2`, `djvm` | DjVu → PDF/TIFF, PDF → DjVu |
 | `gxps` | XPS → PDF |
@@ -75,8 +78,8 @@ The full Docker image installs the Linux-capable subset. Apple iWork formats are
 
 ## Known limitations
 
-- **Layout fidelity:** native routes preserve block structure, not typography. Use LibreOffice/Pandoc for layout-sensitive work and set `options.preserve_layout=true` to bias the planner toward layout engines.
-- **Scanned PDFs:** use OCR. Native PDF text extraction returns an error when the text layer is empty.
+- **Layout fidelity:** the structural native route preserves block structure, not typography; `office2pdf` improves DOCX/PPTX/XLSX→PDF with Typst layout. Use LibreOffice/Pandoc for exact or complex layout and set `options.preserve_layout=true` to bias the planner toward layout engines.
+- **Scanned PDFs:** use OCR. Native PDF text extraction returns an error when the text layer is empty; native `ocrs` supports English/Latin, while Tesseract adds language coverage and searchable PDF.
 - **PDF tables:** native `PDF→CSV/XLSX` uses whitespace/run heuristics; complex merged tables should use a dedicated table extractor.
 - **Multi-page image output:** PDF→JPG/PNG/TIFF currently returns the selected (or first) page. Use a job pipeline or a dedicated raster tool for page archives.
 - **Apple iWork:** only on macOS with Pages/Keynote/Numbers installed.

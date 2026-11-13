@@ -1,0 +1,948 @@
+use super::*;
+use crate::test_support::{make_table_graphic_frame, make_table_row};
+
+fn table_element(elem: &FixedElement) -> &Table {
+    match &elem.kind {
+        FixedElementKind::Table(table) => table,
+        _ => panic!("Expected Table, got {:?}", elem.kind),
+    }
+}
+
+#[test]
+fn test_slide_with_basic_table() {
+    let rows = format!(
+        "{}{}",
+        make_table_row(&["A1", "B1"]),
+        make_table_row(&["A2", "B2"]),
+    );
+    let table_frame =
+        make_table_graphic_frame(914400, 914400, 3657600, 1828800, &[1828800, 1828800], &rows);
+    let slide = make_slide_xml(&[table_frame]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide]);
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    assert_eq!(page.elements.len(), 1);
+
+    let elem = &page.elements[0];
+    assert!((elem.x - 72.0).abs() < 0.1);
+    assert!((elem.y - 72.0).abs() < 0.1);
+
+    let table = table_element(elem);
+    assert_eq!(table.rows.len(), 2);
+    assert_eq!(table.column_widths.len(), 2);
+    assert!((table.column_widths[0] - 144.0).abs() < 0.1);
+
+    let first_cell = &table.rows[0].cells[0];
+    assert_eq!(first_cell.content.len(), 1);
+    match &first_cell.content[0] {
+        Block::Paragraph(paragraph) => assert_eq!(paragraph.runs[0].text, "A1"),
+        _ => panic!("Expected paragraph in cell"),
+    }
+
+    match &table.rows[1].cells[1].content[0] {
+        Block::Paragraph(paragraph) => assert_eq!(paragraph.runs[0].text, "B2"),
+        _ => panic!("Expected paragraph in cell"),
+    }
+}
+
+#[test]
+fn issue_2041_table_fixture_keeps_signed_paragraph_indents() {
+    let fixture: &[u8] = include_bytes!("../../../../tests/fixtures/pptx/oxp_PB001-Input1.pptx");
+    let (document, _warnings) = PptxParser
+        .parse(fixture, &ConvertOptions::default())
+        .expect("the issue fixture should parse");
+    let page: &FixedPage = match document
+        .pages
+        .get(1)
+        .expect("the fixture has a second slide")
+    {
+        Page::Fixed(page) => page,
+        page => panic!("Expected a fixed slide, got {page:?}"),
+    };
+    let expected_labels: [&str; 4] = [
+        "European ex-UK",
+        "Mergers & Acquisitions",
+        "Global Macro Strategies",
+        "High Yield Bonds",
+    ];
+    let mut matching_paragraphs: Vec<(&str, &Paragraph)> = Vec::new();
+    for element in &page.elements {
+        let FixedElementKind::Table(table) = &element.kind else {
+            continue;
+        };
+        for row in &table.rows {
+            for cell in &row.cells {
+                for block in &cell.content {
+                    let Block::Paragraph(paragraph) = block else {
+                        continue;
+                    };
+                    let text: String = paragraph.runs.iter().map(|run| run.text.as_str()).collect();
+                    if let Some(label) = expected_labels.iter().find(|label| **label == text) {
+                        matching_paragraphs.push((label, paragraph));
+                    }
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        matching_paragraphs.len(),
+        expected_labels.len(),
+        "all four affected slide-table labels should be found"
+    );
+    for (label, paragraph) in matching_paragraphs {
+        assert_eq!(paragraph.style.indent_left, Some(60.75), "{label}");
+        assert_eq!(paragraph.style.indent_first_line, Some(-18.0), "{label}");
+    }
+}
+
+#[test]
+fn test_slide_table_does_not_scale_row_floors_to_graphic_frame_height() {
+    let rows_xml = format!(
+        "{}{}",
+        make_table_row(&["A1", "B1"]),
+        make_table_row(&["A2", "B2"]),
+    );
+    let table_frame = make_table_graphic_frame(
+        914400,
+        914400,
+        3_657_600,
+        1_483_360,
+        &[914_400, 914_400],
+        &rows_xml,
+    );
+    let slide = make_slide_xml(&[table_frame]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide]);
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let elem = &page.elements[0];
+    let table = table_element(elem);
+
+    assert_eq!(table.column_widths.len(), 2);
+    assert!((table.column_widths[0] - 144.0).abs() < 0.1);
+    assert!((table.column_widths.iter().sum::<f64>() - elem.width).abs() < 0.1);
+    assert_eq!(table.rows.len(), 2);
+    assert_eq!(table.rows[0].height, None);
+    assert_eq!(table.rows[1].height, None);
+    assert_eq!(table.rows[0].minimum_height, Some(29.2));
+    assert_eq!(table.rows[1].minimum_height, Some(29.2));
+    assert!(
+        (table
+            .rows
+            .iter()
+            .map(|row| row.minimum_height.unwrap_or(0.0))
+            .sum::<f64>()
+            - 58.4)
+            .abs()
+            < 0.1
+    );
+}
+
+#[test]
+fn test_slide_table_uses_content_driven_rows_for_fixed_page_rendering() {
+    let rows_xml = format!(
+        "{}{}",
+        make_table_row(&["A1", "B1"]),
+        make_table_row(&["A2", "B2"]),
+    );
+    let table_frame = make_table_graphic_frame(
+        914400,
+        914400,
+        3_657_600,
+        1_483_360,
+        &[914_400, 914_400],
+        &rows_xml,
+    );
+    let slide = make_slide_xml(&[table_frame]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide]);
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let table = table_element(&page.elements[0]);
+
+    assert!(
+        table.use_content_driven_row_heights,
+        "Fixed-page PPT tables should let content grow past source row floors",
+    );
+}
+
+#[test]
+fn test_slide_table_declared_row_height_is_a_content_growing_minimum() {
+    let rows_xml = concat!(
+        r#"<a:tr h="254000"><a:tc><a:txBody><a:bodyPr/><a:p>"#,
+        r#"<a:r><a:rPr lang="en-US" sz="600"><a:latin typeface="Arial"/></a:rPr><a:t>One</a:t></a:r>"#,
+        r#"<a:br/><a:r><a:rPr lang="en-US" sz="600"><a:latin typeface="Arial"/></a:rPr><a:t>Two</a:t></a:r>"#,
+        r#"<a:br/><a:r><a:rPr lang="en-US" sz="600"><a:latin typeface="Arial"/></a:rPr><a:t>Three</a:t></a:r>"#,
+        r#"<a:br/><a:r><a:rPr lang="en-US" sz="600"><a:latin typeface="Arial"/></a:rPr><a:t>Four</a:t></a:r>"#,
+        r#"</a:p></a:txBody><a:tcPr marL="0" marR="0" marT="0" marB="0" anchor="t"/></a:tc></a:tr>"#,
+    );
+    let table_frame = make_table_graphic_frame(0, 0, 1_828_800, 254_000, &[1_828_800], rows_xml);
+    let slide = make_slide_xml(&[table_frame]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide]);
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let table = table_element(&page.elements[0]);
+
+    assert!(
+        table.use_content_driven_row_heights,
+        "PowerPoint rows must grow when their cell content exceeds a:tr/@h"
+    );
+    assert_eq!(table.rows[0].height, None);
+    assert_eq!(table.rows[0].minimum_height, Some(20.0));
+}
+
+#[test]
+fn test_slide_table_reads_column_widths_from_gridcol_with_extensions() {
+    let rows_xml = make_table_row(&["A1", "B1"]);
+    let table_frame = r#"<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="4" name="Table"/><p:cNvGraphicFramePr><a:graphicFrameLocks noGrp="1"/></p:cNvGraphicFramePr><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="0" y="0"/><a:ext cx="1828800" cy="370840"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table"><a:tbl><a:tblPr/><a:tblGrid><a:gridCol w="914400"><a:extLst><a:ext uri="{9D8B030D-6E8A-4147-A177-3AD203B41FA5}"><a16:colId xmlns:a16="http://schemas.microsoft.com/office/drawing/2014/main" val="1"/></a:ext></a:extLst></a:gridCol><a:gridCol w="914400"><a:extLst><a:ext uri="{9D8B030D-6E8A-4147-A177-3AD203B41FA5}"><a16:colId xmlns:a16="http://schemas.microsoft.com/office/drawing/2014/main" val="2"/></a:ext></a:extLst></a:gridCol></a:tblGrid>"#.to_string()
+        + &rows_xml
+        + r#"</a:tbl></a:graphicData></a:graphic></p:graphicFrame>"#;
+    let slide = make_slide_xml(&[table_frame]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide]);
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let table = table_element(&page.elements[0]);
+
+    assert_eq!(table.column_widths.len(), 2);
+    assert!((table.column_widths[0] - 72.0).abs() < 0.1);
+    assert!((table.column_widths[1] - 72.0).abs() < 0.1);
+}
+
+#[test]
+fn test_slide_table_cell_anchor_maps_to_vertical_alignment() {
+    let rows_xml = concat!(
+        r#"<a:tr h="370840">"#,
+        r#"<a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="en-US"/><a:t>Centered</a:t></a:r></a:p></a:txBody><a:tcPr anchor="ctr"/></a:tc>"#,
+        r#"<a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="en-US"/><a:t>Bottom</a:t></a:r></a:p></a:txBody><a:tcPr anchor="b"/></a:tc>"#,
+        r#"</a:tr>"#,
+    );
+    let table_frame =
+        make_table_graphic_frame(0, 0, 1_828_800, 370_840, &[914_400, 914_400], rows_xml);
+    let slide = make_slide_xml(&[table_frame]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide]);
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let table = table_element(&page.elements[0]);
+
+    assert_eq!(
+        table.rows[0].cells[0].vertical_align,
+        Some(crate::ir::CellVerticalAlign::Center)
+    );
+    assert_eq!(
+        table.rows[0].cells[1].vertical_align,
+        Some(crate::ir::CellVerticalAlign::Bottom)
+    );
+}
+
+#[test]
+fn test_slide_table_cell_margins_map_to_padding() {
+    let rows_xml = concat!(
+        r#"<a:tr h="370840">"#,
+        r#"<a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="en-US"/><a:t>Padded</a:t></a:r></a:p></a:txBody><a:tcPr marL="76200" marR="76200" marT="38100" marB="38100"/></a:tc>"#,
+        r#"</a:tr>"#,
+    );
+    let table_frame = make_table_graphic_frame(0, 0, 914_400, 370_840, &[914_400], rows_xml);
+    let slide = make_slide_xml(&[table_frame]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide]);
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let table = table_element(&page.elements[0]);
+
+    assert_eq!(
+        table.rows[0].cells[0].padding,
+        Some(crate::ir::Insets {
+            top: 3.0,
+            right: 6.0,
+            bottom: 3.0,
+            left: 6.0,
+        })
+    );
+}
+
+#[test]
+fn test_slide_table_uses_powerpoint_default_cell_padding() {
+    let rows_xml = concat!(
+        r#"<a:tr h="370840">"#,
+        r#"<a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="en-US"/><a:t>DefaultPadding</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc>"#,
+        r#"</a:tr>"#,
+    );
+    let table_frame = make_table_graphic_frame(0, 0, 914_400, 370_840, &[914_400], rows_xml);
+    let slide = make_slide_xml(&[table_frame]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide]);
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let table = table_element(&page.elements[0]);
+
+    assert_eq!(
+        table.default_cell_padding,
+        Some(crate::ir::Insets {
+            top: 3.6,
+            right: 7.2,
+            bottom: 3.6,
+            left: 7.2,
+        })
+    );
+    assert_eq!(table.rows[0].cells[0].padding, None);
+    assert!(table.use_content_driven_row_heights);
+}
+
+#[test]
+fn test_slide_table_coalesces_adjacent_runs_with_same_style() {
+    let rows_xml = concat!(
+        r#"<a:tr h="370840">"#,
+        r#"<a:tc><a:txBody><a:bodyPr/><a:p>"#,
+        r#"<a:r><a:rPr lang="en-US" sz="1100"><a:latin typeface="Arial"/></a:rPr><a:t>YOLOv8n + </a:t></a:r>"#,
+        r#"<a:r><a:rPr lang="en-US" sz="1100" err="1"><a:latin typeface="Arial"/></a:rPr><a:t>topk filtering on gpu(</a:t></a:r>"#,
+        r#"<a:r><a:rPr lang="en-US" sz="1100" i="1"><a:latin typeface="Arial"/></a:rPr><a:t>K</a:t></a:r>"#,
+        r#"<a:r><a:rPr lang="en-US" sz="1100"><a:latin typeface="Arial"/></a:rPr><a:t> = 100)</a:t></a:r>"#,
+        r#"</a:p></a:txBody><a:tcPr/></a:tc>"#,
+        r#"</a:tr>"#,
+    );
+    let table_frame = make_table_graphic_frame(0, 0, 914_400, 370_840, &[914_400], rows_xml);
+    let slide = make_slide_xml(&[table_frame]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide]);
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let table = table_element(&page.elements[0]);
+    let paragraph = match &table.rows[0].cells[0].content[0] {
+        Block::Paragraph(paragraph) => paragraph,
+        other => panic!("Expected paragraph, got {other:?}"),
+    };
+
+    assert_eq!(paragraph.runs.len(), 3);
+    assert_eq!(paragraph.runs[0].text, "YOLOv8n + topk filtering on gpu(");
+    assert_eq!(paragraph.runs[1].text, "K");
+    assert_eq!(paragraph.runs[2].text, "\u{00A0}= 100)");
+    assert_eq!(paragraph.runs[1].style.italic, Some(true));
+}
+
+#[test]
+fn test_slide_table_hyperlink_run_inherits_theme_style() {
+    let rows_xml = concat!(
+        r#"<a:tr h="370840">"#,
+        r#"<a:tc><a:txBody><a:bodyPr/><a:p>"#,
+        r#"<a:pPr indent="-216000"><a:buChar char="•"/></a:pPr>"#,
+        r#"<a:r><a:rPr lang="en-US"><a:hlinkClick r:id="rId2"/></a:rPr><a:t>Link</a:t></a:r>"#,
+        r#"<a:r><a:rPr lang="en-US"/><a:t> after</a:t></a:r>"#,
+        r#"</a:p></a:txBody><a:tcPr/></a:tc>"#,
+        r#"</a:tr>"#,
+    );
+    let table_frame = make_table_graphic_frame(0, 0, 914_400, 370_840, &[914_400], rows_xml);
+    let slide = make_slide_xml(&[table_frame]);
+    let theme_xml = make_theme_xml(&[("hlink", "778BA2")], "Calibri Light", "Calibri");
+    let data = build_test_pptx_with_theme(SLIDE_CX, SLIDE_CY, &[slide], &theme_xml);
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let table = table_element(&page.elements[0]);
+    let list = match &table.rows[0].cells[0].content[0] {
+        Block::List(list) => list,
+        other => panic!("Expected list, got {other:?}"),
+    };
+    let paragraph = &list.items[0].content[0];
+    assert_eq!(paragraph.runs.len(), 2);
+    assert_eq!(paragraph.runs[0].text, "Link");
+    assert_eq!(
+        paragraph.runs[0].style.color,
+        Some(Color::new(0x77, 0x8B, 0xA2))
+    );
+    assert_eq!(paragraph.runs[0].style.underline, Some(true));
+    let marker_style = list.level_styles[&0].marker_style.as_ref();
+    assert!(marker_style.is_none_or(|style| {
+        style.color != Some(Color::new(0x77, 0x8B, 0xA2)) && style.underline != Some(true)
+    }));
+}
+
+#[test]
+fn test_slide_table_cell_bulleted_paragraphs_group_into_list() {
+    let rows_xml = concat!(
+        r#"<a:tr h="740000">"#,
+        r#"<a:tc><a:txBody><a:bodyPr/>"#,
+        r#"<a:p><a:pPr indent="-216000"><a:buChar char="•"/></a:pPr><a:r><a:rPr lang="en-US"/><a:t>First bullet</a:t></a:r></a:p>"#,
+        r#"<a:p><a:pPr indent="-216000"><a:buChar char="•"/></a:pPr><a:r><a:rPr lang="en-US"/><a:t>Second bullet</a:t></a:r></a:p>"#,
+        r#"</a:txBody><a:tcPr/></a:tc>"#,
+        r#"</a:tr>"#,
+    );
+    let table_frame = make_table_graphic_frame(0, 0, 914_400, 740_000, &[914_400], rows_xml);
+    let slide = make_slide_xml(&[table_frame]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide]);
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let table = table_element(&page.elements[0]);
+    assert_eq!(table.rows[0].cells[0].content.len(), 1);
+
+    let list = match &table.rows[0].cells[0].content[0] {
+        Block::List(list) => list,
+        other => panic!("Expected List block, got {other:?}"),
+    };
+    assert_eq!(list.kind, crate::ir::ListKind::Unordered);
+    assert_eq!(list.items.len(), 2);
+    assert_eq!(list.items[0].content[0].runs[0].text, "First bullet");
+    assert_eq!(list.items[1].content[0].runs[0].text, "Second bullet");
+}
+
+#[test]
+fn test_slide_table_with_merged_cells() {
+    let mut rows_xml = String::new();
+    rows_xml.push_str(r#"<a:tr h="370840">"#);
+    rows_xml.push_str(r#"<a:tc gridSpan="2"><a:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="en-US"/><a:t>Merged</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc>"#);
+    rows_xml.push_str(r#"<a:tc hMerge="1"><a:txBody><a:bodyPr/><a:p><a:endParaRPr/></a:p></a:txBody><a:tcPr/></a:tc>"#);
+    rows_xml.push_str("</a:tr>");
+    rows_xml.push_str(&make_table_row(&["C1", "C2"]));
+
+    let table_frame =
+        make_table_graphic_frame(0, 0, 3657600, 1828800, &[1828800, 1828800], &rows_xml);
+    let slide = make_slide_xml(&[table_frame]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide]);
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let table = table_element(&page.elements[0]);
+
+    assert_eq!(table.rows[0].cells.len(), 2);
+    assert_eq!(table.rows[0].cells[0].col_span, 2);
+    assert_eq!(table.rows[0].cells[1].col_span, 0);
+    assert_eq!(table.rows[1].cells[0].col_span, 1);
+    assert_eq!(table.rows[1].cells[1].col_span, 1);
+}
+
+#[test]
+fn test_slide_table_with_vertical_merge() {
+    let mut rows_xml = String::new();
+    rows_xml.push_str(r#"<a:tr h="370840">"#);
+    rows_xml.push_str(r#"<a:tc rowSpan="2"><a:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="en-US"/><a:t>VMerged</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc>"#);
+    rows_xml.push_str(r#"<a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="en-US"/><a:t>B1</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc>"#);
+    rows_xml.push_str("</a:tr>");
+    rows_xml.push_str(r#"<a:tr h="370840">"#);
+    rows_xml.push_str(r#"<a:tc vMerge="1"><a:txBody><a:bodyPr/><a:p><a:endParaRPr/></a:p></a:txBody><a:tcPr/></a:tc>"#);
+    rows_xml.push_str(r#"<a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="en-US"/><a:t>B2</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc>"#);
+    rows_xml.push_str("</a:tr>");
+
+    let table_frame =
+        make_table_graphic_frame(0, 0, 3657600, 1828800, &[1828800, 1828800], &rows_xml);
+    let slide = make_slide_xml(&[table_frame]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide]);
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let table = table_element(&page.elements[0]);
+
+    assert_eq!(table.rows[0].cells[0].row_span, 2);
+    assert_eq!(table.rows[1].cells[0].row_span, 0);
+}
+
+#[test]
+fn test_slide_table_with_formatted_text() {
+    let mut rows_xml = String::new();
+    rows_xml.push_str(r#"<a:tr h="370840">"#);
+    rows_xml.push_str(r#"<a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="en-US" b="1" sz="1800"><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></a:rPr><a:t>Bold Red</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc>"#);
+    rows_xml.push_str("</a:tr>");
+
+    let table_frame = make_table_graphic_frame(0, 0, 3657600, 370840, &[3657600], &rows_xml);
+    let slide = make_slide_xml(&[table_frame]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide]);
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let table = table_element(&page.elements[0]);
+
+    match &table.rows[0].cells[0].content[0] {
+        Block::Paragraph(paragraph) => {
+            assert_eq!(paragraph.runs[0].text, "Bold Red");
+            assert_eq!(paragraph.runs[0].style.bold, Some(true));
+            assert_eq!(paragraph.runs[0].style.font_size, Some(18.0));
+            assert_eq!(paragraph.runs[0].style.color, Some(Color::new(255, 0, 0)));
+        }
+        _ => panic!("Expected paragraph in cell"),
+    }
+}
+
+#[test]
+fn test_slide_table_with_cell_background() {
+    let mut rows_xml = String::new();
+    rows_xml.push_str(r#"<a:tr h="370840">"#);
+    rows_xml.push_str(r#"<a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="en-US"/><a:t>Filled</a:t></a:r></a:p></a:txBody><a:tcPr><a:solidFill><a:srgbClr val="00FF00"/></a:solidFill></a:tcPr></a:tc>"#);
+    rows_xml.push_str("</a:tr>");
+
+    let table_frame = make_table_graphic_frame(0, 0, 3657600, 370840, &[3657600], &rows_xml);
+    let slide = make_slide_xml(&[table_frame]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide]);
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let table = table_element(&page.elements[0]);
+    assert_eq!(
+        table.rows[0].cells[0].background,
+        Some(Color::new(0, 255, 0))
+    );
+}
+
+#[test]
+fn a_slide_table_cell_preserves_its_fill_alpha() {
+    let rows_xml = concat!(
+        r#"<a:tr h="370840"><a:tc><a:txBody><a:bodyPr/><a:p><a:r>"#,
+        r#"<a:rPr lang="en-US"/><a:t>Translucent</a:t></a:r></a:p></a:txBody>"#,
+        r#"<a:tcPr><a:solidFill><a:srgbClr val="00FF00"><a:alpha val="50000"/>"#,
+        r#"</a:srgbClr></a:solidFill></a:tcPr></a:tc></a:tr>"#,
+    );
+    let table_frame = make_table_graphic_frame(0, 0, 3_657_600, 370_840, &[3_657_600], rows_xml);
+    let slide = make_slide_xml(&[table_frame]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide]);
+
+    let (doc, _warnings) = PptxParser.parse(&data, &ConvertOptions::default()).unwrap();
+    let table = table_element(&first_fixed_page(&doc).elements[0]);
+
+    assert_eq!(
+        table.rows[0].cells[0].background,
+        Some(Color::new(0, 255, 0))
+    );
+    assert_eq!(table.rows[0].cells[0].background_alpha, Some(0.5));
+}
+
+#[test]
+fn test_slide_table_with_cell_borders() {
+    let mut rows_xml = String::new();
+    rows_xml.push_str(r#"<a:tr h="370840">"#);
+    rows_xml.push_str(r#"<a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="en-US"/><a:t>Bordered</a:t></a:r></a:p></a:txBody><a:tcPr><a:lnL w="12700"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:lnL><a:lnR w="12700"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:lnR><a:lnT w="12700"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:lnT><a:lnB w="12700"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:lnB></a:tcPr></a:tc>"#);
+    rows_xml.push_str("</a:tr>");
+
+    let table_frame = make_table_graphic_frame(0, 0, 3657600, 370840, &[3657600], &rows_xml);
+    let slide = make_slide_xml(&[table_frame]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide]);
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let table = table_element(&page.elements[0]);
+
+    let border = table.rows[0].cells[0]
+        .border
+        .as_ref()
+        .expect("Expected border");
+    assert!(border.left.is_some());
+    assert!(border.right.is_some());
+    assert!(border.top.is_some());
+    assert!(border.bottom.is_some());
+    let left = border.left.as_ref().unwrap();
+    assert!((left.width - 1.0).abs() < 0.1);
+    assert_eq!(left.color, Color::new(0, 0, 0));
+}
+
+#[test]
+fn test_slide_table_cell_border_dash_styles() {
+    let mut rows_xml = String::new();
+    rows_xml.push_str(r#"<a:tr h="370840">"#);
+    rows_xml.push_str(r#"<a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="en-US"/><a:t>Dashed</a:t></a:r></a:p></a:txBody><a:tcPr>"#);
+    rows_xml.push_str(r#"<a:lnT w="12700"><a:solidFill><a:srgbClr val="000000"/></a:solidFill><a:prstDash val="dash"/></a:lnT>"#);
+    rows_xml.push_str(r#"<a:lnB w="12700"><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill><a:prstDash val="dot"/></a:lnB>"#);
+    rows_xml.push_str(r#"</a:tcPr></a:tc>"#);
+    rows_xml.push_str("</a:tr>");
+
+    let table_frame = make_table_graphic_frame(0, 0, 3657600, 370840, &[3657600], &rows_xml);
+    let slide = make_slide_xml(&[table_frame]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide]);
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let table = table_element(&page.elements[0]);
+    let border = table.rows[0].cells[0]
+        .border
+        .as_ref()
+        .expect("Expected border");
+    assert_eq!(
+        border.top.as_ref().expect("Expected top border").style,
+        BorderLineStyle::Dashed
+    );
+    assert_eq!(
+        border
+            .bottom
+            .as_ref()
+            .expect("Expected bottom border")
+            .style,
+        BorderLineStyle::Dotted
+    );
+}
+
+#[test]
+fn test_slide_table_coexists_with_shapes() {
+    let text_box = make_text_box(0, 0, 914400, 457200, "Header");
+    let rows = make_table_row(&["Cell"]);
+    let table_frame = make_table_graphic_frame(0, 914400, 914400, 370840, &[914400], &rows);
+    let slide = make_slide_xml(&[text_box, table_frame]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide]);
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    assert_eq!(page.elements.len(), 2);
+    assert!(matches!(
+        &page.elements[0].kind,
+        FixedElementKind::TextBox(_)
+    ));
+    assert!(matches!(&page.elements[1].kind, FixedElementKind::Table(_)));
+}
+
+#[test]
+fn test_stale_small_frame_extent_does_not_shrink_row_heights() {
+    // Generators often leave the graphicFrame extent stale (smaller than the
+    // declared row heights). PowerPoint grows the table to its intrinsic
+    // height instead of compressing rows, so tr h acts as a minimum.
+    let rows_xml = format!(
+        "{}{}",
+        make_table_row_with_height(685_800, &["A1", "B1"]),
+        make_table_row_with_height(685_800, &["A2", "B2"]),
+    );
+    let table_frame = make_table_graphic_frame(
+        914_400,
+        914_400,
+        3_657_600,
+        914_400, // stale: much smaller than the 1_371_600 EMU row sum
+        &[1_828_800, 1_828_800],
+        &rows_xml,
+    );
+    let slide = make_slide_xml(&[table_frame]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide]);
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let table = table_element(&page.elements[0]);
+
+    assert_eq!(table.rows[0].height, None);
+    assert_eq!(table.rows[1].height, None);
+    assert_eq!(table.rows[0].minimum_height, Some(54.0));
+    assert_eq!(table.rows[1].minimum_height, Some(54.0));
+}
+
+fn make_table_row_with_height(h_emu: i64, cells: &[&str]) -> String {
+    let mut xml = format!(r#"<a:tr h="{h_emu}">"#);
+    for text in cells {
+        xml.push_str(&format!(
+            r#"<a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="en-US"/><a:t>{text}</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc>"#
+        ));
+    }
+    xml.push_str("</a:tr>");
+    xml
+}
+
+/// A slide table cell reads its paragraph marks by the same rule a text box
+/// does (issue #1645).
+///
+/// The two parsers keep separate paragraph-assembly state machines, so a rule
+/// that only lands in one of them drifts — the cell would keep putting the
+/// theme's minor Latin font on a line whose run names its own face.
+#[test]
+fn an_undeclared_cell_paragraph_mark_adds_no_face_to_the_line() {
+    let cell = concat!(
+        r#"<a:tc><a:txBody><a:bodyPr/><a:lstStyle/>"#,
+        r#"<a:p><a:r><a:rPr lang="en-US"><a:latin typeface="Verdana"/></a:rPr><a:t>Manager</a:t></a:r></a:p>"#,
+        r#"</a:txBody><a:tcPr/></a:tc>"#,
+    );
+    let para = only_cell_paragraph(cell);
+
+    assert_eq!(
+        para.runs[0].style.font_family.as_deref(),
+        Some("Verdana"),
+        "the run keeps the face it declares"
+    );
+    assert_eq!(
+        para.style.paragraph_mark_font_family.as_deref(),
+        Some("Verdana"),
+        "a cell paragraph writing no <a:endParaRPr> keeps its run's own face          instead of adding the theme's minor Latin font to the line"
+    );
+}
+
+/// The other branch in a table cell: a mark element that is present but names
+/// no typeface still falls to the theme's minor Latin font (issue #1176).
+#[test]
+fn a_present_but_bare_cell_paragraph_mark_takes_the_theme_minor_latin_font() {
+    let cell = concat!(
+        r#"<a:tc><a:txBody><a:bodyPr/><a:lstStyle/>"#,
+        r#"<a:p><a:r><a:rPr lang="en-US"><a:latin typeface="Verdana"/></a:rPr><a:t>Manager</a:t></a:r>"#,
+        r#"<a:endParaRPr lang="en-US"/></a:p>"#,
+        r#"</a:txBody><a:tcPr/></a:tc>"#,
+    );
+    let para = only_cell_paragraph(cell);
+
+    assert_eq!(
+        para.style.paragraph_mark_font_family.as_deref(),
+        Some("Calibri"),
+        "a present mark declaring no typeface still takes the theme's minor          Latin font"
+    );
+}
+
+/// The single paragraph of a one-cell table built from `cell_xml`, parsed
+/// against a theme whose minor Latin font is Calibri.
+fn only_cell_paragraph(cell_xml: &str) -> Paragraph {
+    let rows_xml = format!(r#"<a:tr h="370840">{cell_xml}</a:tr>"#);
+    let table_frame =
+        make_table_graphic_frame(914400, 914400, 1828800, 370840, &[1828800], &rows_xml);
+    let slide = make_slide_xml(&[table_frame]);
+    let theme_xml = make_theme_xml(&standard_theme_colors(), "Gill Sans MT", "Calibri");
+    let data = build_test_pptx_with_theme(SLIDE_CX, SLIDE_CY, &[slide], &theme_xml);
+
+    let (doc, _warnings) = PptxParser.parse(&data, &ConvertOptions::default()).unwrap();
+    let table = table_element(&first_fixed_page(&doc).elements[0]);
+    match &table.rows[0].cells[0].content[0] {
+        Block::Paragraph(para) => para.clone(),
+        other => panic!("Expected a paragraph in the cell, got {other:?}"),
+    }
+}
+
+/// A run inside a slide table cell that declares its own `<a:latin>` paints in
+/// that face, whatever the cell's `<a:lstStyle>` named (issue #1838).
+///
+/// The cell seeds every run from the list style's defaults, and
+/// `apply_typeface_to_style` writes a slot only while it is still empty, so
+/// without clearing the inherited face first the run's own declaration is
+/// silently dropped. The text-box parser already clears it; the table parser
+/// is the second copy of the same paragraph state machine.
+#[test]
+fn a_cell_run_declaring_its_own_latin_typeface_overrides_the_list_style_face() {
+    let cell = concat!(
+        r#"<a:tc><a:txBody><a:bodyPr/>"#,
+        r#"<a:lstStyle><a:lvl1pPr><a:defRPr sz="1800">"#,
+        r#"<a:latin typeface="Gill Sans MT"/>"#,
+        r#"</a:defRPr></a:lvl1pPr></a:lstStyle>"#,
+        r#"<a:p><a:r><a:rPr lang="en-US"><a:latin typeface="Verdana"/></a:rPr>"#,
+        r#"<a:t>Manager</a:t></a:r></a:p>"#,
+        r#"</a:txBody><a:tcPr/></a:tc>"#,
+    );
+    let para = only_cell_paragraph(cell);
+
+    assert_eq!(
+        para.runs[0].style.font_family.as_deref(),
+        Some("Verdana"),
+        "the run's own <a:latin> outranks the face its cell's list style named"
+    );
+}
+
+/// Triangulation for the rule above: the face the run declares is whatever it
+/// wrote, not one particular family, and the list style's face is likewise not
+/// one particular family.
+#[test]
+fn a_cell_run_latin_typeface_wins_for_any_pair_of_families() {
+    let cell = concat!(
+        r#"<a:tc><a:txBody><a:bodyPr/>"#,
+        r#"<a:lstStyle><a:lvl1pPr><a:defRPr sz="1800">"#,
+        r#"<a:latin typeface="Courier New"/>"#,
+        r#"</a:defRPr></a:lvl1pPr></a:lstStyle>"#,
+        r#"<a:p><a:r><a:rPr lang="en-US"><a:latin typeface="Georgia"/></a:rPr>"#,
+        r#"<a:t>Owner</a:t></a:r></a:p>"#,
+        r#"</a:txBody><a:tcPr/></a:tc>"#,
+    );
+    let para = only_cell_paragraph(cell);
+
+    assert_eq!(
+        para.runs[0].style.font_family.as_deref(),
+        Some("Georgia"),
+        "the rule is the run's own face, not one particular family"
+    );
+}
+
+/// The East Asian slot follows the same rule as the Latin one: a run's own
+/// `<a:ea>` replaces the list style's (issue #1838).
+#[test]
+fn a_cell_run_declaring_its_own_east_asian_typeface_overrides_the_list_style_face() {
+    let cell = concat!(
+        r#"<a:tc><a:txBody><a:bodyPr/>"#,
+        r#"<a:lstStyle><a:lvl1pPr><a:defRPr sz="1800">"#,
+        r#"<a:ea typeface="MS PGothic"/>"#,
+        r#"</a:defRPr></a:lvl1pPr></a:lstStyle>"#,
+        r#"<a:p><a:r><a:rPr lang="ja-JP"><a:ea typeface="Yu Gothic"/></a:rPr>"#,
+        r#"<a:t>部長</a:t></a:r></a:p>"#,
+        r#"</a:txBody><a:tcPr/></a:tc>"#,
+    );
+    let para = only_cell_paragraph(cell);
+
+    assert_eq!(
+        para.runs[0].style.east_asian_font_family.as_deref(),
+        Some("Yu Gothic"),
+        "the run's own <a:ea> outranks the face its cell's list style named"
+    );
+}
+
+/// A cell paragraph's own `<a:pPr>/<a:defRPr>` outranks its list style for
+/// every run that leaves the property out, exactly as in a text box (issue
+/// #2157). Native PowerPoint draws such a cell run at the paragraph's 12pt
+/// and in its Arial although the cell's list style says 24pt Times New Roman
+/// (`scripts/probes/issue-2157-table-cell-paragraph-default.json`).
+#[test]
+fn a_cell_paragraph_default_outranks_the_list_style_for_runs_that_omit_it() {
+    let cell = concat!(
+        r#"<a:tc><a:txBody><a:bodyPr/>"#,
+        r#"<a:lstStyle><a:lvl1pPr><a:defRPr sz="2400">"#,
+        r#"<a:solidFill><a:srgbClr val="000000"/></a:solidFill>"#,
+        r#"<a:latin typeface="Times New Roman"/>"#,
+        r#"</a:defRPr></a:lvl1pPr></a:lstStyle>"#,
+        r#"<a:p><a:pPr algn="l"><a:defRPr sz="1200" b="1">"#,
+        r#"<a:solidFill><a:srgbClr val="C00000"/></a:solidFill>"#,
+        r#"<a:latin typeface="Arial"/></a:defRPr></a:pPr>"#,
+        r#"<a:r><a:rPr lang="en-US"/><a:t>Inherits </a:t></a:r>"#,
+        r#"<a:r><a:rPr lang="en-US" sz="1600"><a:latin typeface="Verdana"/></a:rPr>"#,
+        r#"<a:t>overrides</a:t></a:r></a:p>"#,
+        r#"</a:txBody><a:tcPr/></a:tc>"#,
+    );
+    let para = only_cell_paragraph(cell);
+
+    let inherits = &para.runs[0].style;
+    assert_eq!(inherits.font_size, Some(12.0));
+    assert_eq!(inherits.bold, Some(true));
+    assert_eq!(inherits.color, Some(Color::new(0xC0, 0x00, 0x00)));
+    assert_eq!(inherits.font_family.as_deref(), Some("Arial"));
+
+    let overrides = &para.runs[1].style;
+    assert_eq!(overrides.font_size, Some(16.0));
+    assert_eq!(overrides.bold, Some(true));
+    assert_eq!(overrides.font_family.as_deref(), Some("Verdana"));
+}
+
+/// Triangulation for the rule above with the self-closing form, and a sibling
+/// paragraph with no `<a:defRPr>` of its own keeps the list style's size.
+#[test]
+fn a_cell_paragraph_default_stays_inside_its_own_paragraph() {
+    let cell = concat!(
+        r#"<a:tc><a:txBody><a:bodyPr/>"#,
+        r#"<a:lstStyle><a:lvl1pPr><a:defRPr sz="2400"/></a:lvl1pPr></a:lstStyle>"#,
+        r#"<a:p><a:pPr><a:defRPr sz="900"/></a:pPr>"#,
+        r#"<a:r><a:rPr lang="en-US"/><a:t>Small</a:t></a:r></a:p>"#,
+        r#"<a:p><a:r><a:rPr lang="en-US"/><a:t>List style</a:t></a:r></a:p>"#,
+        r#"</a:txBody><a:tcPr/></a:tc>"#,
+    );
+    let rows_xml = format!(r#"<a:tr h="370840">{cell}</a:tr>"#);
+    let table_frame =
+        make_table_graphic_frame(914400, 914400, 1828800, 370840, &[1828800], &rows_xml);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[make_slide_xml(&[table_frame])]);
+    let (doc, _warnings) = PptxParser.parse(&data, &ConvertOptions::default()).unwrap();
+    let table = table_element(&first_fixed_page(&doc).elements[0]);
+
+    let sizes: Vec<Option<f64>> = table.rows[0].cells[0]
+        .content
+        .iter()
+        .map(|block| match block {
+            Block::Paragraph(para) => para.runs[0].style.font_size,
+            other => panic!("Expected a paragraph in the cell, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(sizes, vec![Some(9.0), Some(24.0)]);
+}
+
+/// A cell run that declares no typeface at all still inherits the list
+/// style's face — the override is keyed on the run's own declaration, not on
+/// entering `<a:rPr>` (issue #1838).
+#[test]
+fn a_cell_run_declaring_no_typeface_keeps_the_list_style_face() {
+    let cell = concat!(
+        r#"<a:tc><a:txBody><a:bodyPr/>"#,
+        r#"<a:lstStyle><a:lvl1pPr><a:defRPr sz="1800">"#,
+        r#"<a:latin typeface="Gill Sans MT"/><a:ea typeface="MS PGothic"/>"#,
+        r#"</a:defRPr></a:lvl1pPr></a:lstStyle>"#,
+        r#"<a:p><a:r><a:rPr lang="en-US" b="1"/>"#,
+        r#"<a:t>Manager</a:t></a:r></a:p>"#,
+        r#"</a:txBody><a:tcPr/></a:tc>"#,
+    );
+    let para = only_cell_paragraph(cell);
+
+    assert_eq!(
+        para.runs[0].style.font_family.as_deref(),
+        Some("Gill Sans MT"),
+        "a run naming no Latin face keeps the one it inherits"
+    );
+    assert_eq!(
+        para.runs[0].style.east_asian_font_family.as_deref(),
+        Some("MS PGothic"),
+        "a run naming no East Asian face keeps the one it inherits"
+    );
+}
+
+/// The paragraph mark reads its face by the same rule: an `<a:endParaRPr>`
+/// that declares a typeface overrides the list style's (issue #1838).
+#[test]
+fn a_cell_paragraph_mark_declaring_its_own_latin_typeface_overrides_the_list_style_face() {
+    let cell = concat!(
+        r#"<a:tc><a:txBody><a:bodyPr/>"#,
+        r#"<a:lstStyle><a:lvl1pPr><a:defRPr sz="1800">"#,
+        r#"<a:latin typeface="Gill Sans MT"/>"#,
+        r#"</a:defRPr></a:lvl1pPr></a:lstStyle>"#,
+        r#"<a:p><a:r><a:rPr lang="en-US"><a:latin typeface="Verdana"/></a:rPr>"#,
+        r#"<a:t>Manager</a:t></a:r>"#,
+        r#"<a:endParaRPr lang="en-US"><a:latin typeface="Georgia"/></a:endParaRPr></a:p>"#,
+        r#"</a:txBody><a:tcPr/></a:tc>"#,
+    );
+    let para = only_cell_paragraph(cell);
+
+    assert_eq!(
+        para.style.paragraph_mark_font_family.as_deref(),
+        Some("Georgia"),
+        "the mark's own <a:latin> outranks the face its cell's list style named"
+    );
+}
+
+/// A second `<a:latin>` inside one `<a:rPr>` must not undo the first: the
+/// clear happens once per run-property element, so the first declaration still
+/// wins the way `apply_typeface_to_style` intends (issue #1838).
+#[test]
+fn a_repeated_latin_typeface_in_one_cell_run_keeps_the_first_declaration() {
+    let cell = concat!(
+        r#"<a:tc><a:txBody><a:bodyPr/>"#,
+        r#"<a:lstStyle><a:lvl1pPr><a:defRPr sz="1800">"#,
+        r#"<a:latin typeface="Gill Sans MT"/>"#,
+        r#"</a:defRPr></a:lvl1pPr></a:lstStyle>"#,
+        r#"<a:p><a:r><a:rPr lang="en-US">"#,
+        r#"<a:latin typeface="Verdana"/><a:latin typeface="Courier New"/>"#,
+        r#"</a:rPr><a:t>Manager</a:t></a:r></a:p>"#,
+        r#"</a:txBody><a:tcPr/></a:tc>"#,
+    );
+    let para = only_cell_paragraph(cell);
+
+    assert_eq!(
+        para.runs[0].style.font_family.as_deref(),
+        Some("Verdana"),
+        "the first <a:latin> of one <a:rPr> wins, and a later one neither \
+         clears it nor restores the inherited face"
+    );
+}

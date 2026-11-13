@@ -1,0 +1,4256 @@
+use super::*;
+use crate::ir::WordCompatibilityMode;
+
+fn empty_paragraph_metric_run(font_family: &str, font_size_pt: f64) -> Run {
+    Run {
+        text: String::new(),
+        style: TextStyle {
+            font_family: Some(font_family.into()),
+            font_size: Some(font_size_pt),
+            ..TextStyle::default()
+        },
+        href: None,
+        footnote: None,
+        inline_box: None,
+    }
+}
+
+#[test]
+fn test_generate_plain_paragraph() {
+    let doc = make_doc(vec![make_flow_page(vec![make_paragraph("Hello World")])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(result.contains("Hello World"));
+}
+
+#[test]
+fn test_generate_first_line_indent_for_flow_paragraph() {
+    let mut paragraph = make_paragraph("Indented first line");
+    let Block::Paragraph(paragraph) = &mut paragraph else {
+        unreachable!();
+    };
+    paragraph.style.indent_first_line = Some(12.0);
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(
+        paragraph.clone(),
+    )])]);
+
+    let source = generate_typst(&doc).unwrap().source;
+
+    assert!(
+        source.contains("#par(first-line-indent: (amount: 12pt, all: true))["),
+        "Word first-line indentation must reach the flow paragraph: {source}"
+    );
+    assert!(source.contains("Indented first line"));
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn test_first_line_indent_does_not_change_baseline_after_page_break() {
+    let compiled_baseline = |first_line_indent: Option<f64>| -> f64 {
+        let mut after_page_break = make_paragraph("After page break");
+        let Block::Paragraph(paragraph) = &mut after_page_break else {
+            unreachable!();
+        };
+        paragraph.style.space_before = Some(60.0);
+        paragraph.style.indent_first_line = first_line_indent;
+        let doc = make_doc(vec![make_flow_page(vec![
+            Block::PageBreak,
+            after_page_break,
+        ])]);
+        let source = generate_typst(&doc).unwrap().source;
+        crate::render::pdf::compiled_text_runs(&source, 1)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.text.contains("After page break"))
+            .expect("the paragraph must render after the page break")
+            .baseline_pt
+    };
+
+    let plain_baseline: f64 = compiled_baseline(None);
+    let indented_baseline: f64 = compiled_baseline(Some(56.7));
+    assert!(
+        (plain_baseline - indented_baseline).abs() < 0.05,
+        "first-line indentation changes only the horizontal start, not the baseline: plain={plain_baseline}pt, indented={indented_baseline}pt"
+    );
+}
+
+/// Word lets a paragraph hang into the margin: every line starts at the
+/// margin plus the signed `w:ind w:left`, the first line also plus its signed
+/// first-line offset, and a negative `w:right` moves the line end past the
+/// right margin (issue #2233). Main clamped both indents to zero.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_negative_paragraph_indent_hangs_its_lines_into_the_margin() {
+    let compiled_runs = |left: Option<f64>,
+                         right: Option<f64>,
+                         first_line: Option<f64>,
+                         alignment: Option<Alignment>,
+                         text: &str|
+     -> Vec<crate::render::pdf::PlacedTextRun> {
+        let mut block = make_paragraph(text);
+        let Block::Paragraph(paragraph) = &mut block else {
+            unreachable!();
+        };
+        paragraph.style.indent_left = left;
+        paragraph.style.indent_right = right;
+        paragraph.style.indent_first_line = first_line;
+        paragraph.style.alignment = alignment;
+        let source = generate_typst(&make_doc(vec![make_flow_page(vec![block])]))
+            .unwrap()
+            .source;
+        crate::render::pdf::compiled_text_runs(&source, 0).unwrap()
+    };
+    // Each line's left edge, top to bottom, for a paragraph that wraps.
+    let line_starts = |left: Option<f64>, first_line: Option<f64>| -> Vec<f64> {
+        let text: String = "Word lets a paragraph hang into the margin. ".repeat(14);
+        let mut lines: Vec<(f64, f64)> = Vec::new();
+        for run in compiled_runs(left, None, first_line, None, &text) {
+            match lines
+                .iter_mut()
+                .find(|(baseline, _)| (baseline - run.baseline_pt).abs() < 0.01)
+            {
+                Some((_, start)) => *start = start.min(run.left_pt),
+                None => lines.push((run.baseline_pt, run.left_pt)),
+            }
+        }
+        lines.into_iter().map(|(_, start)| start).collect()
+    };
+    // A4 with 72pt margins: the text column runs from 72pt to 523.28pt. Each
+    // case is a left and a first-line indent, then where the first and the
+    // later lines start.
+    let cases: [(&str, f64, f64, f64, f64); 4] = [
+        ("left -36", -36.0, 0.0, 36.0, 36.0),
+        ("left -36, firstLine 40", -36.0, 40.0, 76.0, 36.0),
+        ("left -36, hanging 18", -36.0, -18.0, 18.0, 36.0),
+        ("left 20", 20.0, 0.0, 92.0, 92.0),
+    ];
+    for (case, left, first_line, first_start, continuation_start) in cases {
+        let starts: Vec<f64> = line_starts(Some(left), Some(first_line));
+        assert!(
+            starts.len() >= 3
+                && (starts[0] - first_start).abs() < 0.05
+                && starts[1..]
+                    .iter()
+                    .all(|start| (start - continuation_start).abs() < 0.05),
+            "{case}: the first line must start at {first_start}pt and the rest at {continuation_start}pt, got {starts:?}"
+        );
+    }
+
+    let right_aligned_start = |right: Option<f64>| -> f64 {
+        compiled_runs(None, right, None, Some(Alignment::Right), "Right")
+            .into_iter()
+            .find(|run| run.text == "Right")
+            .expect("the right-aligned line should be placed")
+            .left_pt
+    };
+    let no_indent: f64 = right_aligned_start(None);
+    for (right, shift) in [(-18.0, 18.0), (18.0, -18.0)] {
+        let moved: f64 = right_aligned_start(Some(right)) - no_indent;
+        assert!(
+            (moved - shift).abs() < 0.05,
+            "a {right}pt right indent must move a right-aligned line {shift}pt, got {moved}pt"
+        );
+    }
+}
+
+/// docxide-pdf `paragraph-offset-frame-no-frame` (`spaced_section_mark.docx`)
+/// and `paragraph-offset-frame-immediate` (`offset_text_frame.docx`),
+/// unmodified: "About providing information" has `w:ind w:left="-1418"
+/// w:firstLine="1560"`, -70.9pt and +78pt. Word starts it at 92.05pt in the
+/// body, 85.05pt − 70.9pt + 78pt, and at 72.28pt in the text-anchored frame
+/// that `w:x` starts at 65.3pt; main started both 71pt to the right
+/// (issue #2233).
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_paragraph_hanging_into_the_margin_starts_where_word_starts_it() {
+    use crate::parser::Parser;
+
+    let cases: [(&str, &[u8], f64); 2] = [
+        (
+            "body",
+            include_bytes!("../../../../tests/fixtures/docx/docxide/spaced_section_mark.docx"),
+            92.05,
+        ),
+        (
+            "text frame",
+            include_bytes!("../../../../tests/fixtures/docx/docxide/offset_text_frame.docx"),
+            72.28,
+        ),
+    ];
+    for (place, fixture, word_start) in cases {
+        let (document, _) = crate::parser::docx::DocxParser
+            .parse(fixture, &crate::config::ConvertOptions::default())
+            .expect("the fixture should parse");
+        let source = generate_typst(&document).unwrap().source;
+        let start: f64 = crate::render::pdf::compiled_text_runs(&source, 0)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.text.starts_with("About"))
+            .expect("the hanging paragraph should be placed")
+            .left_pt;
+        assert!(
+            (start - word_start).abs() < 0.25,
+            "{place}: Word starts the paragraph at {word_start}pt, got {start}pt"
+        );
+    }
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn docx_terminal_line_break_keeps_the_final_blank_line() {
+    for line_height in [14.0, 20.0] {
+        for break_count in 0..=3 {
+            for has_text_before_break in [false, true] {
+                let paragraph = |text: String| {
+                    let mut block = make_paragraph(&text);
+                    let Block::Paragraph(para) = &mut block else {
+                        unreachable!();
+                    };
+                    para.style.line_spacing = Some(LineSpacing::Exact(line_height));
+                    para.style.space_before = Some(0.0);
+                    para.style.space_after = Some(0.0);
+                    for run in &mut para.runs {
+                        run.style.font_family = Some("Arial".into());
+                        run.style.font_size = Some(12.0);
+                    }
+                    if text.is_empty() {
+                        para.runs.clear();
+                    }
+                    block
+                };
+                let mut blocks = vec![paragraph("Report start".into())];
+                let blank_lines = "\n".repeat(break_count);
+                if has_text_before_break {
+                    let Block::Paragraph(first) = &mut blocks[0] else {
+                        unreachable!();
+                    };
+                    first.runs[0].text.push_str(&blank_lines);
+                } else {
+                    blocks.push(paragraph(blank_lines));
+                }
+                blocks.push(paragraph("Report end".into()));
+                let doc = make_doc(vec![make_flow_page(blocks)]);
+                let source = generate_typst(&doc).unwrap().source;
+                let runs = crate::render::pdf::compiled_text_runs(&source, 0).unwrap();
+                let baseline = |label: &str| {
+                    runs.iter()
+                        .find(|run| run.text.contains(label))
+                        .unwrap()
+                        .baseline_pt
+                };
+                let expected_lines = break_count + if has_text_before_break { 1 } else { 2 };
+                let actual_gap = baseline("Report end") - baseline("Report start");
+                assert!(
+                    (actual_gap - expected_lines as f64 * line_height).abs() < 0.05,
+                    "terminal breaks retain the paragraph mark's blank line: height={line_height}, breaks={break_count}, text={has_text_before_break}, gap={actual_gap}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn docx_terminal_line_break_fixture_preserves_report_spacing() {
+    use crate::parser::Parser;
+    let data = include_bytes!("../../../../tests/fixtures/docx/terminal_line_break.docx");
+    let (document, _) = crate::parser::docx::DocxParser
+        .parse(data, &crate::ConvertOptions::default())
+        .unwrap();
+    let source = generate_typst(&document).unwrap().source;
+    let runs = crate::render::pdf::compiled_text_runs(&source, 0).unwrap();
+    let baseline = |label: &str| {
+        runs.iter()
+            .find(|run| run.text.contains(label))
+            .unwrap()
+            .baseline_pt
+    };
+    // Native Word reserves two exact 20pt blank lines for this break-only paragraph.
+    assert!((baseline("Report end") - baseline("Report start") - 60.0).abs() < 0.05);
+}
+
+#[test]
+fn test_generate_empty_paragraph_reserves_line_height() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: Vec::new(),
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+
+    assert!(
+        result.contains("#v(12pt)"),
+        "empty DOCX paragraph marks should reserve vertical flow space: {result}"
+    );
+}
+
+#[test]
+fn empty_paragraph_line_spacing_does_not_add_leading_to_its_placeholder() {
+    let mut empty_paragraph = make_paragraph("");
+    let Block::Paragraph(paragraph) = &mut empty_paragraph else {
+        unreachable!("make_paragraph returns a paragraph block");
+    };
+    paragraph.runs.clear();
+    paragraph.style.line_spacing = Some(LineSpacing::Proportional(1.079));
+    let mark_run: Run =
+        empty_paragraph_metric_run(crate::defaults::TYPST_DEFAULT_FONT_FAMILY, 11.0);
+    paragraph.style.paragraph_mark_text_style = Some(Box::new(mark_run.style.clone()));
+
+    let (top_edge_em, bottom_edge_em) =
+        super::word_line_box_em(std::slice::from_ref(&mark_run), &paragraph.style, None)
+            .expect("an empty paragraph mark still has a Word line box");
+    let expected_line_height_pt: f64 = (top_edge_em + bottom_edge_em) * 11.0;
+    let expected_placeholder: String = format!(
+        "#v({}pt)",
+        crate::render::typst_gen::fmt::format_f64(expected_line_height_pt)
+    );
+
+    let doc = make_doc(vec![make_flow_page(vec![empty_paragraph])]);
+    let result = generate_typst(&doc).unwrap().source;
+
+    assert!(
+        result.contains(&expected_placeholder),
+        "the blank paragraph reserves its Word line advance: {result}"
+    );
+    assert!(
+        !result.contains("#set par(leading:") && !result.contains("#set text(top-edge:"),
+        "an explicit empty-paragraph strut must not create a text baseline: {result}"
+    );
+}
+
+/// An empty paragraph that states no `w:spacing w:line` is single spaced.
+///
+/// ECMA-376 makes an absent `w:line` single spacing (240 twips, `auto`),
+/// and Word gives an empty paragraph the line its paragraph mark would take:
+/// the mark's face and size, under the paragraph's line spacing. So in a run
+/// of same-face paragraphs with no spacing between them, a blank paragraph
+/// advances the next line by exactly one more line pitch — `ALPHA`, blank,
+/// `BRAVO` puts `BRAVO` two pitches below `ALPHA`. A mark in a larger size
+/// takes that size's line instead: 20pt Arial is 20/12 of 12pt Arial's.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn empty_paragraph_without_line_spacing_takes_its_mark_line() {
+    let arial = |size_pt: f64| TextStyle {
+        font_family: Some("Arial".to_string()),
+        font_size: Some(size_pt),
+        ..TextStyle::default()
+    };
+    let text_paragraph = |text: &str| {
+        Block::Paragraph(Paragraph {
+            style: ParagraphStyle::default(),
+            runs: vec![Run {
+                text: text.to_string(),
+                style: arial(12.0),
+                href: None,
+                footnote: None,
+                inline_box: None,
+            }],
+        })
+    };
+    let empty_paragraph = |mark_size_pt: f64| {
+        Block::Paragraph(Paragraph {
+            style: ParagraphStyle {
+                paragraph_mark_text_style: Some(Box::new(arial(mark_size_pt))),
+                ..ParagraphStyle::default()
+            },
+            runs: Vec::new(),
+        })
+    };
+    let bravo_below_alpha_pt = |content: Vec<Block>| -> f64 {
+        let doc = make_doc(vec![make_flow_page(content)]);
+        let source: String = generate_typst(&doc).unwrap().source;
+        let runs = crate::render::pdf::compiled_text_runs(&source, 0)
+            .unwrap_or_else(|error| panic!("compile failed: {error}\n{source}"));
+        let baseline = |needle: &str| -> f64 {
+            runs.iter()
+                .find(|run| run.text.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} must be placed"))
+                .baseline_pt
+        };
+        baseline("BRAVO") - baseline("ALPHA")
+    };
+
+    let pitch_pt: f64 =
+        bravo_below_alpha_pt(vec![text_paragraph("ALPHA"), text_paragraph("BRAVO")]);
+    let with_blank_pt: f64 = bravo_below_alpha_pt(vec![
+        text_paragraph("ALPHA"),
+        empty_paragraph(12.0),
+        text_paragraph("BRAVO"),
+    ]);
+    assert!(
+        (with_blank_pt - 2.0 * pitch_pt).abs() < 0.01,
+        "a single-spaced blank 12pt Arial line must advance one {pitch_pt}pt pitch, \
+         but BRAVO sits {with_blank_pt}pt below ALPHA"
+    );
+
+    let with_large_blank_pt: f64 = bravo_below_alpha_pt(vec![
+        text_paragraph("ALPHA"),
+        empty_paragraph(20.0),
+        text_paragraph("BRAVO"),
+    ]);
+    let expected_pt: f64 = pitch_pt + pitch_pt * 20.0 / 12.0;
+    assert!(
+        (with_large_blank_pt - expected_pt).abs() < 0.01,
+        "a blank line whose mark is 20pt must take 20pt Arial's line, \
+         expected {expected_pt}pt, got {with_large_blank_pt}pt"
+    );
+}
+
+/// Word paces and seats single-spaced lines by the `hhea` of the face the run
+/// names, not the face that paints it. A host without Tahoma paints Tahoma and
+/// Arial with the same Liberation Sans, yet Tahoma's 2049/-423/0 line at 2048
+/// units per em is 1.2070em with its baseline 1.0005em down, and Arial's
+/// 1854/-434/67 line is 1.1499em with its baseline 0.9380em down. Laid out on
+/// the painted face, each Tahoma line advanced 4.7% short: in the header
+/// fixture with its body replaced by 40 single 10pt lines, the 40th landed
+/// 23.48pt above where Word's Tahoma puts it (issue #2247).
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn single_spaced_lines_take_the_named_faces_pitch_and_seat() {
+    let lines_in = |family: &str, size_pt: f64| -> Vec<f64> {
+        let style = TextStyle {
+            font_family: Some(family.to_string()),
+            font_size: Some(size_pt),
+            ..TextStyle::default()
+        };
+        let content: Vec<Block> = ["ALPHA", "BRAVO", "CHARLIE"]
+            .into_iter()
+            .map(|text| {
+                Block::Paragraph(Paragraph {
+                    style: ParagraphStyle::default(),
+                    runs: vec![Run {
+                        text: text.to_string(),
+                        style: style.clone(),
+                        href: None,
+                        footnote: None,
+                        inline_box: None,
+                    }],
+                })
+            })
+            .collect();
+        let doc = make_doc(vec![make_flow_page(content)]);
+        let source: String = generate_typst(&doc).unwrap().source;
+        let runs = crate::render::pdf::compiled_text_runs(&source, 0)
+            .unwrap_or_else(|error| panic!("compile failed: {error}\n{source}"));
+        ["ALPHA", "BRAVO", "CHARLIE"]
+            .into_iter()
+            .map(|needle| {
+                runs.iter()
+                    .find(|run| run.text.contains(needle))
+                    .unwrap_or_else(|| panic!("{needle} must be placed"))
+                    .baseline_pt
+            })
+            .collect()
+    };
+
+    let top_margin_pt: f64 = Margins::default().top;
+    for (family, ascender, descender, line_gap) in [
+        ("Tahoma", 2049.0, 423.0, 0.0),
+        ("Arial", 1854.0, 434.0, 67.0),
+    ] {
+        let seat_em: f64 = (ascender + line_gap) / 2048.0;
+        let pitch_em: f64 = (ascender + descender + line_gap) / 2048.0;
+        for size_pt in [7.5, 10.0, 12.0] {
+            let baselines: Vec<f64> = lines_in(family, size_pt);
+            for pair in baselines.windows(2) {
+                let advance_pt: f64 = pair[1] - pair[0];
+                assert!(
+                    (advance_pt - pitch_em * size_pt).abs() < 0.01,
+                    "{family} {size_pt}pt lines must advance {}pt, got {advance_pt}pt",
+                    pitch_em * size_pt
+                );
+            }
+            let seat_pt: f64 = baselines[0] - top_margin_pt;
+            assert!(
+                (seat_pt - seat_em * size_pt).abs() < 0.01,
+                "{family} {size_pt}pt's first baseline must sit {}pt below the margin, \
+                 got {seat_pt}pt",
+                seat_em * size_pt
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn issue_2018_empty_bodycopy_keeps_the_following_paragraph_at_the_word_baseline() {
+    use crate::parser::Parser;
+
+    const FIXTURE: &[u8] =
+        include_bytes!("../../../../tests/fixtures/docx/libreoffice/tdf105688.docx");
+    let (document, _warnings) = crate::parser::docx::DocxParser
+        .parse(FIXTURE, &crate::ConvertOptions::default())
+        .expect("the DOCX fixture should parse");
+    let mut additional_fonts: Vec<typst::text::Font> = Vec::new();
+    crate::pipeline::extend_document_fonts(&mut additional_fonts, &document);
+    let font_context: crate::render::font_context::FontSearchContext =
+        crate::render::font_context::resolve_font_search_context(&[])
+            .with_in_memory_fonts(&additional_fonts);
+    let output: crate::render::typst_gen::TypstOutput =
+        crate::render::typst_gen::generate_typst_with_options_and_font_context(
+            &document,
+            &crate::ConvertOptions::default(),
+            Some(&font_context),
+        )
+        .expect("the fixture should generate Typst");
+    let page_runs: Vec<crate::render::pdf::PlacedTextRun> =
+        crate::render::pdf::compiled_text_runs_with_fonts_and_images(
+            &output.source,
+            &output.images,
+            1,
+            &additional_fonts,
+        )
+        .expect("the second page should compile");
+    let heading_baseline_pt: f64 = page_runs
+        .iter()
+        .find(|run| run.font_size_pt == 12.0 && run.text == "Xxxxx")
+        .expect("the cyan SectionHeading should render")
+        .baseline_pt;
+    let mut body_baselines_pt: Vec<f64> = page_runs
+        .iter()
+        .filter(|run| run.font_size_pt == 8.5 && run.left_pt == 36.0)
+        .map(|run| run.baseline_pt)
+        .collect();
+    body_baselines_pt.sort_by(f64::total_cmp);
+    body_baselines_pt.dedup_by(|left, right| (*left - *right).abs() < 0.01);
+    assert!(
+        !body_baselines_pt.is_empty(),
+        "the Bodycopy paragraph should render at least one line"
+    );
+    let baseline_gap_pt: f64 = body_baselines_pt[0] - heading_baseline_pt;
+    assert!(
+        (baseline_gap_pt - 26.88).abs() <= 1.0,
+        "the paragraph after the empty Bodycopy paragraph should match Word's 26.88pt baseline gap within 1pt, got {baseline_gap_pt:.5}pt (heading {heading_baseline_pt:.5}pt, Bodycopy {:.5}pt)",
+        body_baselines_pt[0]
+    );
+}
+
+#[test]
+fn empty_paragraph_border_insets_do_not_shrink_its_shaded_line_box() {
+    let top_border: BorderSide = BorderSide {
+        width: 3.0,
+        color: Color::black(),
+        style: BorderLineStyle::Solid,
+        join: LineJoin::Round,
+        cap: LineCap::Flat,
+    };
+    let mut empty_paragraph = make_paragraph("");
+    let Block::Paragraph(paragraph) = &mut empty_paragraph else {
+        unreachable!("make_paragraph returns a paragraph block");
+    };
+    paragraph.runs.clear();
+    paragraph.style.line_spacing = Some(LineSpacing::Proportional(1.079));
+    paragraph.style.background = Some(Color::new(0xE2, 0xEF, 0xD9));
+    let mark_run: Run =
+        empty_paragraph_metric_run(crate::defaults::TYPST_DEFAULT_FONT_FAMILY, 11.0);
+    paragraph.style.paragraph_mark_text_style = Some(Box::new(mark_run.style.clone()));
+    paragraph.style.border = Some(Box::new(CellBorder {
+        top: Some(top_border.clone()),
+        bottom: Some(top_border),
+        left: None,
+        right: None,
+    }));
+    paragraph.style.border_space = Some(Box::new(Insets {
+        top: 1.0,
+        bottom: 1.0,
+        left: 0.0,
+        right: 0.0,
+    }));
+
+    let (top_edge_em, bottom_edge_em) =
+        super::word_line_box_em(std::slice::from_ref(&mark_run), &paragraph.style, None)
+            .expect("an empty paragraph mark still has a Word line box");
+    let word_line_height_pt: f64 = (top_edge_em + bottom_edge_em) * 11.0;
+    let expected_placeholder: String = format!(
+        "#v({}pt)",
+        crate::render::typst_gen::fmt::format_f64(word_line_height_pt)
+    );
+
+    let doc = make_doc(vec![make_flow_page(vec![empty_paragraph])]);
+    let result = generate_typst(&doc).unwrap().source;
+
+    assert!(
+        result.contains(&expected_placeholder),
+        "the paragraph fill keeps its full Word line box; paragraph borders overlay its edges: {result}"
+    );
+}
+
+#[test]
+fn test_generate_page_setup() {
+    let doc = make_doc(vec![Page::Flow(FlowPage {
+        first_header: None,
+        first_footer: None,
+        size: PageSize {
+            width: 612.0,
+            height: 792.0,
+        },
+        margins: Margins {
+            top: 36.0,
+            bottom: 36.0,
+            left: 54.0,
+            right: 54.0,
+        },
+        content: vec![make_paragraph("test")],
+        header: None,
+        footer: None,
+        columns: None,
+        line_grid_pitch: None,
+        line_grid_snaps_lines: false,
+        page_numbering: None,
+        page_borders: None,
+        line_numbering: None,
+        vertical_alignment: None,
+    })]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(result.contains("612pt"));
+    assert!(result.contains("792pt"));
+    assert!(result.contains("36pt"));
+    assert!(result.contains("54pt"));
+}
+
+#[test]
+fn test_generate_bold_text() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "Bold text".to_string(),
+            style: TextStyle {
+                bold: Some(true),
+                ..TextStyle::default()
+            },
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("weight: \"bold\""),
+        "Expected bold weight in: {result}"
+    );
+    assert!(result.contains("Bold text"));
+}
+
+#[test]
+fn test_generate_italic_text() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "Italic text".to_string(),
+            style: TextStyle {
+                italic: Some(true),
+                ..TextStyle::default()
+            },
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("style: \"italic\""),
+        "Expected italic style in: {result}"
+    );
+    assert!(result.contains("Italic text"));
+}
+
+#[test]
+fn test_generate_underline_text() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "Underlined".to_string(),
+            style: TextStyle {
+                underline: Some(true),
+                ..TextStyle::default()
+            },
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("#underline("),
+        "Expected underline wrapper in: {result}"
+    );
+    assert!(result.contains("Underlined"));
+    // Word draws one continuous rectangle straight through descenders. Typst
+    // skips ink by default, which chopped the rule into segments wherever a
+    // glyph descended through it (issue #641).
+    assert!(
+        result.contains("evade: false"),
+        "The underline must not evade descenders, got: {result}"
+    );
+}
+
+#[test]
+fn test_generate_font_size() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "Large text".to_string(),
+            style: TextStyle {
+                font_size: Some(24.0),
+                ..TextStyle::default()
+            },
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("size: 24pt"),
+        "Expected font size in: {result}"
+    );
+}
+
+#[test]
+fn test_generate_font_color() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "Red text".to_string(),
+            style: TextStyle {
+                color: Some(Color::new(255, 0, 0)),
+                ..TextStyle::default()
+            },
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("fill: rgb(255, 0, 0)"),
+        "Expected RGB color in: {result}"
+    );
+}
+
+#[test]
+fn test_generate_combined_text_styles() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "Styled".to_string(),
+            style: TextStyle {
+                bold: Some(true),
+                italic: Some(true),
+                font_size: Some(16.0),
+                color: Some(Color::new(0, 128, 255)),
+                ..TextStyle::default()
+            },
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(result.contains("weight: \"bold\""));
+    assert!(result.contains("style: \"italic\""));
+    assert!(result.contains("size: 16pt"));
+    assert!(result.contains("fill: rgb(0, 128, 255)"));
+    assert!(result.contains("Styled"));
+}
+
+#[test]
+fn test_generate_alignment_center() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            alignment: Some(Alignment::Center),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "Centered".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("align(center"),
+        "Expected center alignment in: {result}"
+    );
+}
+
+#[test]
+fn test_generate_alignment_right() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            alignment: Some(Alignment::Right),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "Right".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("align(right"),
+        "Expected right alignment in: {result}"
+    );
+}
+
+#[test]
+fn test_generate_alignment_justify() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            alignment: Some(Alignment::Justify),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "Justified text".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("par(justify: true") || result.contains("set par(justify: true"),
+        "Expected justify in: {result}"
+    );
+    // Typst hangs line-final punctuation into the margin when justifying.
+    // Word does not, so a justified line ending in a comma overshot the
+    // right margin by about 0.8 of the comma's advance (issue #640).
+    // Typst lets a justified line squeeze its spaces to two thirds of their
+    // natural width. Word's own exports never go below 0.9332, and on the
+    // audited letter our 0.9014 squeeze pulled one more syllable onto a line
+    // and split a Korean word across the break (issue #639).
+    assert!(
+        result.contains("justification-limits: (spacing: (min: 80%, max: 150%))"),
+        "justified text must not shrink its spaces below their natural width: {result}"
+    );
+    assert!(
+        result.contains("overhang: false"),
+        "justified text must not hang punctuation past the margin: {result}"
+    );
+}
+
+/// A justified paragraph in the compatibility mode Word declares, so the
+/// natural-width rule of issue #1130 can be switched on and off around one
+/// paragraph.
+fn justified_paragraph_document(text: &str, mode: WordCompatibilityMode) -> Document {
+    let mut doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            alignment: Some(Alignment::Justify),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: text.to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    doc.styles.word_compatibility_mode = Some(mode);
+    doc
+}
+
+/// Word's pre-2013 East Asian justification seats on a line only what fits at
+/// its natural width. Swept over eleven measures either side of the fit
+/// boundary, a native legacy export of the reported fixture refuses a 0.5pt
+/// overrun where Typst's Knuth-Plass breaker squeezes twelve word spaces to
+/// 0.9746 of natural to take one more eojeol (issue #1130).
+#[test]
+fn test_legacy_justified_east_asian_paragraph_breaks_at_natural_width() {
+    let doc = justified_paragraph_document(
+        "본 계약은 2026년 8월 체결되며 ABC 주식회사와 DEF 파트너스는 각각 임원을 파견한다",
+        WordCompatibilityMode::Legacy,
+    );
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("par(justify: true"),
+        "the paragraph is still justified: {result}"
+    );
+    assert!(
+        result.contains(r#"set par(linebreaks: "simple")"#),
+        "a legacy East Asian justified line must not compress to seat one more \
+         token: {result}"
+    );
+}
+
+/// At `compatibilityMode 15` Word does take that trade, and its compressed word
+/// space measures 3.6020pt against our 3.6019pt on the reported fixture, so the
+/// Knuth-Plass breaker is what models it (issue #1130).
+#[test]
+fn test_word_2013_justified_east_asian_paragraph_keeps_the_optimized_breaker() {
+    let doc = justified_paragraph_document(
+        "본 계약은 2026년 8월 체결되며 ABC 주식회사와 DEF 파트너스는 각각 임원을 파견한다",
+        WordCompatibilityMode::Word2013OrLater,
+    );
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        !result.contains("linebreaks:"),
+        "modern Word compresses to seat one more token, so the breaker stays: \
+         {result}"
+    );
+}
+
+/// The switch is East Asian, not legacy-wide: the same legacy export takes up
+/// to 2.5pt of overrun on its Latin paragraph, so Latin keeps the breaker that
+/// already reproduces the corpus's compressed English lines (issue #1130).
+#[test]
+fn test_legacy_justified_latin_paragraph_keeps_the_optimized_breaker() {
+    let doc = justified_paragraph_document(
+        "Monthly active users crossed 21,300 in June, up 72% since January.",
+        WordCompatibilityMode::Legacy,
+    );
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        !result.contains("linebreaks:"),
+        "legacy Latin justification compresses, so the breaker stays: {result}"
+    );
+}
+
+/// Word's legacy table-cell paragraph uses first-fit breaks, while the same
+/// Latin justification in a body paragraph retains the optimized breaker
+/// (issues #1130, #2020).
+#[test]
+fn test_legacy_justified_latin_table_cell_uses_first_fit_breaker() {
+    let paragraph: Paragraph = Paragraph {
+        style: ParagraphStyle {
+            alignment: Some(Alignment::Justify),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "Monthly active users crossed 21,300 in June, up 72% since January.".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    };
+    let table: Table = Table {
+        rows: vec![TableRow {
+            cant_split: false,
+            cells: vec![TableCell {
+                content: vec![Block::Paragraph(paragraph)],
+                ..TableCell::default()
+            }],
+            height: None,
+            minimum_height: None,
+        }],
+        column_widths: vec![180.0],
+        ..Table::default()
+    };
+    let mut doc: Document = make_doc(vec![make_flow_page(vec![Block::Table(table)])]);
+    doc.styles.word_compatibility_mode = Some(WordCompatibilityMode::Legacy);
+
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains(r#"set par(linebreaks: "simple")"#),
+        "legacy justified text in a table cell uses first-fit breaks: {result}"
+    );
+}
+
+/// The cell-specific first-fit rule belongs to Word's legacy layout engine.
+#[test]
+fn test_word_2013_justified_latin_table_cell_keeps_the_optimized_breaker() {
+    let paragraph: Paragraph = Paragraph {
+        style: ParagraphStyle {
+            alignment: Some(Alignment::Justify),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "Monthly active users crossed 21,300 in June, up 72% since January.".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    };
+    let table: Table = Table {
+        rows: vec![TableRow {
+            cant_split: false,
+            cells: vec![TableCell {
+                content: vec![Block::Paragraph(paragraph)],
+                ..TableCell::default()
+            }],
+            height: None,
+            minimum_height: None,
+        }],
+        column_widths: vec![180.0],
+        ..Table::default()
+    };
+    let mut doc: Document = make_doc(vec![make_flow_page(vec![Block::Table(table)])]);
+    doc.styles.word_compatibility_mode = Some(WordCompatibilityMode::Word2013OrLater);
+
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        !result.contains("linebreaks:"),
+        "modern Word keeps the optimized breaker for justified cell text: {result}"
+    );
+}
+
+/// A presentation and a workbook declare no such setting, and neither is laid
+/// out by Word, so both keep the modern breaker.
+#[test]
+fn test_document_without_a_compatibility_mode_keeps_the_optimized_breaker() {
+    let mut doc = justified_paragraph_document("본 계약은 체결되며", WordCompatibilityMode::Legacy);
+    doc.styles.word_compatibility_mode = None;
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        !result.contains("linebreaks:"),
+        "only a Word package states a compatibility mode: {result}"
+    );
+}
+
+#[test]
+fn test_punctuation_never_hangs_regardless_of_alignment() {
+    // The setting is document-wide, not per paragraph, because a hung glyph
+    // leaves the line's layout box: a *centred* line opening with a hyphen was
+    // measured narrow and drawn off centre, and header and footer bands never
+    // pass through the paragraph settings at all (issues #645, #646).
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            alignment: Some(Alignment::Center),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "- 1 -".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert_eq!(
+        result.matches("overhang: false").count(),
+        1,
+        "stated once for the document, not per paragraph: {result}"
+    );
+    let preamble_end = result.find("#set page").unwrap_or(result.len());
+    assert!(
+        result[..preamble_end].contains("overhang: false"),
+        "it must precede the first page so header and footer bands inherit it: {result}"
+    );
+}
+
+/// Every page format must override the backend's automatic hyphenation
+/// policy before generating any content, including headers and text boxes.
+#[test]
+fn test_hyphenation_is_off_for_every_format_by_default() {
+    let flow = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            alignment: Some(Alignment::Justify),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "Internationalization considerations notwithstanding".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let slide = make_doc(vec![make_fixed_page(
+        720.0,
+        540.0,
+        vec![make_text_box(
+            10.0,
+            10.0,
+            200.0,
+            100.0,
+            "Telecommunications infrastructure",
+        )],
+    )]);
+    let sheet = make_doc(vec![make_sheet_page(
+        "Sheet1",
+        595.0,
+        842.0,
+        Margins::default(),
+        make_simple_table(vec![vec!["Interoperability characteristics"]]),
+    )]);
+    for (format, doc) in [("DOCX", flow), ("PPTX", slide), ("XLSX", sheet)] {
+        let result = generate_typst(&doc).unwrap().source;
+        let preamble_end = result.find("#set page").unwrap_or(result.len());
+        assert!(
+            result[..preamble_end].contains("#set text(hyphenate: false)"),
+            "{format}: hyphenation must be off before the first page: {result}"
+        );
+    }
+}
+
+/// The parsed document setting must enable the renderer's hyphenation rule.
+#[test]
+fn test_document_auto_hyphenation_turns_hyphenation_on() {
+    let mut doc = make_doc(vec![make_flow_page(vec![make_paragraph(
+        "Internationalization considerations notwithstanding",
+    )])]);
+    doc.styles.hyphenates_automatically = true;
+    let result = generate_typst(&doc).unwrap().source;
+    let preamble_end = result.find("#set page").unwrap_or(result.len());
+    assert!(
+        result[..preamble_end].contains("#set text(hyphenate: true)"),
+        "auto hyphenation must reach the document text: {result}"
+    );
+    assert!(
+        !result.contains("hyphenate: false"),
+        "auto hyphenation must not also be switched off: {result}"
+    );
+}
+
+#[test]
+fn test_generate_line_spacing_proportional() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            line_spacing: Some(LineSpacing::Proportional(2.0)),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "Double spaced".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("leading:"),
+        "Expected leading setting in: {result}"
+    );
+}
+
+#[test]
+fn test_generate_line_spacing_exact() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            line_spacing: Some(LineSpacing::Exact(18.0)),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "Exact spaced".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("leading: 18pt"),
+        "Expected exact leading in: {result}"
+    );
+}
+
+#[test]
+fn test_generate_word_default_line_box() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            line_box: Some(LineBox {
+                ascent_em: 1.3125,
+                descent_em: 0.4375,
+            }),
+            space_after: Some(8.0),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "Word defaults".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let source = generate_typst(&doc).unwrap().source;
+
+    assert!(
+        source.contains("#set text(top-edge: 1.3125em, bottom-edge: -0.4375em)"),
+        "Expected Word-compatible line edges in: {source}"
+    );
+    assert!(
+        source.contains("#set par(leading: 0pt)"),
+        "Expected Word-compatible line stacking in: {source}"
+    );
+    assert!(
+        source.contains("below: 8pt"),
+        "Expected paragraph spacing in: {source}"
+    );
+}
+
+#[test]
+fn test_generate_letter_spacing() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "Spaced text".to_string(),
+            style: TextStyle {
+                letter_spacing: Some(2.0),
+                ..TextStyle::default()
+            },
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("tracking: 2pt"),
+        "Expected tracking param in: {result}"
+    );
+}
+
+#[test]
+fn test_generate_letter_spacing_negative() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "Condensed".to_string(),
+            style: TextStyle {
+                letter_spacing: Some(-0.5),
+                ..TextStyle::default()
+            },
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("tracking: -0.5pt"),
+        "Expected negative tracking in: {result}"
+    );
+}
+
+#[test]
+fn test_generate_tab_uses_measured_default_stops() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "Name:\tValue".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("#context {"),
+        "Expected contextual tab rendering in: {result}"
+    );
+    // A body paragraph's pen is the rendered prefix on the tab's own line
+    // (issue #2226).
+    assert!(
+        result.contains("measure(tab_line_0).width"),
+        "Expected tab spacing to measure the rendered prefix in: {result}"
+    );
+    assert!(
+        result.contains("calc.rem-euclid(tab_prefix_width_1.abs.pt(), 36)"),
+        "Expected default tabs to advance to the next 36pt stop in: {result}"
+    );
+    assert!(
+        !result.contains("#h(36pt)"),
+        "Expected default tabs to avoid a hard-coded 36pt gap in: {result}"
+    );
+}
+
+#[test]
+fn test_generate_tab_uses_next_explicit_stop_and_alignment() {
+    use crate::ir::{TabAlignment, TabLeader, TabStop};
+
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            tab_stops: Some(vec![
+                TabStop {
+                    position: 72.0,
+                    alignment: TabAlignment::Left,
+                    leader: TabLeader::None,
+                },
+                TabStop {
+                    position: 216.0,
+                    alignment: TabAlignment::Right,
+                    leader: TabLeader::Dot,
+                },
+            ]),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "Col1\tCol2\tCol3".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("if tab_prefix_width_1 < 72pt"),
+        "Expected the first explicit stop to be chosen by measured width in: {result}"
+    );
+    assert!(
+        result.contains("else if tab_prefix_width_2 < 216pt"),
+        "Expected the next explicit stop to be selected after the first one in: {result}"
+    );
+    assert!(
+        result.contains("216pt - tab_prefix_width_2 - tab_segment_width_2"),
+        "Expected right-aligned tabs to subtract the following segment width in: {result}"
+    );
+}
+
+#[test]
+fn test_generate_tab_falls_back_to_next_default_stop_after_explicit_tabs() {
+    use crate::ir::{TabAlignment, TabLeader, TabStop};
+
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            tab_stops: Some(vec![TabStop {
+                position: 100.0,
+                alignment: TabAlignment::Left,
+                leader: TabLeader::None,
+            }]),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "A\tB\tC".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("if tab_prefix_width_1 < 100pt"),
+        "Expected the explicit stop to be used when it is still ahead of the prefix in: {result}"
+    );
+    assert!(
+        result.contains("calc.rem-euclid(tab_prefix_width_2.abs.pt(), 36)"),
+        "Expected tabs beyond explicit stops to use the next default stop in: {result}"
+    );
+}
+
+#[test]
+fn test_generate_tab_uses_paragraph_default_stop_interval() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            default_tab_stop_pt: Some(72.0),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "Label\tValue".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+
+    assert!(
+        result.contains("calc.rem-euclid(tab_prefix_width_1.abs.pt(), 72)"),
+        "Expected the paragraph's default tab interval in: {result}"
+    );
+}
+
+#[test]
+fn test_generate_tab_leader_uses_repeat_fill() {
+    use crate::ir::{TabAlignment, TabLeader, TabStop};
+
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            tab_stops: Some(vec![TabStop {
+                position: 144.0,
+                alignment: TabAlignment::Left,
+                leader: TabLeader::Dot,
+            }]),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "Heading\t12".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("box(width: tab_advance_1, repeat[.])"),
+        "Expected dot tab leaders to render with Typst repeat fill in: {result}"
+    );
+}
+
+#[test]
+fn test_generate_decimal_tab_uses_decimal_separator_not_thousands_separator() {
+    use crate::ir::{TabAlignment, TabLeader, TabStop};
+
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            tab_stops: Some(vec![TabStop {
+                position: 180.0,
+                alignment: TabAlignment::Decimal,
+                leader: TabLeader::None,
+            }]),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "Total\t1,234.56".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("let tab_decimal_anchor_1 = [1,234]"),
+        "Expected decimal alignment to anchor after the thousands group in: {result}"
+    );
+}
+
+#[test]
+fn test_generate_decimal_tab_handles_comma_decimal_locale() {
+    use crate::ir::{TabAlignment, TabLeader, TabStop};
+
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            tab_stops: Some(vec![TabStop {
+                position: 180.0,
+                alignment: TabAlignment::Decimal,
+                leader: TabLeader::None,
+            }]),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "Total\t1.234,56".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("let tab_decimal_anchor_1 = [1.234]"),
+        "Expected decimal alignment to anchor on the locale decimal separator in: {result}"
+    );
+}
+
+#[test]
+fn test_generate_multiple_paragraphs() {
+    let doc = make_doc(vec![make_flow_page(vec![
+        make_paragraph("First paragraph"),
+        make_paragraph("Second paragraph"),
+    ])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(result.contains("First paragraph"));
+    assert!(result.contains("Second paragraph"));
+    assert!(
+        result.contains("First paragraph\n\nSecond paragraph"),
+        "Expected paragraph break between flow paragraphs in: {result}"
+    );
+}
+
+#[test]
+fn test_generate_paragraph_with_multiple_runs() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![
+            Run {
+                text: "Normal ".to_string(),
+                style: TextStyle::default(),
+                href: None,
+                footnote: None,
+                inline_box: None,
+            },
+            Run {
+                text: "bold".to_string(),
+                style: TextStyle {
+                    bold: Some(true),
+                    ..TextStyle::default()
+                },
+                href: None,
+                footnote: None,
+                inline_box: None,
+            },
+            Run {
+                text: " normal again".to_string(),
+                style: TextStyle::default(),
+                href: None,
+                footnote: None,
+                inline_box: None,
+            },
+        ],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(result.contains("Normal "));
+    assert!(result.contains("bold"));
+    assert!(result.contains(" normal again"));
+}
+
+#[test]
+fn test_generate_empty_document() {
+    let doc = make_doc(vec![]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(result.is_empty() || !result.is_empty());
+}
+
+#[test]
+fn test_generate_special_characters_escaped() {
+    let doc = make_doc(vec![make_flow_page(vec![make_paragraph(
+        "Price: $100 #items @store",
+    )])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("\\#") || result.contains("Price"),
+        "Expected escaped or present text in: {result}"
+    );
+}
+
+#[test]
+fn test_centered_paragraph_with_spacing_keeps_full_width_block() {
+    // A paragraph with spacing gets a #block wrapper; without width: 100%
+    // the block shrinks to its content and the inner #align(center) has no
+    // visible effect (Word: <w:spacing w:after> + <w:jc w:val="center">).
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            alignment: Some(Alignment::Center),
+            space_after: Some(6.0),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "Centered title".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("align(center"),
+        "Expected center alignment in: {result}"
+    );
+    let block_start = result.find("#block(").expect("expected block wrapper");
+    let block_params = &result[block_start..block_start + 60];
+    assert!(
+        block_params.contains("width: 100%"),
+        "Block wrapper must span the full width for alignment to apply: {block_params}"
+    );
+}
+
+#[test]
+fn test_document_grid_pitch_snaps_line_height() {
+    // A Korean Word section whose <w:docGrid> snaps lines puts body lines on
+    // an 18pt grid. The line box is clamped to a fixed em height equal to the
+    // grid pitch (leading 0) so a taller fallback glyph on a line cannot
+    // inflate its advance past the grid (issue #398). The baseline keeps its
+    // constant ascent inside that box: the slot's slack accrues below it, not
+    // around it (issue #518). Uses a font from Typst's embedded set so the
+    // test is environment-free.
+    let Some((_, _, word_pitch_em)) = crate::render::pdf::font_line_metrics_em("Libertinus Serif")
+    else {
+        return; // no font book available (e.g. exotic CI sandbox)
+    };
+    let mut page = match make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "그리드 정렬 grid snapped".to_string(),
+            style: TextStyle {
+                font_family: Some("Libertinus Serif".to_string()),
+                font_size: Some(10.0),
+                ..TextStyle::default()
+            },
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })]) {
+        Page::Flow(flow) => flow,
+        _ => unreachable!(),
+    };
+    page.line_grid_pitch = Some(18.0);
+    page.line_grid_snaps_lines = true;
+    let doc = make_doc(vec![Page::Flow(page)]);
+    let result = generate_typst(&doc).unwrap().source;
+
+    assert_line_advance(
+        &result,
+        "Libertinus Serif",
+        10.0,
+        18.0,
+        0.15 * word_pitch_em,
+    );
+    assert!(
+        result.contains("leading: 0pt"),
+        "the grid advance is carried by the box, not by leading: {result}"
+    );
+}
+
+#[test]
+fn test_latin_paragraph_ignores_document_grid() {
+    // Word leaves Latin-only paragraphs at their metric line height even
+    // when the section carries a document grid; only East Asian text snaps
+    // (issue #354).
+    let mut page = match make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "latin only body text".to_string(),
+            style: TextStyle {
+                font_family: Some("Libertinus Serif".to_string()),
+                font_size: Some(10.0),
+                ..TextStyle::default()
+            },
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })]) {
+        Page::Flow(flow) => flow,
+        _ => unreachable!(),
+    };
+    page.line_grid_pitch = Some(18.0);
+    page.line_grid_snaps_lines = true;
+    let doc = make_doc(vec![Page::Flow(page)]);
+    let result = generate_typst(&doc).unwrap().source;
+
+    // The paragraph keeps Word's hhea single-spacing advance; the 18pt grid
+    // pitch must not appear in its line box.
+    let Some((ascender, descender, word_pitch)) =
+        crate::render::pdf::font_line_metrics_em("Libertinus Serif")
+    else {
+        return;
+    };
+    let single_pt: f64 = (word_pitch * 10.0).max((ascender + descender) * 10.0);
+    assert_line_advance(&result, "Libertinus Serif", 10.0, single_pt, 0.0);
+    assert!(
+        (single_pt - 18.0).abs() > 0.01,
+        "the fixture only proves anything if the grid pitch differs from single spacing"
+    );
+}
+
+#[test]
+fn test_no_document_grid_uses_word_single_spacing() {
+    // Without a document grid, paragraphs still use Word's hhea single-line
+    // pitch instead of Typst's glyph-tight default (issue #354).
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "plain".to_string(),
+            style: TextStyle {
+                font_family: Some("Libertinus Serif".to_string()),
+                font_size: Some(10.0),
+                ..TextStyle::default()
+            },
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    let Some((ascender, descender, word_pitch)) =
+        crate::render::pdf::font_line_metrics_em("Libertinus Serif")
+    else {
+        return;
+    };
+    let single_pt: f64 = (word_pitch * 10.0).max((ascender + descender) * 10.0);
+    assert_line_advance(&result, "Libertinus Serif", 10.0, single_pt, 0.0);
+    assert!(
+        result.contains("leading: 0pt"),
+        "the advance is carried by the box, not by leading: {result}"
+    );
+}
+
+#[test]
+fn test_generate_paragraph_with_background_shading() {
+    // w:pPr/w:shd paints the whole paragraph; the block wrapper must carry
+    // the fill so the shading spans the full line width (issue #351).
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            background: Some(Color::new(0xF4, 0xF4, 0xF4)),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "$ cargo install office2pdf-cli".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("fill: rgb(244, 244, 244)"),
+        "paragraph shading must fill the block wrapper: {result}"
+    );
+    assert!(
+        result.contains("#block(width: 100%"),
+        "shaded paragraphs need the full-width block wrapper: {result}"
+    );
+}
+
+#[test]
+fn matching_adjacent_paragraph_borders_join_without_merging_shading() {
+    let make_border = || CellBorder {
+        top: Some(BorderSide {
+            width: 1.0,
+            color: Color::black(),
+            style: BorderLineStyle::Solid,
+            join: LineJoin::Round,
+            cap: LineCap::Flat,
+        }),
+        bottom: Some(BorderSide {
+            width: 1.0,
+            color: Color::black(),
+            style: BorderLineStyle::Solid,
+            join: LineJoin::Round,
+            cap: LineCap::Flat,
+        }),
+        left: Some(BorderSide {
+            width: 1.0,
+            color: Color::black(),
+            style: BorderLineStyle::Solid,
+            join: LineJoin::Round,
+            cap: LineCap::Flat,
+        }),
+        right: Some(BorderSide {
+            width: 1.0,
+            color: Color::black(),
+            style: BorderLineStyle::Solid,
+            join: LineJoin::Round,
+            cap: LineCap::Flat,
+        }),
+    };
+    let mut first: Block = make_paragraph("First shaded paragraph");
+    let mut second: Block = make_paragraph("Second shaded paragraph");
+    let Block::Paragraph(first_paragraph) = &mut first else {
+        unreachable!();
+    };
+    first_paragraph.style.border = Some(Box::new(make_border()));
+    first_paragraph.style.background = Some(Color::new(251, 228, 213));
+    let Block::Paragraph(second_paragraph) = &mut second else {
+        unreachable!();
+    };
+    second_paragraph.style.border = Some(Box::new(make_border()));
+    second_paragraph.style.background = Some(Color::new(222, 234, 246));
+
+    let document: Document = make_doc(vec![make_flow_page(vec![first, second])]);
+    let source: String = generate_typst(&document).unwrap().source;
+
+    assert_eq!(
+        source.matches("top: 1pt + rgb(0, 0, 0)").count(),
+        1,
+        "only the first paragraph should paint the joined frame's top edge: {source}"
+    );
+    assert_eq!(
+        source.matches("bottom: 1pt + rgb(0, 0, 0)").count(),
+        1,
+        "only the last paragraph should paint the joined frame's bottom edge: {source}"
+    );
+    assert_eq!(
+        source.matches("left: 1pt + rgb(0, 0, 0)").count(),
+        3,
+        "the shared frame and both paragraph fills must keep the left edge: {source}"
+    );
+    assert_eq!(
+        source.matches("right: 1pt + rgb(0, 0, 0)").count(),
+        3,
+        "the shared frame and both paragraph fills must keep the right edge: {source}"
+    );
+    assert!(
+        source.contains("#block(width: 100%, above: 0pt, below: 0pt, stroke: (left: 1pt + rgb(0, 0, 0), right: 1pt + rgb(0, 0, 0)), outset: (x: 1.44pt))["),
+        "a shared frame must wrap the joined paragraphs: {source}"
+    );
+    assert!(source.contains("fill: rgb(251, 228, 213)"));
+    assert!(source.contains("fill: rgb(222, 234, 246)"));
+}
+
+#[test]
+fn matching_paragraph_borders_join_across_layout_breaks() {
+    let make_border = || {
+        Box::new(CellBorder {
+            top: Some(BorderSide {
+                width: 1.0,
+                color: Color::black(),
+                style: BorderLineStyle::Solid,
+                join: LineJoin::Round,
+                cap: LineCap::Flat,
+            }),
+            bottom: Some(BorderSide {
+                width: 1.0,
+                color: Color::black(),
+                style: BorderLineStyle::Solid,
+                join: LineJoin::Round,
+                cap: LineCap::Flat,
+            }),
+            left: Some(BorderSide {
+                width: 1.0,
+                color: Color::black(),
+                style: BorderLineStyle::Solid,
+                join: LineJoin::Round,
+                cap: LineCap::Flat,
+            }),
+            right: Some(BorderSide {
+                width: 1.0,
+                color: Color::black(),
+                style: BorderLineStyle::Solid,
+                join: LineJoin::Round,
+                cap: LineCap::Flat,
+            }),
+        })
+    };
+    let mut first: Block = make_paragraph("First shaded paragraph");
+    let mut second: Block = make_paragraph("Second shaded paragraph");
+    let Block::Paragraph(first_paragraph) = &mut first else {
+        unreachable!();
+    };
+    first_paragraph.style.border = Some(make_border());
+    first_paragraph.style.background = Some(Color::new(251, 228, 213));
+    let Block::Paragraph(second_paragraph) = &mut second else {
+        unreachable!();
+    };
+    second_paragraph.style.border = Some(make_border());
+    second_paragraph.style.background = Some(Color::new(222, 234, 246));
+
+    let document: Document = make_doc(vec![make_flow_page(vec![
+        first,
+        Block::ColumnBreak,
+        second,
+    ])]);
+    let source: String = generate_typst(&document).unwrap().source;
+
+    assert_eq!(
+        source.matches("top: 1pt + rgb(0, 0, 0)").count(),
+        1,
+        "the continuation must not add a top edge after a column break: {source}"
+    );
+    assert_eq!(
+        source.matches("bottom: 1pt + rgb(0, 0, 0)").count(),
+        1,
+        "the preceding paragraph must not add a bottom edge before a column break: {source}"
+    );
+}
+
+#[test]
+fn issue_1975_fixture_joins_borders_across_differently_shaded_paragraphs() {
+    use crate::parser::Parser;
+
+    let fixture: &[u8] = include_bytes!(
+        "../../../../tests/fixtures/docx/libreoffice/tdf153964_topMarginAfterBreak14.docx"
+    );
+    let (document, _) = crate::parser::docx::DocxParser
+        .parse(fixture, &crate::config::ConvertOptions::default())
+        .unwrap();
+    let source: String = generate_typst(&document).unwrap().source;
+    let first_text_position: usize = source.find("[column break1]").unwrap();
+    let first_paragraph_start: usize = source[..first_text_position]
+        .rfind("#block(width: 100%, above: 0pt, fill: rgb(251, 228, 213)")
+        .unwrap();
+    let second_text_position: usize = source.find("[60 pt followed by page break]").unwrap();
+    let second_paragraph_start: usize = source[..second_text_position]
+        .rfind("#block(width: 100%, above: 52pt, fill: rgb(222, 234, 246)")
+        .unwrap();
+    let second_paragraph_after_text_end: usize =
+        second_text_position + source[second_text_position..].find("#pagebreak()").unwrap();
+    let first_paragraph: &str = &source[first_paragraph_start..first_text_position];
+    let first_paragraph_after_text: &str = &source[first_text_position..second_paragraph_start];
+    let second_paragraph: &str = &source[second_paragraph_start..second_text_position];
+    let second_paragraph_after_text: &str =
+        &source[second_text_position..second_paragraph_after_text_end];
+
+    assert!(
+        source[..first_paragraph_start]
+            .rfind("#block(width: 100%, above: 0pt, below: 0pt, stroke: (left: 3pt + rgb(0, 0, 0), right: 3pt + rgb(0, 0, 0)), outset: (x: 5.44pt))[" )
+            .is_some(),
+        "adjacent DOCX paragraphs with matching borders need a shared side frame"
+    );
+    assert!(!first_paragraph.contains("top: 3pt + rgb(0, 0, 0)"));
+    assert!(!first_paragraph.contains("bottom: 3pt + rgb(0, 0, 0)"));
+    assert!(!second_paragraph.contains("top: 3pt + rgb(0, 0, 0)"));
+    assert!(!second_paragraph.contains("bottom: 3pt + rgb(0, 0, 0)"));
+    assert!(
+        first_paragraph_after_text
+            .contains("#block(width: 100%, height: 8pt, above: 0pt, below: 0pt, fill: rgb(251, 228, 213), stroke: (left: 3pt + rgb(0, 0, 0), right: 3pt + rgb(0, 0, 0))"),
+        "the orange shading must fill the paragraph's transferred 8pt after-spacing: {first_paragraph_after_text}"
+    );
+    assert!(
+        second_paragraph.contains("dy: -62.5pt"),
+        "before-spacing shading must include the removed 2.5pt paragraph-border inset: {second_paragraph}"
+    );
+    assert!(
+        second_paragraph_after_text.contains("#block(width: 100%, height: 8pt, above: 0pt, below: 0pt, fill: rgb(222, 234, 246), stroke: (left: 3pt + rgb(0, 0, 0), right: 3pt + rgb(0, 0, 0))"),
+        "the blue shading and joined side frame must reach the paragraph's trailing 8pt: {second_paragraph_after_text}"
+    );
+    assert!(source.contains("fill: rgb(251, 228, 213)"));
+    assert!(source.contains("fill: rgb(222, 234, 246)"));
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn issue_1896_preserves_empty_paragraph_after_spacing_before_a_leading_page_break() {
+    use crate::parser::Parser;
+
+    let fixtures: [&[u8]; 2] = [
+        include_bytes!(
+            "../../../../tests/fixtures/docx/libreoffice/tdf153964_topMarginAfterBreak14.docx"
+        ),
+        include_bytes!(
+            "../../../../tests/fixtures/docx/libreoffice/tdf153964_topMarginAfterBreak15.docx"
+        ),
+    ];
+    let continuation_baselines: Vec<f64> = fixtures
+        .iter()
+        .map(|fixture| {
+            let (document, _warnings) = crate::parser::docx::DocxParser
+                .parse(fixture, &crate::config::ConvertOptions::default())
+                .expect("the public break-spacing fixture should parse");
+            let source: String = generate_typst(&document)
+                .expect("the public break-spacing fixture should generate")
+                .source;
+            crate::render::pdf::compiled_text_runs(&source, 1)
+                .expect("the continuation page should compile")
+                .into_iter()
+                .find(|run| run.text.contains("start of the"))
+                .expect("the continuation text should be on page 2")
+                .baseline_pt
+        })
+        .collect();
+    let empty_paragraph_gap_pt: f64 = continuation_baselines[1] - continuation_baselines[0];
+
+    assert!(
+        (empty_paragraph_gap_pt + 8.0).abs() <= 0.24,
+        "Word subtracts the preceding empty Normal paragraph's 8pt after-spacing from the leading page-break continuation gap; observed a {empty_paragraph_gap_pt:.3}pt continuation gap"
+    );
+}
+
+/// Word lays an empty paragraph's line out like any one-line paragraph: when
+/// it does not fit in what is left of a page, it starts the next page whole
+/// and pushes the following text down by its height. Typst cut the empty
+/// paragraph's spacing off at the page's bottom and carried none of it over,
+/// so the text started the next page one line high (issue #2253). The filler
+/// leaves 20pt: a 16pt empty line stays on page 1, and 24pt and 30pt ones,
+/// plain, indented or shaded, open page 2.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn an_empty_paragraph_that_does_not_fit_starts_the_next_page() {
+    let exact_line = |line_pt: f64| ParagraphStyle {
+        line_spacing: Some(LineSpacing::Exact(line_pt)),
+        space_before: Some(0.0),
+        space_after: Some(0.0),
+        ..ParagraphStyle::default()
+    };
+    let exact_line_paragraph = |text: &str| {
+        let mut paragraph: Block = make_paragraph(text);
+        if let Block::Paragraph(paragraph) = &mut paragraph {
+            paragraph.style = exact_line(20.0);
+            paragraph.runs[0].style.font_family = Some("Arial".into());
+            paragraph.runs[0].style.font_size = Some(12.0);
+        }
+        paragraph
+    };
+    let continuation_baseline = |empty_style: ParagraphStyle| -> f64 {
+        let mut content: Vec<Block> = (1..=14)
+            .map(|line| exact_line_paragraph(&format!("Filler {line}")))
+            .collect();
+        content.push(Block::Paragraph(Paragraph {
+            style: empty_style,
+            runs: Vec::new(),
+        }));
+        content.push(exact_line_paragraph("Continuation"));
+        // 300pt of body height: fourteen 20pt lines leave 20pt below them.
+        let document: Document = make_doc(vec![Page::Flow(FlowPage {
+            size: PageSize {
+                width: 300.0,
+                height: 400.0,
+            },
+            margins: Margins {
+                top: 50.0,
+                bottom: 50.0,
+                left: 50.0,
+                right: 50.0,
+            },
+            content,
+            ..match make_flow_page(Vec::new()) {
+                Page::Flow(flow_page) => flow_page,
+                _ => unreachable!(),
+            }
+        })]);
+        let source: String = generate_typst(&document)
+            .expect("the synthetic overflow document should generate")
+            .source;
+        crate::render::pdf::compiled_text_runs(&source, 1)
+            .expect("page 2 should compile")
+            .into_iter()
+            .find(|run| run.text.contains("Continuation"))
+            .expect("the continuation should be on page 2")
+            .baseline_pt
+    };
+
+    // The 16pt empty line fits on page 1, so the continuation opens page 2.
+    let page_top_baseline_pt: f64 = continuation_baseline(exact_line(16.0));
+    let indented = ParagraphStyle {
+        indent_left: Some(36.0),
+        ..exact_line(30.0)
+    };
+    let shaded = ParagraphStyle {
+        background: Some(Color::new(0xD9, 0xE2, 0xF3)),
+        ..exact_line(24.0)
+    };
+    for (label, empty_style, empty_line_pt) in [
+        ("plain", exact_line(24.0), 24.0),
+        ("indented", indented, 30.0),
+        ("shaded", shaded, 24.0),
+    ] {
+        let shift_pt: f64 = continuation_baseline(empty_style) - page_top_baseline_pt;
+        assert!(
+            (shift_pt - empty_line_pt).abs() < 0.01,
+            "a {label} {empty_line_pt}pt empty line that does not fit must open page 2 and push \
+             the continuation down by its height, got {shift_pt:.3}pt"
+        );
+    }
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn issue_1896_collapses_empty_paragraph_after_spacing_before_a_leading_page_break() {
+    use crate::ir::ColumnLayout;
+
+    let continuation_baseline = |empty_paragraph_after_spacing_pt: &[f64]| -> f64 {
+        let mut content: Vec<Block> = empty_paragraph_after_spacing_pt
+            .iter()
+            .map(|space_after_pt| {
+                Block::Paragraph(Paragraph {
+                    style: ParagraphStyle {
+                        space_after: Some(*space_after_pt),
+                        ..ParagraphStyle::default()
+                    },
+                    runs: Vec::new(),
+                })
+            })
+            .collect();
+        content.push(Block::PageBreak);
+        content.push(make_paragraph("Continuation"));
+        let mut page: Page = make_flow_page(content);
+        let Page::Flow(flow_page) = &mut page else {
+            unreachable!();
+        };
+        flow_page.columns = Some(ColumnLayout {
+            num_columns: 2,
+            spacing: 36.0,
+            column_widths: None,
+            has_separator: false,
+        });
+        let document: Document = make_doc(vec![page]);
+        let source: String = generate_typst(&document)
+            .expect("the synthetic break-spacing document should generate")
+            .source;
+        crate::render::pdf::compiled_text_runs(&source, 1)
+            .expect("the continuation page should compile")
+            .into_iter()
+            .find(|run| run.text.contains("Continuation"))
+            .expect("the continuation text should be on page 2")
+            .baseline_pt
+    };
+
+    let no_empty_paragraph_baseline_pt: f64 = continuation_baseline(&[]);
+    let one_empty_paragraph_baseline_pt: f64 = continuation_baseline(&[8.0]);
+    let two_empty_paragraph_baseline_pt: f64 = continuation_baseline(&[4.0, 8.0]);
+
+    assert!(
+        (one_empty_paragraph_baseline_pt - no_empty_paragraph_baseline_pt + 8.0).abs() < 0.01,
+        "the empty paragraph's after-spacing must pull the continuation upward across the initial page break"
+    );
+    assert!(
+        (two_empty_paragraph_baseline_pt - one_empty_paragraph_baseline_pt).abs() < 0.01,
+        "adjacent empty paragraphs collapse to the largest after-spacing, not a sum"
+    );
+}
+
+#[test]
+fn test_paragraph_before_spacing_overlay_stays_inline_with_text() {
+    let doc = make_doc(vec![make_flow_page(vec![
+        make_paragraph("Previous paragraph"),
+        Block::Paragraph(Paragraph {
+            style: ParagraphStyle {
+                space_before: Some(60.0),
+                background: Some(Color::new(0xFB, 0xE4, 0xD5)),
+                border: Some(Box::new(CellBorder {
+                    left: Some(BorderSide {
+                        width: 1.0,
+                        color: Color::black(),
+                        style: BorderLineStyle::Solid,
+                        join: LineJoin::Round,
+                        cap: LineCap::Flat,
+                    }),
+                    right: Some(BorderSide {
+                        width: 1.0,
+                        color: Color::black(),
+                        style: BorderLineStyle::Solid,
+                        join: LineJoin::Round,
+                        cap: LineCap::Flat,
+                    }),
+                    ..CellBorder::default()
+                })),
+                ..ParagraphStyle::default()
+            },
+            runs: vec![Run {
+                text: "Shaded paragraph".to_string(),
+                style: TextStyle::default(),
+                href: None,
+                footnote: None,
+                inline_box: None,
+            }],
+        }),
+    ])]);
+    let source = generate_typst(&doc).unwrap().source;
+
+    let overlay_start: usize = source
+        .find("#box(place(")
+        .expect("a placed rectangle paints the before spacing");
+    let joiner_start: usize = source[overlay_start..]
+        .find("#sym.wj#h(0pt, weak: true)")
+        .map(|offset| overlay_start + offset)
+        .expect("the place call is joined to the next word");
+    let overlay_markup: &str = &source[overlay_start..joiner_start];
+
+    assert!(overlay_markup.contains("dy: -60pt"), "{overlay_markup}");
+    assert!(overlay_markup.contains("height: 60pt"), "{overlay_markup}");
+    assert!(
+        overlay_markup.contains("fill: rgb(251, 228, 213)"),
+        "{overlay_markup}"
+    );
+    assert!(
+        overlay_markup.contains("stroke: (left:"),
+        "{overlay_markup}"
+    );
+    assert!(overlay_markup.contains("right:"), "{overlay_markup}");
+    assert!(
+        !overlay_markup.contains("top:") && !overlay_markup.contains("bottom:"),
+        "the vertical gap continues the side borders without drawing a horizontal rule"
+    );
+    assert!(source[joiner_start..].contains("Shaded paragraph"));
+}
+
+#[test]
+fn test_generate_paragraph_with_bottom_border_rule() {
+    // w:pBdr bottom rules (resume header underline) must stroke the block
+    // wrapper's bottom edge (issue #368).
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            border: Some(Box::new(CellBorder {
+                bottom: Some(BorderSide {
+                    width: 0.75,
+                    color: Color::new(0x1E, 0x27, 0x61),
+                    style: BorderLineStyle::Solid,
+                    join: LineJoin::Round,
+                    cap: LineCap::Flat,
+                }),
+                ..CellBorder::default()
+            })),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "JAMIE PARKER".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    // Word inflates the rule 0.02in past each edge of the text column, so it
+    // runs 2.88pt wider than the copy above it. `outset` widens what the block
+    // paints without moving the text inside it (issue #644).
+    assert!(
+        result.contains("outset: (x: 1.44pt)"),
+        "the rule must overhang the text column by 1.44pt each side: {result}"
+    );
+    assert!(
+        result.contains("stroke: (bottom: 0.75pt + rgb(30, 39, 97))"),
+        "bottom border must stroke the wrapper: {result}"
+    );
+}
+
+#[test]
+fn test_generate_paragraph_with_double_bottom_border() {
+    // Double letterhead rules render as two placed hairlines; Typst strokes
+    // have no double style (issue #368).
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            border: Some(Box::new(CellBorder {
+                bottom: Some(BorderSide {
+                    width: 1.0,
+                    color: Color::black(),
+                    style: BorderLineStyle::Double,
+                    join: LineJoin::Round,
+                    cap: LineCap::Flat,
+                }),
+                ..CellBorder::default()
+            })),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "주식회사 에이엑스솔루션".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    let rule_count = result.matches("line(length: 100%").count();
+    assert_eq!(
+        rule_count, 2,
+        "double borders draw exactly two rules: {result}"
+    );
+    assert!(
+        !result.contains("stroke: (bottom:"),
+        "double sides must not also stroke the wrapper: {result}"
+    );
+}
+
+fn make_tab_paragraph() -> Block {
+    Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "제1조\t(목적) 본문".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })
+}
+
+#[test]
+fn test_tab_advance_uses_document_default_tab_stop() {
+    // Word documents carry w:defaultTabStop; tabs advance to multiples of
+    // it, not the ECMA fallback (issue #393).
+    let mut doc = make_doc(vec![make_flow_page(vec![make_tab_paragraph()])]);
+    doc.styles.default_tab_stop_pt = Some(40.0);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("calc.rem-euclid(tab_prefix_width_1.abs.pt(), 40)"),
+        "explicit default tab stop must drive the advance: {result}"
+    );
+}
+
+#[test]
+fn test_tab_advance_defaults_to_40pt_under_document_grid() {
+    // When settings.xml omits w:defaultTabStop, East Asian Word (signalled
+    // by the section's w:docGrid) falls back to 800 twips = 40pt, not the
+    // ECMA 720 twips (issue #393).
+    let mut page = match make_flow_page(vec![make_tab_paragraph()]) {
+        Page::Flow(flow) => flow,
+        _ => unreachable!(),
+    };
+    page.line_grid_pitch = Some(18.0);
+    page.line_grid_snaps_lines = true;
+    let doc = make_doc(vec![Page::Flow(page)]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("calc.rem-euclid(tab_prefix_width_1.abs.pt(), 40)"),
+        "grid documents default to 40pt tab stops: {result}"
+    );
+}
+
+#[test]
+fn test_tab_advance_defaults_to_36pt_without_grid() {
+    let doc = make_doc(vec![make_flow_page(vec![make_tab_paragraph()])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("calc.rem-euclid(tab_prefix_width_1.abs.pt(), 36)"),
+        "ECMA default stays 36pt: {result}"
+    );
+}
+
+#[test]
+fn test_latin_paragraph_space_after_stays_raw_gap() {
+    // Word places `w:spacing w:after` directly below the full line box,
+    // which the paragraph's own line box already spans, so the gap reaches
+    // the block unchanged and needs no leading top-up (issues #394, #452).
+    let make_para = |text: &str| {
+        Block::Paragraph(Paragraph {
+            style: ParagraphStyle {
+                space_after: Some(4.0),
+                ..ParagraphStyle::default()
+            },
+            runs: vec![Run {
+                text: text.to_string(),
+                style: TextStyle {
+                    font_family: Some("Libertinus Serif".to_string()),
+                    font_size: Some(10.0),
+                    ..TextStyle::default()
+                },
+                href: None,
+                footnote: None,
+                inline_box: None,
+            }],
+        })
+    };
+    let doc = make_doc(vec![make_flow_page(vec![
+        make_para("first paragraph"),
+        make_para("second paragraph"),
+    ])]);
+    let result = generate_typst(&doc).unwrap().source;
+
+    assert!(
+        result.contains("below: 4pt"),
+        "Latin paragraph keeps the raw 4pt gap: {result}"
+    );
+}
+
+#[test]
+fn test_consecutive_paragraphs_each_advance_by_the_full_font_line() {
+    // The shaded command lines of a technical manual are separate 9pt
+    // Courier New paragraphs with `w:spacing w:after="0"`. Word advances
+    // each by the font's full single-spacing line; Typst only inserts
+    // `par(leading:)` *between* the lines of one paragraph, so recovering
+    // the advance that way left every paragraph one leading short and
+    // consecutive command lines packed 28% tighter than Word (issue #452).
+    // The line box must therefore span the whole advance on its own.
+    let Some(advance_pt) = single_spacing_advance_pt(LINE_GAP_FONT, 9.0) else {
+        return;
+    };
+    let make_code_line = |text: &str| {
+        Block::Paragraph(Paragraph {
+            style: ParagraphStyle {
+                space_after: Some(0.0),
+                ..ParagraphStyle::default()
+            },
+            runs: vec![Run {
+                text: text.to_string(),
+                style: TextStyle {
+                    font_family: Some(LINE_GAP_FONT.to_string()),
+                    font_size: Some(9.0),
+                    ..TextStyle::default()
+                },
+                href: None,
+                footnote: None,
+                inline_box: None,
+            }],
+        })
+    };
+    let doc = make_doc(vec![make_flow_page(vec![
+        make_code_line("$ cargo install office2pdf-cli"),
+        make_code_line("$ office2pdf --version"),
+    ])]);
+    let result = generate_typst(&doc).unwrap().source;
+
+    assert_line_advance(&result, LINE_GAP_FONT, 9.0, advance_pt, 0.0);
+    assert!(
+        result.contains("leading: 0pt"),
+        "the advance belongs to the box, not to leading: {result}"
+    );
+    assert!(
+        result.contains("below: 0pt"),
+        "a zero w:spacing w:after stays zero: {result}"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_mixed_font_line_uses_the_declared_runs_deeper_descent() {
+    let Some((arial_top_em, arial_bottom_em, _)) =
+        crate::render::pdf::font_line_metrics_em("Arial")
+    else {
+        return;
+    };
+    let Some((_courier_top_em, courier_bottom_em, _)) =
+        crate::render::pdf::font_line_metrics_em("Courier New")
+    else {
+        return;
+    };
+    let arial_size_pt: f64 = 10.5;
+    let courier_size_pt: f64 = 9.5;
+    let arial_bottom_pt: f64 = arial_bottom_em * arial_size_pt;
+    let courier_bottom_pt: f64 = courier_bottom_em * courier_size_pt;
+    if courier_bottom_pt <= arial_bottom_pt + 0.1 {
+        return;
+    }
+
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            alignment: Some(Alignment::Justify),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![
+            Run {
+                text: "Ensure the original fonts are installed, or pass ".to_string(),
+                style: TextStyle {
+                    font_family: Some("Arial".to_string()),
+                    font_size: Some(arial_size_pt),
+                    ..TextStyle::default()
+                },
+                href: None,
+                footnote: None,
+                inline_box: None,
+            },
+            Run {
+                text: "--font-path".to_string(),
+                style: TextStyle {
+                    font_family: Some("Courier New".to_string()),
+                    font_size: Some(courier_size_pt),
+                    ..TextStyle::default()
+                },
+                href: None,
+                footnote: None,
+                inline_box: None,
+            },
+            Run {
+                text: "\nfiles. Missing fonts fall back to substitutes.".to_string(),
+                style: TextStyle {
+                    font_family: Some("Arial".to_string()),
+                    font_size: Some(arial_size_pt),
+                    ..TextStyle::default()
+                },
+                href: None,
+                footnote: None,
+                inline_box: None,
+            },
+        ],
+    })])]);
+    let output = generate_typst(&doc).unwrap();
+    let placed = crate::render::pdf::compiled_text_runs(&output.source, 0).unwrap();
+    let mixed_baseline_pt: f64 = placed
+        .iter()
+        .find(|run| run.text.contains("--font-path"))
+        .expect("the mixed-font line should contain the Courier run")
+        .baseline_pt;
+    let following_baseline_pt: f64 = placed
+        .iter()
+        .find(|run| run.text.contains("files."))
+        .expect("the hard break should start the following Arial line")
+        .baseline_pt;
+    let actual_advance_pt: f64 = following_baseline_pt - mixed_baseline_pt;
+    let expected_advance_pt: f64 =
+        arial_top_em * arial_size_pt + courier_bottom_pt.max(arial_bottom_pt);
+
+    assert!(
+        (actual_advance_pt - expected_advance_pt).abs() < 0.05,
+        "the next baseline should use Arial's ascent plus the deepest declared \
+         run descent: got {actual_advance_pt}pt, expected {expected_advance_pt}pt; \
+         placed={placed:?}\n{}",
+        output.source
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_mixed_font_line_uses_the_following_lines_taller_ascent() {
+    let Some((arial_top_em, _arial_bottom_em, _)) =
+        crate::render::pdf::font_line_metrics_em("Arial")
+    else {
+        return;
+    };
+    let Some((courier_top_em, courier_bottom_em, _)) =
+        crate::render::pdf::font_line_metrics_em("Courier New")
+    else {
+        return;
+    };
+    let arial_size_pt: f64 = 10.5;
+    let courier_size_pt: f64 = 9.5;
+    let arial_top_pt: f64 = arial_top_em * arial_size_pt;
+    let courier_top_pt: f64 = courier_top_em * courier_size_pt;
+    if arial_top_pt <= courier_top_pt + 0.1 {
+        return;
+    }
+
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![
+            Run {
+                text: "first Courier line".to_string(),
+                style: TextStyle {
+                    font_family: Some("Courier New".to_string()),
+                    font_size: Some(courier_size_pt),
+                    ..TextStyle::default()
+                },
+                href: None,
+                footnote: None,
+                inline_box: None,
+            },
+            Run {
+                text: "\nsecond Courier run ".to_string(),
+                style: TextStyle {
+                    font_family: Some("Courier New".to_string()),
+                    font_size: Some(courier_size_pt),
+                    ..TextStyle::default()
+                },
+                href: None,
+                footnote: None,
+                inline_box: None,
+            },
+            Run {
+                text: "with taller Arial ascent".to_string(),
+                style: TextStyle {
+                    font_family: Some("Arial".to_string()),
+                    font_size: Some(arial_size_pt),
+                    ..TextStyle::default()
+                },
+                href: None,
+                footnote: None,
+                inline_box: None,
+            },
+        ],
+    })])]);
+    let output = generate_typst(&doc).unwrap();
+    let placed = crate::render::pdf::compiled_text_runs(&output.source, 0).unwrap();
+    let first_baseline_pt: f64 = placed
+        .iter()
+        .find(|run| run.text.contains("first Courier"))
+        .expect("the first Courier line should be present")
+        .baseline_pt;
+    let second_baseline_pt: f64 = placed
+        .iter()
+        .find(|run| run.text.contains("second Courier"))
+        .expect("the hard break should start the second line")
+        .baseline_pt;
+    let actual_advance_pt: f64 = second_baseline_pt - first_baseline_pt;
+    let expected_advance_pt: f64 =
+        courier_bottom_em * courier_size_pt + arial_top_pt.max(courier_top_pt);
+
+    assert!(
+        (actual_advance_pt - expected_advance_pt).abs() < 0.05,
+        "the next baseline should use the first line's Courier descent plus the \
+         tallest declared ascent on the following line: got {actual_advance_pt}pt, \
+         expected {expected_advance_pt}pt; placed={placed:?}\n{}",
+        output.source
+    );
+}
+
+#[test]
+fn uniform_font_runs_keep_only_the_paragraph_level_line_box() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![
+            Run {
+                text: "first Arial run ".to_string(),
+                style: TextStyle {
+                    font_family: Some("Arial".to_string()),
+                    font_size: Some(10.5),
+                    ..TextStyle::default()
+                },
+                href: None,
+                footnote: None,
+                inline_box: None,
+            },
+            Run {
+                text: "second Arial run".to_string(),
+                style: TextStyle {
+                    font_family: Some("arial".to_string()),
+                    font_size: Some(9.5),
+                    ..TextStyle::default()
+                },
+                href: None,
+                footnote: None,
+                inline_box: None,
+            },
+        ],
+    })])]);
+    let output = generate_typst(&doc).unwrap();
+
+    assert!(
+        output.source.contains("#set text(top-edge:"),
+        "the paragraph-level Word line box should still be present\n{}",
+        output.source
+    );
+    assert!(
+        !output.source.contains("#text(top-edge:"),
+        "same-family runs must not gain per-run line boxes\n{}",
+        output.source
+    );
+}
+
+/// A Typst-embedded font whose hhea line is taller than its typographic
+/// metric box, so the single-spacing advance is strictly larger than the
+/// metric box. Libertinus Serif - the default test font here - has no line
+/// gap at all, which would make the assertions above pass vacuously.
+const LINE_GAP_FONT: &str = "DejaVu Sans Mono";
+
+/// Word's single-spacing advance for `family` at `font_size`, or `None`
+/// when the font is unavailable or its hhea line adds no gap over the
+/// typographic metric box (which would make the assertion vacuous).
+fn single_spacing_advance_pt(family: &str, font_size: f64) -> Option<f64> {
+    let (ascender, descender, word_pitch) = crate::render::pdf::font_line_metrics_em(family)?;
+    (word_pitch - (ascender + descender) > 0.001).then_some(word_pitch * font_size)
+}
+
+#[test]
+fn test_grid_paragraph_space_after_stays_raw_gap() {
+    // Grid variant: the snapped line box already spans the full grid pitch,
+    // so Word's after-gap sits directly below it and reaches the block
+    // unchanged (issues #394, #452).
+    if crate::render::pdf::font_line_metrics_em("Libertinus Serif").is_none() {
+        return;
+    }
+    let mut page = match make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            space_after: Some(4.0),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "그리드 본문".to_string(),
+            style: TextStyle {
+                font_family: Some("Libertinus Serif".to_string()),
+                font_size: Some(10.0),
+                ..TextStyle::default()
+            },
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })]) {
+        Page::Flow(flow) => flow,
+        _ => unreachable!(),
+    };
+    page.line_grid_pitch = Some(18.0);
+    page.line_grid_snaps_lines = true;
+    let doc = make_doc(vec![Page::Flow(page)]);
+    let result = generate_typst(&doc).unwrap().source;
+
+    assert!(
+        result.contains("below: 4pt"),
+        "grid paragraph keeps the raw 4pt gap: {result}"
+    );
+}
+
+#[test]
+fn test_paragraph_left_indent_offsets_the_text_column() {
+    // Word's `w:ind w:left` moves the whole paragraph right; only the list
+    // path ever read it, so indented body paragraphs started at the margin
+    // (issue #464).
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            indent_left: Some(12.0),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "$ cargo install office2pdf-cli".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+
+    assert!(
+        result.contains("inset: (left: 12pt, right: 0pt)"),
+        "left indent should inset the paragraph block: {result}"
+    );
+}
+
+#[test]
+fn test_paragraph_right_indent_narrows_the_text_column() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            indent_right: Some(18.0),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "narrowed".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+
+    assert!(
+        result.contains("inset: (left: 0pt, right: 18pt)"),
+        "right indent should inset the paragraph block: {result}"
+    );
+}
+
+#[test]
+fn test_indented_paragraph_shading_starts_at_the_indent() {
+    // Word paints `w:pPr/w:shd` from the left indent to the right indent,
+    // not across the whole text column: measured on a Word export, the
+    // shaded band of a 12pt-indented code line starts at the indent, 12pt
+    // right of the margin (issue #464). The fill therefore belongs to an
+    // inner block that spans only the inset content area.
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            indent_left: Some(12.0),
+            background: Some(Color::new(0xF4, 0xF4, 0xF4)),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "$ office2pdf --version".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+
+    let inset_at = result
+        .find("inset: (left: 12pt, right: 0pt)")
+        .expect("indent should inset the outer block");
+    let fill_at = result
+        .find("fill: rgb(244, 244, 244)")
+        .expect("shading should still be emitted");
+    assert!(
+        fill_at > inset_at,
+        "the fill belongs to a block nested inside the indent: {result}"
+    );
+}
+
+#[test]
+fn test_unindented_paragraph_keeps_a_single_block() {
+    // A paragraph with no indent must not gain an inset or a nested block.
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            background: Some(Color::new(0xF4, 0xF4, 0xF4)),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "flush left".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+
+    assert!(
+        !result.contains("inset: (left:"),
+        "an unindented paragraph needs no inset: {result}"
+    );
+    assert!(
+        result.contains("fill: rgb(244, 244, 244)"),
+        "shading is still emitted: {result}"
+    );
+}
+
+#[test]
+fn test_empty_indented_paragraph_closes_its_block() {
+    // An indented paragraph with no runs takes the early-return path. Leaving
+    // its indent wrapper open produced "unclosed delimiter" and failed 73
+    // third-party fixtures outright (regression caught on #464).
+    let doc = make_doc(vec![make_flow_page(vec![
+        Block::Paragraph(Paragraph {
+            style: ParagraphStyle {
+                indent_left: Some(24.0),
+                ..ParagraphStyle::default()
+            },
+            runs: Vec::new(),
+        }),
+        make_paragraph("after the empty paragraph"),
+    ])]);
+    let result = generate_typst(&doc).unwrap().source;
+
+    let opened: usize = result.matches('[').count();
+    let closed: usize = result.matches(']').count();
+    assert_eq!(
+        opened, closed,
+        "every content block opened must be closed: {result}"
+    );
+    assert!(
+        result.contains("after the empty paragraph"),
+        "the following paragraph must not be swallowed: {result}"
+    );
+}
+
+#[test]
+fn empty_shaded_paragraph_paints_background_through_before_spacing() {
+    let mut empty_paragraph = make_paragraph("");
+    let Block::Paragraph(paragraph) = &mut empty_paragraph else {
+        unreachable!("make_paragraph returns a paragraph block");
+    };
+    paragraph.runs.clear();
+    paragraph.style.space_before = Some(60.0);
+    paragraph.style.background = Some(Color::new(0xE2, 0xEF, 0xD9));
+
+    let doc = make_doc(vec![make_flow_page(vec![
+        make_paragraph("Previous paragraph"),
+        empty_paragraph,
+    ])]);
+    let result = generate_typst(&doc).unwrap().source;
+
+    assert!(
+        result.contains("height: 60pt, fill: rgb(226, 239, 217)"),
+        "empty paragraph shading must cover its before-spacing gap: {result}"
+    );
+    assert!(
+        !result.contains("#sym.wj#h(0pt, weak: true)#v(12pt)"),
+        "the placed shading must not create a text line before an empty paragraph's line box: {result}"
+    );
+}
+
+#[test]
+fn empty_shaded_before_spacing_owns_the_top_border_at_its_outer_edge() {
+    let top_border: BorderSide = BorderSide {
+        width: 3.0,
+        color: Color::black(),
+        style: BorderLineStyle::Solid,
+        join: LineJoin::Round,
+        cap: LineCap::Flat,
+    };
+    let mut empty_paragraph = make_paragraph("");
+    let Block::Paragraph(paragraph) = &mut empty_paragraph else {
+        unreachable!();
+    };
+    paragraph.runs.clear();
+    paragraph.style.space_after = Some(8.0);
+    paragraph.style.decoration_before_spacing = Some(52.0);
+    paragraph.style.background = Some(Color::new(0xE2, 0xEF, 0xD9));
+    paragraph.style.border_space = Some(Box::new(Insets {
+        top: 1.0,
+        bottom: 1.0,
+        left: 4.0,
+        right: 4.0,
+    }));
+    paragraph.style.border = Some(Box::new(CellBorder {
+        top: Some(top_border.clone()),
+        bottom: Some(top_border.clone()),
+        left: Some(top_border.clone()),
+        right: Some(top_border),
+    }));
+
+    let doc = make_doc(vec![make_flow_page(vec![empty_paragraph])]);
+    let source = generate_typst(&doc).unwrap().source;
+    let overlay_start: usize = source.find("#box(place(").expect("before-spacing overlay");
+    let overlay_end: usize = source[overlay_start..]
+        .find("#v(12pt)")
+        .map(|relative_end| overlay_start + relative_end)
+        .expect("empty paragraph line box follows its overlay");
+    let overlay: &str = &source[overlay_start..overlay_end];
+    let block_start: usize = source[..overlay_start]
+        .rfind("#block(width: 100%, above: 0pt, below: 12pt")
+        .expect("decorated empty paragraph block");
+    let block_header_end: usize = source[block_start..]
+        .find(")[")
+        .map(|relative_end| block_start + relative_end)
+        .expect("decorated block header");
+    let block_header: &str = &source[block_start..block_header_end];
+
+    assert!(
+        overlay.contains("height: 52pt, fill: rgb(226, 239, 217), stroke: (top: 3pt"),
+        "the before-spacing overlay must carry the paragraph's top border: {overlay}"
+    );
+    assert!(
+        !block_header.contains("stroke: (top:") && block_header.contains("inset: (top: 2.5pt"),
+        "the inner paragraph block keeps its top inset without drawing a second top border: {block_header}"
+    );
+}
+
+#[test]
+fn empty_shaded_paragraph_keeps_after_spacing_outside_its_fill() {
+    let mut empty_paragraph = make_paragraph("");
+    let Block::Paragraph(paragraph) = &mut empty_paragraph else {
+        unreachable!("make_paragraph returns a paragraph block");
+    };
+    paragraph.runs.clear();
+    paragraph.style.space_before = None;
+    paragraph.style.space_after = Some(8.0);
+    paragraph.style.decoration_before_spacing = Some(60.0);
+    paragraph.style.background = Some(Color::new(0xE2, 0xEF, 0xD9));
+
+    let doc = make_doc(vec![make_flow_page(vec![empty_paragraph])]);
+    let result = generate_typst(&doc).unwrap().source;
+
+    assert!(
+        result.contains("#block(width: 100%, above: 0pt, below: 8pt, fill: rgb(226, 239, 217)"),
+        "the paragraph's block spacing stays outside its painted fill: {result}"
+    );
+}
+
+#[test]
+fn empty_paragraph_after_spacing_starts_beyond_its_bottom_border() {
+    let bottom_border: BorderSide = BorderSide {
+        width: 3.0,
+        color: Color::black(),
+        style: BorderLineStyle::Solid,
+        join: LineJoin::Round,
+        cap: LineCap::Flat,
+    };
+    let mut empty_paragraph = make_paragraph("");
+    let Block::Paragraph(paragraph) = &mut empty_paragraph else {
+        unreachable!("make_paragraph returns a paragraph block");
+    };
+    paragraph.runs.clear();
+    paragraph.style.space_after = Some(8.0);
+    paragraph.style.background = Some(Color::new(0xFF, 0x00, 0x00));
+    paragraph.style.border_space = Some(Box::new(Insets {
+        bottom: 1.0,
+        ..Insets::default()
+    }));
+    paragraph.style.border = Some(Box::new(CellBorder {
+        bottom: Some(bottom_border),
+        ..CellBorder::default()
+    }));
+
+    let doc = make_doc(vec![make_flow_page(vec![empty_paragraph])]);
+    let result = generate_typst(&doc).unwrap().source;
+
+    assert!(
+        result.contains("#block(width: 100%, above: 0pt, below: 12pt, fill: rgb(255, 0, 0)"),
+        "after-spacing must follow the empty paragraph's 1pt border gap and 3pt bottom rule: {result}"
+    );
+}
+
+/// One paragraph of `text` in `family` at `font_size`, with no grid.
+fn line_box_for_text(text: &str, family: &str, font_size: f64) -> Option<(f64, f64)> {
+    line_box_for_text_in_context(text, family, font_size, None)
+}
+
+/// The same box, generated under `font_context` — which must be handed to the
+/// generator rather than merely installed around it, because generation
+/// replaces the ambient context with the one it is given.
+fn line_box_for_text_in_context(
+    text: &str,
+    family: &str,
+    font_size: f64,
+    font_context: Option<&crate::render::font_context::FontSearchContext>,
+) -> Option<(f64, f64)> {
+    crate::render::font_subst::with_font_search_context(font_context, || {
+        crate::render::pdf::font_line_metrics_em(family)
+    })?;
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: text.to_string(),
+            style: TextStyle {
+                font_family: Some(family.to_string()),
+                font_size: Some(font_size),
+                ..TextStyle::default()
+            },
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    emitted_line_box_em(
+        &crate::render::typst_gen::generate_typst_with_options_and_font_context(
+            &doc,
+            &ConvertOptions::default(),
+            font_context,
+        )
+        .unwrap()
+        .source,
+    )
+}
+
+#[test]
+fn east_asian_line_advances_130_percent_of_the_font_line() {
+    // Word gives a line carrying East Asian text 130% of the font's own hhea
+    // line. Measured across the business corpus: 10.5pt Malgun Gothic paces its
+    // wrapped lines at 18.00-18.24pt against 18.156 predicted, and
+    // 06_official_letter_ko's 9.5pt paragraphs advance 16.43pt where the bare
+    // hhea line is 12.64pt (issue #518).
+    let Some((ascender, descender, word_pitch_em)) =
+        crate::render::pdf::font_line_metrics_em("Libertinus Serif")
+    else {
+        return; // no font book available (e.g. exotic CI sandbox)
+    };
+    let _ = (ascender, descender);
+    let Some((top, bottom)) = line_box_for_text("본문 한 줄", "Libertinus Serif", 10.0) else {
+        return;
+    };
+
+    assert!(
+        (top + bottom - 1.3 * word_pitch_em).abs() < 0.001,
+        "East Asian advance {}em should be 1.3 x the {word_pitch_em}em hhea line",
+        top + bottom
+    );
+}
+
+#[test]
+fn east_asian_bonus_is_centred_on_the_baseline() {
+    // Half of the 30% lands above the baseline and half below: an Arial first
+    // baseline sits at `hhea ascender + lineGap` while a Malgun Gothic one at
+    // the same settings sits 0.15 x pitch lower, and the descent gap grows by
+    // the same amount (issue #518).
+    let Some((ascender, _descender, word_pitch_em)) =
+        crate::render::pdf::font_line_metrics_em("Libertinus Serif")
+    else {
+        return;
+    };
+    let Some((top, bottom)) = line_box_for_text("본문 한 줄", "Libertinus Serif", 10.0) else {
+        return;
+    };
+
+    assert!(
+        (top - (ascender + 0.15 * word_pitch_em)).abs() < 0.001,
+        "the baseline should sit 0.15 x pitch below the Latin seat, got {top}em"
+    );
+    assert!(
+        (bottom - (word_pitch_em - ascender + 0.15 * word_pitch_em)).abs() < 0.001,
+        "the other half of the bonus belongs below the baseline, got {bottom}em"
+    );
+}
+
+#[test]
+fn a_latin_line_keeps_the_plain_hhea_line_and_seat() {
+    // Triangulation for both rules above: the bonus is a property of the
+    // line's script, not of the renderer. Inflating Latin lines too made every
+    // Western document 30-50% taller (issue #354).
+    let Some((ascender, _descender, word_pitch_em)) =
+        crate::render::pdf::font_line_metrics_em("Libertinus Serif")
+    else {
+        return;
+    };
+    let Some((top, bottom)) = line_box_for_text("plain body text", "Libertinus Serif", 10.0) else {
+        return;
+    };
+
+    assert!(
+        (top + bottom - word_pitch_em).abs() < 0.001,
+        "a Latin line advances the bare hhea line, got {}em",
+        top + bottom
+    );
+    assert!(
+        (top - ascender).abs() < 0.001,
+        "a Latin baseline keeps the `hhea ascender + lineGap` seat, got {top}em"
+    );
+}
+
+#[test]
+fn the_east_asian_bonus_scales_with_the_font_size_not_with_the_text() {
+    // The rule is a factor on the font's line, so doubling the size doubles
+    // both edges exactly - a fake that returned one measured pair would not.
+    let Some((small_top, small_bottom)) = line_box_for_text("표", "Libertinus Serif", 9.0) else {
+        return;
+    };
+    let (large_top, large_bottom) =
+        line_box_for_text("전혀 다른 한국어 문장", "Libertinus Serif", 21.0)
+            .expect("the same font resolves at any size");
+
+    // The box is emitted in em, so the em split must be identical at both
+    // sizes and for unrelated text.
+    assert!(
+        (small_top - large_top).abs() < 0.001 && (small_bottom - large_bottom).abs() < 0.001,
+        "the split is a property of the font, not of the size or the text: \
+         {small_top}/{small_bottom} vs {large_top}/{large_bottom}"
+    );
+}
+
+/// The body line box of one 10.5pt paragraph of `text` set in Noto Sans CJK
+/// SC whose `hhea` line gap is `line_gap` units.
+fn line_box_with_cjk_line_gap(line_gap: i16, text: &str) -> (f64, f64) {
+    let context = noto_sans_cjk_context_with_line_gap(line_gap);
+    line_box_for_text_in_context(text, NOTO_SANS_CJK_SC, 10.5, Some(&context))
+        .expect("the conversion-local face resolves")
+}
+
+#[test]
+fn an_east_asian_line_leaves_the_faces_line_gap_out_of_its_box() {
+    // Word builds its 1.3x East Asian line from the `hhea` ascender and
+    // descender alone. A native Word for Mac export of a 10.5pt Batang
+    // paragraph (hhea 879/-145, line gap 152 of 1024 units) advances 13.65pt
+    // per line = 1.3 x (asc + desc), where carrying the gap gave 15.68pt, and
+    // seats the first baseline at asc + 0.15 x (asc + desc) below the margin
+    // (issue #1638).
+    let (top, bottom) = line_box_with_cjk_line_gap(300, "本合同由双方签订");
+    let bare_line_em: f64 = NOTO_SANS_CJK_ASCENDER_EM + NOTO_SANS_CJK_DESCENDER_EM;
+
+    assert!(
+        (top + bottom - 1.3 * bare_line_em).abs() < 0.001,
+        "the East Asian advance {}em should be 1.3 x the gap-free {bare_line_em}em line",
+        top + bottom
+    );
+    assert!(
+        (top - (NOTO_SANS_CJK_ASCENDER_EM + 0.15 * bare_line_em)).abs() < 0.001,
+        "the baseline should sit asc + 0.15 x (asc + desc) below the box top, got {top}em"
+    );
+}
+
+#[test]
+fn an_east_asian_line_box_does_not_move_with_the_line_gap() {
+    // Triangulation: Batang's 152/1024 gap is one value, and a model keyed to
+    // it would pass the test above. Word's box ignores the gap at any size of
+    // it — Yu Gothic's 1024/2048 and Hiragino Sans GB's 500/1000 export the
+    // same gap-free pitch (issue #1638).
+    let without_gap: (f64, f64) = line_box_with_cjk_line_gap(0, "表");
+    for line_gap in [76, 148, 500] {
+        let (top, bottom) = line_box_with_cjk_line_gap(line_gap, "完全不同的一句中文");
+        assert!(
+            (top - without_gap.0).abs() < 0.001 && (bottom - without_gap.1).abs() < 0.001,
+            "a {line_gap}-unit gap moved the East Asian box to {top}/{bottom}em from \
+             {}/{}em",
+            without_gap.0,
+            without_gap.1
+        );
+    }
+}
+
+#[test]
+fn a_latin_line_in_the_same_face_keeps_the_line_gap() {
+    // The gap stays in Word's Latin single line, above the baseline: Arial's
+    // 67/2048 (#508, #514) and the system Times New Roman's 87/2048 (#1284)
+    // were both measured that way. Only the East Asian box drops it.
+    let (top, bottom) = line_box_with_cjk_line_gap(300, "plain body text");
+    let line_gap_em: f64 = 0.300;
+
+    assert!(
+        (top + bottom - (NOTO_SANS_CJK_ASCENDER_EM + NOTO_SANS_CJK_DESCENDER_EM + line_gap_em))
+            .abs()
+            < 0.001,
+        "a Latin line advances the gap-inclusive hhea line, got {}em",
+        top + bottom
+    );
+    assert!(
+        (top - (NOTO_SANS_CJK_ASCENDER_EM + line_gap_em)).abs() < 0.001,
+        "a Latin baseline keeps the `hhea ascender + lineGap` seat, got {top}em"
+    );
+}
+
+#[test]
+fn a_header_or_footer_east_asian_line_leaves_the_line_gap_out() {
+    // Header and footer stories size their band, their `w:pBdr` rule and
+    // their seat from the same East Asian line as the body, so they must drop
+    // the gap with it or a Batang header would outgrow its body (issue #1638).
+    let runs: Vec<Run> = vec![Run {
+        text: "本合同由双方签订".to_string(),
+        style: TextStyle {
+            font_family: Some(NOTO_SANS_CJK_SC.to_string()),
+            font_size: Some(10.0),
+            ..TextStyle::default()
+        },
+        href: None,
+        footnote: None,
+        inline_box: None,
+    }];
+    let bare_line_em: f64 = NOTO_SANS_CJK_ASCENDER_EM + NOTO_SANS_CJK_DESCENDER_EM;
+    let context = noto_sans_cjk_context_with_line_gap(300);
+    let (advance_pt, descent_em) =
+        crate::render::font_subst::with_font_search_context(Some(&context), || {
+            (
+                text::word_line_advance_pt(&runs),
+                text::word_line_box_descent_em(&runs),
+            )
+        });
+
+    let advance_pt: f64 = advance_pt.expect("the face resolves");
+    assert!(
+        (advance_pt - 1.3 * bare_line_em * 10.0).abs() < 0.001,
+        "the story line should advance 1.3 x the gap-free line, got {advance_pt}pt"
+    );
+    let descent_em: f64 = descent_em.expect("the face resolves");
+    let expected_descent_em: f64 = NOTO_SANS_CJK_DESCENDER_EM + 0.15 * bare_line_em;
+    assert!(
+        (descent_em - expected_descent_em).abs() < 0.001,
+        "the line box should end desc + 0.15 x (asc + desc) below the baseline, \
+         got {descent_em}em"
+    );
+}
+
+/// One paragraph with a bottom rule of `style` at `width`pt and `space`pt of
+/// `w:pBdr` gap.
+fn bordered_paragraph_source(width: f64, style: BorderLineStyle, space: f64) -> String {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            border: Some(Box::new(CellBorder {
+                bottom: Some(BorderSide {
+                    width,
+                    color: Color::black(),
+                    style,
+                    join: LineJoin::Round,
+                    cap: LineCap::Flat,
+                }),
+                ..CellBorder::default()
+            })),
+            border_space: Some(Box::new(Insets {
+                top: 0.0,
+                right: 0.0,
+                bottom: space,
+                left: 0.0,
+            })),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "서울특별시 강남구".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    generate_typst(&doc).unwrap().source
+}
+
+#[test]
+fn a_paragraph_rule_reserves_its_own_declared_space() {
+    // `w:pBdr` carries `w:space` per side, in points. A fixed 4pt stood in for
+    // it until #520, which displaced every line below a bordered paragraph by
+    // the difference — 06_official_letter_ko declares 8pt and lost 4pt of it,
+    // as a step that survived to the bottom of the page.
+    //
+    // Half the width, not the whole of it: Typst centres the stroke on the
+    // inset edge, so reserving the full width sat the rule half a width low
+    // (issue #648).
+    let source = bordered_paragraph_source(0.75, BorderLineStyle::Solid, 8.0);
+
+    assert!(
+        source.contains("inset: (bottom: 8.375pt)"),
+        "the rule reserves its declared 8pt plus half its 0.75pt width: {source}"
+    );
+}
+
+#[test]
+fn a_rule_that_declares_no_space_sits_against_the_text() {
+    // Triangulation, and the attribute's own default: `w:space` omitted means
+    // zero, not a house value.
+    let source = bordered_paragraph_source(0.75, BorderLineStyle::Solid, 0.0);
+
+    assert!(
+        source.contains("inset: (bottom: 0.375pt)"),
+        "with no declared space only the rule's width is reserved: {source}"
+    );
+}
+
+#[test]
+fn a_double_rule_reserves_its_space_plus_all_three_widths() {
+    // A Word double rule is two lines of the declared width separated by a gap
+    // of the same width, and it is drawn as two placed hairlines because Typst
+    // strokes have no double style. Both the reserved height and the placement
+    // of each hairline hang off the declared space (issue #520).
+    let source = bordered_paragraph_source(1.0, BorderLineStyle::Double, 8.0);
+
+    assert!(
+        source.contains("inset: (bottom: 11pt)"),
+        "8pt of space plus three 1pt widths: {source}"
+    );
+    assert!(
+        source.contains("#place(bottom, dx: -1.44pt, dy: 9pt,")
+            && source.contains("#place(bottom, dx: -1.44pt, dy: 11pt,"),
+        "both hairlines are placed from the declared space: {source}"
+    );
+    // A placed line spans the block's layout box, which `outset` does not
+    // widen, so each hairline reaches past both edges itself (issue #644).
+    assert!(
+        source.contains("line(length: 100% + 2.88pt"),
+        "a double rule overhangs the column like a single one: {source}"
+    );
+    assert!(
+        !source.contains("stroke: (bottom:"),
+        "a double rule is drawn as overlays, not as a block stroke: {source}"
+    );
+}
+
+#[test]
+fn every_declared_space_reaches_the_output_unchanged() {
+    // Triangulation across values, so no single measured constant can pass.
+    for (space, expected) in [
+        (0.0, "0.375pt"),
+        (2.0, "2.375pt"),
+        (8.0, "8.375pt"),
+        (14.0, "14.375pt"),
+    ] {
+        let source = bordered_paragraph_source(0.75, BorderLineStyle::Solid, space);
+        assert!(
+            source.contains(&format!("inset: (bottom: {expected})")),
+            "{space}pt of declared space should reserve {expected}: {source}"
+        );
+    }
+}
+
+#[test]
+fn test_generate_heading_with_style_border_rule() {
+    // Word paints a heading's `w:pBdr` around it like any other paragraph, and
+    // a chapter-rule heading style is the commonest place one appears. The
+    // heading branch used to return before any decoration was emitted, so
+    // every styled heading rule was dropped (issue #581).
+    let body = Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "본문".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    });
+    let heading = Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            heading_level: Some(1),
+            space_before: Some(14.0),
+            space_after: Some(7.5),
+            border: Some(Box::new(CellBorder {
+                bottom: Some(BorderSide {
+                    width: 1.5,
+                    color: Color::new(0x2E, 0x74, 0xB5),
+                    style: BorderLineStyle::Solid,
+                    join: LineJoin::Round,
+                    cap: LineCap::Flat,
+                }),
+                ..CellBorder::default()
+            })),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "개요".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    });
+    let doc = make_doc(vec![make_flow_page(vec![body, heading])]);
+    let result = generate_typst(&doc).unwrap().source;
+
+    assert!(
+        result.contains("stroke: (bottom: 1.5pt + rgb(46, 116, 181))"),
+        "a heading's style border must stroke its wrapper: {result}"
+    );
+    assert!(
+        // Framed because a heading is a paragraph like any other, and Word
+        // breaks its Korean at eojeol too (issue #626).
+        result.contains("#heading(level: 1)[#box[개요]]"),
+        "the heading itself must survive the wrapper: {result}"
+    );
+    assert!(
+        result.contains("above: 14pt") && result.contains("below: 7.5pt"),
+        "the wrapper carries the heading's own spacing, not Typst's: {result}"
+    );
+}
+
+/// A heading paragraph carrying `style`, with one plain run, following a body
+/// paragraph — the page's first block has its `space_before` hoisted into a
+/// leading `#v()` instead, because Typst drops block spacing at a page top.
+fn heading_source(style: ParagraphStyle) -> String {
+    let doc = make_doc(vec![make_flow_page(vec![
+        make_paragraph("Body copy"),
+        Block::Paragraph(Paragraph {
+            style,
+            runs: vec![Run {
+                text: "Overview".to_string(),
+                style: TextStyle::default(),
+                href: None,
+                footnote: None,
+                inline_box: None,
+            }],
+        }),
+    ])]);
+    generate_typst(&doc).unwrap().source
+}
+
+#[test]
+fn every_heading_spacing_reaches_its_block_unchanged() {
+    // A heading resolves `w:spacing` exactly like body copy, so whatever the
+    // style hierarchy resolved has to reach the block. Left off, the gap was
+    // Typst's own `#set heading` default — a number no `w:spacing`, no style
+    // definition and no Word rule produced — and because Typst collapses
+    // adjacent block spacing to the larger of the two, that default also
+    // swallowed the neighbouring paragraph's declared gap (issue #1132).
+    //
+    // Triangulated across values, so no single measured constant can pass.
+    for (before, after, expected) in [
+        (
+            None,
+            Some(8.0),
+            "#block(width: 100%, above: 0pt, below: 8pt)",
+        ),
+        (
+            Some(14.0),
+            Some(7.0),
+            "#block(width: 100%, above: 14pt, below: 7pt)",
+        ),
+        (
+            Some(6.0),
+            Some(0.0),
+            "#block(width: 100%, above: 6pt, below: 0pt)",
+        ),
+    ] {
+        let source = heading_source(ParagraphStyle {
+            heading_level: Some(1),
+            space_before: before,
+            space_after: after,
+            ..ParagraphStyle::default()
+        });
+        assert!(
+            source.contains(expected),
+            "heading spacing {before:?}/{after:?} should emit {expected}: {source}"
+        );
+        assert!(
+            source.contains("#heading(level: 1)"),
+            "the heading itself must survive the wrapper: {source}"
+        );
+    }
+}
+
+#[test]
+fn a_heading_takes_the_same_line_box_as_body_copy() {
+    // The block's `above`/`below` measure from the line box's edges, so a
+    // heading needs Word's box for them to land where Word puts them: with
+    // Typst's glyph-tight default the wrapper ends at the baseline and the
+    // gap below the heading comes out a descender short (issue #1132).
+    let source = heading_source(ParagraphStyle {
+        heading_level: Some(1),
+        line_box: Some(LineBox {
+            ascent_em: 1.3125,
+            descent_em: 0.4375,
+        }),
+        space_after: Some(8.0),
+        ..ParagraphStyle::default()
+    });
+
+    assert!(
+        source.contains("#set text(top-edge: 1.3125em, bottom-edge: -0.4375em)"),
+        "a heading's line box must reach the output: {source}"
+    );
+    assert!(
+        source.contains("#set par(leading: 0pt)"),
+        "a heading stacks its lines Word's way: {source}"
+    );
+}
+
+/// A heading paragraph in `family`, following a body paragraph, with the
+/// `w:spacing w:after` a real `Heading N` resolves.
+fn theme_heading_source(family: &str) -> String {
+    let doc = make_doc(vec![make_flow_page(vec![
+        make_paragraph("Body copy"),
+        Block::Paragraph(Paragraph {
+            style: ParagraphStyle {
+                heading_level: Some(1),
+                space_after: Some(8.0),
+                ..ParagraphStyle::default()
+            },
+            runs: vec![Run {
+                text: "Overview".to_string(),
+                style: TextStyle {
+                    font_family: Some(family.to_string()),
+                    font_size: Some(16.0),
+                    ..TextStyle::default()
+                },
+                href: None,
+                footnote: None,
+                inline_box: None,
+            }],
+        }),
+    ])]);
+    generate_typst(&doc).unwrap().source
+}
+
+#[test]
+fn a_theme_major_face_heading_takes_the_base_family_line_box() {
+    // `Calibri Light` is the `majorHAnsi` face of every Office theme since
+    // 2013, so a built-in `Heading N` resolves to it. Typst indexes the
+    // installed face under the trimmed family `Calibri`, so the stated name
+    // matched no face: `font_line_metrics_em` answered `None`, the heading got
+    // no fixed line box, and its block ended on the baseline with the
+    // descender missing from the gap below it (issue #1197).
+    if crate::render::pdf::font_line_metrics_em("Calibri").is_none() {
+        return; // no Calibri-compatible face on this host
+    }
+    let light: String = theme_heading_source("Calibri Light");
+    let regular: String = theme_heading_source("Calibri");
+
+    let light_box = emitted_line_box_em(&light)
+        .unwrap_or_else(|| panic!("a Calibri Light heading needs Word's line box: {light}"));
+    let regular_box = emitted_line_box_em(&regular)
+        .unwrap_or_else(|| panic!("a Calibri heading needs Word's line box: {regular}"));
+    assert_eq!(
+        light_box, regular_box,
+        "Calibri Light declares Calibri's own hhea metrics, so the two headings \
+         share one line box"
+    );
+}
+
+#[test]
+fn test_generate_undecorated_heading_keeps_its_bare_form() {
+    // A heading with nothing to carry — no decoration, no resolved
+    // `w:spacing`, no line box — keeps Typst's own heading block, because an
+    // empty wrapper would state nothing the document asked for. Every DOCX
+    // heading does resolve a `w:spacing w:after`, so this is the shape only an
+    // IR built without one takes (issues #581, #1132).
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            heading_level: Some(2),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: "한 문장 요약".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+
+    // One syllable needs no frame; the two-syllable eojeol each get one so a
+    // wrapped heading breaks where Word breaks it (issue #626).
+    assert!(result.contains("#heading(level: 2)[한 #box[문장] #box[요약]]"));
+    assert!(
+        !result.contains("#block(width: 100%"),
+        "an undecorated heading needs no block wrapper: {result}"
+    );
+}
+
+/// A one-run paragraph of `text` carrying `style`, set bold at 16pt so a
+/// heading's own show rule has no size or weight left to change.
+#[cfg(not(target_arch = "wasm32"))]
+fn placement_probe_paragraph(style: ParagraphStyle, text: &str) -> Block {
+    Block::Paragraph(Paragraph {
+        style,
+        runs: vec![Run {
+            text: text.to_string(),
+            style: TextStyle {
+                bold: Some(true),
+                font_size: Some(16.0),
+                ..TextStyle::default()
+            },
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_heading_is_placed_across_the_line_exactly_like_body_copy() {
+    // An outline level makes a paragraph a heading for the navigation pane
+    // and the contents, not a different kind of paragraph: Word lays it out
+    // with the same `w:jc`, `w:ind` and `w:bidi` as body copy. The heading
+    // branch was a second copy of the paragraph emitter that picked up the
+    // vertical settings one issue at a time (#581, #1132) but none of the
+    // horizontal ones, so a centred zh-CN Word "Title" — which carries
+    // `w:outlineLvl 0` — printed flush left (issue #1820).
+    //
+    // Each case gets its own page holding a body paragraph and a heading
+    // with the same settings, so the two runs on a page must share an x.
+    let cases: Vec<(&str, ParagraphStyle)> = vec![
+        ("default", ParagraphStyle::default()),
+        (
+            "left",
+            ParagraphStyle {
+                alignment: Some(Alignment::Left),
+                ..ParagraphStyle::default()
+            },
+        ),
+        (
+            "centre",
+            ParagraphStyle {
+                alignment: Some(Alignment::Center),
+                ..ParagraphStyle::default()
+            },
+        ),
+        (
+            "right",
+            ParagraphStyle {
+                alignment: Some(Alignment::Right),
+                ..ParagraphStyle::default()
+            },
+        ),
+        (
+            "left indent",
+            ParagraphStyle {
+                indent_left: Some(144.0),
+                ..ParagraphStyle::default()
+            },
+        ),
+        (
+            "centre inside both indents",
+            ParagraphStyle {
+                alignment: Some(Alignment::Center),
+                indent_left: Some(144.0),
+                indent_right: Some(36.0),
+                ..ParagraphStyle::default()
+            },
+        ),
+        (
+            "right inside a right indent",
+            ParagraphStyle {
+                alignment: Some(Alignment::Right),
+                indent_right: Some(90.0),
+                ..ParagraphStyle::default()
+            },
+        ),
+        (
+            "centre with spacing and a rule",
+            ParagraphStyle {
+                alignment: Some(Alignment::Center),
+                space_before: Some(12.0),
+                space_after: Some(3.0),
+                border: Some(Box::new(CellBorder {
+                    bottom: Some(BorderSide {
+                        width: 0.75,
+                        color: Color::new(0, 0, 0),
+                        style: BorderLineStyle::Solid,
+                        join: LineJoin::Miter,
+                        cap: LineCap::Flat,
+                    }),
+                    ..CellBorder::default()
+                })),
+                ..ParagraphStyle::default()
+            },
+        ),
+        (
+            "right-to-left",
+            ParagraphStyle {
+                direction: Some(TextDirection::Rtl),
+                ..ParagraphStyle::default()
+            },
+        ),
+    ];
+    let pages: Vec<Page> = cases
+        .iter()
+        .map(|(_, style)| {
+            make_flow_page(vec![
+                placement_probe_paragraph(style.clone(), "Overview"),
+                placement_probe_paragraph(
+                    ParagraphStyle {
+                        heading_level: Some(1),
+                        ..style.clone()
+                    },
+                    "Overview",
+                ),
+            ])
+        })
+        .collect();
+    let source: String = generate_typst(&make_doc(pages)).unwrap().source;
+
+    let left_margin: f64 = Margins::default().left;
+    for (page_index, (label, _)) in cases.iter().enumerate() {
+        let lefts: Vec<f64> = crate::render::pdf::compiled_text_runs(&source, page_index)
+            .unwrap()
+            .into_iter()
+            .filter(|run| run.text == "Overview")
+            .map(|run| run.left_pt)
+            .collect();
+        let [body, heading] = lefts[..] else {
+            panic!("{label}: expected one body and one heading run, got {lefts:?}");
+        };
+        assert!(
+            (body - heading).abs() < 0.01,
+            "{label}: the heading starts at {heading}pt where body copy starts at {body}pt"
+        );
+        if *label != "default" && *label != "left" {
+            assert!(
+                body > left_margin + 1.0,
+                "{label}: the case must move text off the margin to test anything: {body}pt"
+            );
+        }
+    }
+}
+
+/// Build a header paragraph in Word's running-head shape: segments separated
+/// by `<w:tab/>` runs, with the stops that place them declared on the
+/// paragraph.
+#[cfg(not(target_arch = "wasm32"))]
+fn running_head(texts: &[&str], stops: Vec<TabStop>) -> crate::ir::HeaderFooterParagraph {
+    let mut elements: Vec<HFInline> = Vec::new();
+    for (index, text) in texts.iter().enumerate() {
+        if index > 0 {
+            elements.push(HFInline::Run(Run {
+                text: "\t".to_string(),
+                style: TextStyle::default(),
+                href: None,
+                footnote: None,
+                inline_box: None,
+            }));
+        }
+        elements.push(HFInline::Run(Run {
+            text: (*text).to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }));
+    }
+    crate::ir::HeaderFooterParagraph {
+        style: ParagraphStyle {
+            tab_stops: Some(stops),
+            ..ParagraphStyle::default()
+        },
+        elements,
+        border: None,
+        border_space: None,
+        sheet_section_is_rich: false,
+        frame: None,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn stop(position: f64, alignment: TabAlignment) -> TabStop {
+    TabStop {
+        position,
+        alignment,
+        leader: TabLeader::None,
+    }
+}
+
+/// A body paragraph with the same segments and stops as `running_head`.
+#[cfg(not(target_arch = "wasm32"))]
+fn tabbed_body_paragraph(texts: &[&str], stops: Option<Vec<TabStop>>) -> Block {
+    Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            tab_stops: stops,
+            ..ParagraphStyle::default()
+        },
+        runs: vec![Run {
+            text: texts.join("\t"),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_header_tab_places_its_segment_exactly_like_a_body_tab() {
+    // Word advances every tab to the first stop past the pen, in a header as
+    // in the body. Header tabs were instead matched against two running-head
+    // shapes: one tab went to the right margin whenever the last stop was a
+    // right stop, so `<tab>Title` under the Header style's centre and right
+    // stops printed right-aligned instead of centred (issue #1821), and any
+    // other shape collapsed the tab to a space. Body paragraphs already
+    // measure the pen and resolve each tab against the stops, so a header
+    // segment must land exactly where the same runs land in the body.
+    let centre_and_right = || {
+        Some(vec![
+            stop(225.6, TabAlignment::Center),
+            stop(451.3, TabAlignment::Right),
+        ])
+    };
+    let cases: Vec<(Vec<&str>, Option<Vec<TabStop>>)> = vec![
+        // No declared stop: the document's default stops apply. First, because
+        // only the first page's header can be written before the page's
+        // default is in force.
+        (vec!["Section", "Detail"], None),
+        (vec!["", "Centred"], centre_and_right()),
+        (vec!["Confidential", "Draft"], centre_and_right()),
+        (vec!["Left", "Middle", "Margin"], centre_and_right()),
+        // The #579 running head: a lone right stop at the text edge.
+        (
+            vec!["Handbook", "Chapter"],
+            Some(vec![stop(451.3, TabAlignment::Right)]),
+        ),
+        (
+            vec!["Label", "Value"],
+            Some(vec![stop(144.0, TabAlignment::Left)]),
+        ),
+    ];
+    let pages: Vec<Page> = cases
+        .iter()
+        .map(|(texts, stops)| {
+            let mut head = running_head(texts, stops.clone().unwrap_or_default());
+            head.style.tab_stops = stops.clone();
+            let Page::Flow(mut flow) =
+                make_flow_page(vec![tabbed_body_paragraph(texts, stops.clone())])
+            else {
+                unreachable!()
+            };
+            flow.header = Some(crate::ir::HeaderFooter {
+                shapes: Vec::new(),
+                paragraphs: vec![head],
+                distance_from_edge: None,
+                sheet_print_scale: None,
+            });
+            Page::Flow(flow)
+        })
+        .collect();
+    // A declared `w:defaultTabStop` (708 twips) rather than the 36pt fallback,
+    // so a header written before the page's default is in force shows up.
+    let mut doc: Document = make_doc(pages);
+    doc.styles.default_tab_stop_pt = Some(35.4);
+    let source: String = generate_typst(&doc).unwrap().source;
+
+    for (page_index, (texts, _)) in cases.iter().enumerate() {
+        let runs = crate::render::pdf::compiled_text_runs(&source, page_index).unwrap();
+        for text in texts.iter().filter(|text| !text.is_empty()) {
+            let mut placed: Vec<(f64, f64)> = runs
+                .iter()
+                .filter(|run| run.text == *text)
+                .map(|run| (run.baseline_pt, run.left_pt))
+                .collect();
+            placed.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let [(_, header_x), (_, body_x)] = placed[..] else {
+                panic!(
+                    "{texts:?}: expected '{text}' once in the header and once in the body, got {placed:?}"
+                );
+            };
+            assert!(
+                (header_x - body_x).abs() < 0.01,
+                "{texts:?}: header '{text}' starts at {header_x}pt, the body places it at {body_x}pt"
+            );
+        }
+    }
+
+    // The case the running-head shapes got wrong lands on the centre stop,
+    // not the right margin: the stop sits 225.6pt into a 72pt margin.
+    let centred_x: f64 = crate::render::pdf::compiled_text_runs(&source, 1)
+        .unwrap()
+        .into_iter()
+        .filter(|run| run.text == "Centred")
+        .map(|run| run.left_pt)
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        (72.0 + 225.6 - 40.0..72.0 + 225.6).contains(&centred_x),
+        "a lone tab before a centre stop centres its segment on that stop: {centred_x}pt"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_header_tab_leader_takes_the_tab_runs_formatting_like_a_body_tab() {
+    // A leader is the tab character's own ink, in the run holding the tab
+    // (issue #2244). Header tabs are written by a separate path from body
+    // tabs, so both must carry the tab run's size and colour to its leader.
+    let tab_style = TextStyle {
+        font_size: Some(15.0),
+        color: Some(Color::new(192, 0, 0)),
+        ..TextStyle::default()
+    };
+    let plain = |text: &str| Run {
+        text: text.to_string(),
+        style: TextStyle::default(),
+        href: None,
+        footnote: None,
+        inline_box: None,
+    };
+    let tab = Run {
+        text: "\t".to_string(),
+        style: tab_style.clone(),
+        href: None,
+        footnote: None,
+        inline_box: None,
+    };
+    let stops = vec![TabStop {
+        position: 451.3,
+        alignment: TabAlignment::Right,
+        leader: TabLeader::Dot,
+    }];
+    let Page::Flow(mut flow) = make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle {
+            tab_stops: Some(stops.clone()),
+            ..ParagraphStyle::default()
+        },
+        runs: vec![plain("Body"), tab.clone(), plain("4")],
+    })]) else {
+        unreachable!()
+    };
+    let mut head = running_head(&[], stops);
+    head.elements = vec![
+        HFInline::Run(plain("Head")),
+        HFInline::Run(tab),
+        HFInline::Run(plain("9")),
+    ];
+    flow.header = Some(crate::ir::HeaderFooter {
+        shapes: Vec::new(),
+        paragraphs: vec![head],
+        distance_from_edge: None,
+        sheet_print_scale: None,
+    });
+    let source: String = generate_typst(&make_doc(vec![Page::Flow(flow)]))
+        .unwrap()
+        .source;
+    let runs = crate::render::pdf::compiled_text_runs(&source, 0).unwrap();
+
+    let baseline_of = |label: &str| -> f64 {
+        runs.iter()
+            .find(|run| run.text == label)
+            .unwrap_or_else(|| panic!("no run {label:?} in {runs:?}"))
+            .baseline_pt
+    };
+    for (label, baseline_pt) in [
+        ("header", baseline_of("Head")),
+        ("body", baseline_of("Body")),
+    ] {
+        let leaders: Vec<&crate::render::pdf::PlacedTextRun> = runs
+            .iter()
+            .filter(|run| run.text == "." && (run.baseline_pt - baseline_pt).abs() < 0.01)
+            .collect();
+        assert!(
+            leaders.len() > 10,
+            "{label}: expected a row of leader dots, got {runs:?}"
+        );
+        for dot in leaders {
+            assert!(
+                (dot.font_size_pt - 15.0).abs() < 0.01,
+                "{label}: leader size {}pt",
+                dot.font_size_pt
+            );
+            assert_eq!(
+                dot.fill_rgba,
+                Some([192, 0, 0, 255]),
+                "{label}: leader colour"
+            );
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn centered_header_page_field_uses_its_effective_left_and_right_indents() {
+    let page_number_x = |indent_left: Option<f64>, indent_right: Option<f64>| -> f64 {
+        let header_paragraph = crate::ir::HeaderFooterParagraph {
+            style: ParagraphStyle {
+                alignment: Some(Alignment::Center),
+                indent_left,
+                indent_right,
+                ..ParagraphStyle::default()
+            },
+            elements: vec![crate::ir::HFInline::PageNumber(TextStyle::default())],
+            border: None,
+            border_space: None,
+            sheet_section_is_rich: false,
+            frame: None,
+        };
+        let Page::Flow(mut flow) = make_flow_page(Vec::new()) else {
+            unreachable!("the fixture is a flow page");
+        };
+        flow.header = Some(crate::ir::HeaderFooter {
+            shapes: Vec::new(),
+            paragraphs: vec![header_paragraph],
+            distance_from_edge: None,
+            sheet_print_scale: None,
+        });
+        let document: Document = make_doc(vec![Page::Flow(flow)]);
+        let source: String = generate_typst(&document).unwrap().source;
+
+        crate::render::pdf::compiled_text_runs(&source, 0)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.text == "1")
+            .expect("the page-number field should be rendered in the header")
+            .left_pt
+    };
+
+    let no_indents: f64 = page_number_x(None, None);
+    let negative_right_indent: f64 = page_number_x(None, Some(-56.7));
+    let positive_left_indent: f64 = page_number_x(Some(20.0), None);
+    let both_indents: f64 = page_number_x(Some(20.0), Some(8.0));
+
+    assert!(
+        (negative_right_indent - no_indents - 28.35).abs() < 0.05,
+        "a -56.7pt right indent must widen the centered line and move its field 28.35pt right: no-indent={no_indents}pt, negative-right={negative_right_indent}pt"
+    );
+    assert!(
+        (positive_left_indent - no_indents - 10.0).abs() < 0.05,
+        "a 20pt left indent must narrow the centered line and move its field 10pt right: no-indent={no_indents}pt, positive-left={positive_left_indent}pt"
+    );
+    assert!(
+        (both_indents - no_indents - 6.0).abs() < 0.05,
+        "centered placement must account for both indents: no-indent={no_indents}pt, left-and-right={both_indents}pt"
+    );
+}
+
+/// Letter-spacing disables ligatures (issue #684).
+///
+/// Tracking and ligation are mutually exclusive: a ligature replaces several
+/// glyphs with one and swallows the inter-glyph spacing the tracking should
+/// have added. PowerPoint disables ligatures under `a:rPr/@spc` for that
+/// reason. Leaving `liga` on merged the `ffi` in "office2pdf" into one glyph,
+/// so the text layer extracted as "o ffi c e 2 p d f" and matched no search
+/// for the word.
+#[test]
+fn test_letter_spacing_disables_ligatures() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "office2pdf".to_string(),
+            style: TextStyle {
+                letter_spacing: Some(0.5),
+                ..TextStyle::default()
+            },
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("ligatures: false"),
+        "tracked text must disable ligatures, got: {result}"
+    );
+}
+
+/// Triangulation: a run with no tracking keeps ligatures, so the rule is tied
+/// to letter-spacing rather than applied to every run.
+#[test]
+fn test_untracked_text_keeps_ligatures() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "office2pdf".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        !result.contains("ligatures: false"),
+        "untracked text must not disable ligatures, got: {result}"
+    );
+}
+
+/// An explicit zero tracking is not tracking, so it leaves ligatures alone.
+#[test]
+fn test_zero_letter_spacing_keeps_ligatures() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "office2pdf".to_string(),
+            style: TextStyle {
+                letter_spacing: Some(0.0),
+                ..TextStyle::default()
+            },
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        !result.contains("ligatures: false"),
+        "zero tracking must not disable ligatures, got: {result}"
+    );
+}
+
+/// PowerPoint never applies `liga`, so a slide states that once (issue #1058).
+///
+/// The rule is document-wide rather than per-run because it holds for every
+/// slide run, including the emission sites that cannot name their own text.
+#[test]
+fn test_powerpoint_slide_disables_ligatures_document_wide() {
+    let doc = make_doc(vec![make_fixed_page(
+        720.0,
+        540.0,
+        vec![make_text_box(60.0, 200.0, 400.0, 60.0, "Standard setting:")],
+    )]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("#set text(ligatures: false)"),
+        "a slide must switch standard ligatures off for the whole document, \
+         got: {result}"
+    );
+}
+
+/// Triangulation: the rule is keyed to the slide, not switched on for every
+/// document, so a flow page whose document states no ligature default keeps
+/// the engine's. A Word document states its own default and each run its own
+/// answer (issue #2205); see `test_word_run_without_ligatures_switches_them_off`.
+#[test]
+fn test_flow_page_keeps_ligatures_document_wide() {
+    let doc = make_doc(vec![make_flow_page(vec![make_paragraph(
+        "Standard setting:",
+    )])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        !result.contains("ligatures: false"),
+        "a flow page must not disable ligatures document-wide, got: {result}"
+    );
+}
+
+fn word_run_paragraph(text: &str, style: TextStyle) -> Block {
+    Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: text.to_string(),
+            style,
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })
+}
+
+/// A Word run that resolves to no ligatures says so on its own text, because
+/// Typst ligates by default: the Word reference of docxide case8 draws the
+/// `ffi` of `officia` as three glyphs where the face's ligature fused them and
+/// pulled the rest of the line one 10pt cell left (issue #2205).
+#[test]
+fn test_word_run_without_ligatures_switches_them_off() {
+    let doc = make_doc(vec![make_flow_page(vec![word_run_paragraph(
+        "culpa qui officia",
+        TextStyle {
+            ligatures: Some(crate::ir::Ligatures::NONE),
+            ..TextStyle::default()
+        },
+    )])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("ligatures: false"),
+        "a run Word sets without ligatures must switch them off, got: {result}"
+    );
+}
+
+/// Triangulation: a run whose style asks for standard ligatures states them
+/// on in its `#text(...)`, so it ligates even inside content that switched
+/// them off around it. Every Word run resolves a size, so it has one.
+#[test]
+fn test_word_run_with_standard_ligatures_switches_them_on() {
+    let doc = make_doc(vec![make_flow_page(vec![word_run_paragraph(
+        "scientific flow",
+        TextStyle {
+            font_size: Some(11.0),
+            ligatures: Some(crate::ir::Ligatures {
+                standard: true,
+                contextual: true,
+                ..crate::ir::Ligatures::NONE
+            }),
+            ..TextStyle::default()
+        },
+    )])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("ligatures: true") && !result.contains("ligatures: false"),
+        "a run asking for standard ligatures must keep them, got: {result}"
+    );
+    assert!(
+        !result.contains("discretionary-ligatures") && !result.contains("historical-ligatures"),
+        "classes the run does not ask for stay at the engine's off default, got: {result}"
+    );
+}
+
+/// The historical and discretional classes are off unless a run asks for
+/// them, in Word and in Typst alike, so only a request is emitted.
+#[test]
+fn test_word_run_with_historical_and_discretional_ligatures_requests_them() {
+    let doc = make_doc(vec![make_flow_page(vec![word_run_paragraph(
+        "Th ct st",
+        TextStyle {
+            ligatures: Some(crate::ir::Ligatures {
+                historical: true,
+                discretional: true,
+                ..crate::ir::Ligatures::NONE
+            }),
+            ..TextStyle::default()
+        },
+    )])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("ligatures: false")
+            && result.contains("discretionary-ligatures: true")
+            && result.contains("historical-ligatures: true"),
+        "historical and discretional ligatures without standard ones, got: {result}"
+    );
+}
+
+/// Tracking still wins over a stated ligature request (issue #684), and the
+/// run carries one `ligatures:` argument, which Typst requires.
+#[test]
+fn test_tracked_word_run_states_ligatures_once() {
+    let doc = make_doc(vec![make_flow_page(vec![word_run_paragraph(
+        "office2pdf",
+        TextStyle {
+            letter_spacing: Some(0.5),
+            ligatures: Some(crate::ir::Ligatures {
+                standard: true,
+                contextual: true,
+                historical: true,
+                discretional: true,
+            }),
+            ..TextStyle::default()
+        },
+    )])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert_eq!(
+        result.matches("ligatures: ").count(),
+        1,
+        "exactly one ligatures argument, got: {result}"
+    );
+    assert!(
+        result.contains("ligatures: false"),
+        "tracked text must disable ligatures, got: {result}"
+    );
+}
+
+/// A substituted face's kern pairs land on top of the tracking the document
+/// declared, and the combined advance can exceed the gap a PDF text extractor
+/// reads as a word break. On the deck in issue #864 that split five titles —
+/// `ANSATTE` extracted as `ANSAT TE` — while the glyphs rendered continuously.
+#[test]
+fn test_letter_spacing_disables_kerning() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "ANSATTE".to_string(),
+            style: TextStyle {
+                letter_spacing: Some(3.0),
+                ..TextStyle::default()
+            },
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        result.contains("kerning: false"),
+        "tracked text must disable kerning, got: {result}"
+    );
+}
+
+/// Triangulation: an untracked run keeps kerning, so the rule is tied to
+/// letter-spacing and does not flatten every run's pair spacing.
+#[test]
+fn test_untracked_text_keeps_kerning() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "ANSATTE".to_string(),
+            style: TextStyle::default(),
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        !result.contains("kerning: false"),
+        "untracked text must keep kerning, got: {result}"
+    );
+}
+
+/// An explicit zero tracking is not tracking, so it leaves kerning alone —
+/// PowerPoint writes `spc="0"` routinely.
+#[test]
+fn test_zero_letter_spacing_keeps_kerning() {
+    let doc = make_doc(vec![make_flow_page(vec![Block::Paragraph(Paragraph {
+        style: ParagraphStyle::default(),
+        runs: vec![Run {
+            text: "ANSATTE".to_string(),
+            style: TextStyle {
+                letter_spacing: Some(0.0),
+                ..TextStyle::default()
+            },
+            href: None,
+            footnote: None,
+            inline_box: None,
+        }],
+    })])]);
+    let result = generate_typst(&doc).unwrap().source;
+    assert!(
+        !result.contains("kerning: false"),
+        "zero tracking must keep kerning, got: {result}"
+    );
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn native_empty_mark_fixture_preserves_mark_size_in_body_spacing() {
+    use crate::parser::Parser;
+    let data: &[u8] =
+        include_bytes!("../../../../tests/fixtures/docx/issue-2058-empty-paragraph-marks.docx");
+    let (document, _) = crate::parser::docx::DocxParser
+        .parse(data, &crate::ConvertOptions::default())
+        .unwrap();
+    let source = generate_typst(&document).unwrap().source;
+    let runs = crate::render::pdf::compiled_text_runs(&source, 0).unwrap();
+    let baseline = |needle: &str| {
+        runs.iter()
+            .find(|run| run.text.contains(needle))
+            .unwrap()
+            .baseline_pt
+    };
+    let pitch = baseline("Before 20pt") - baseline("After 12pt");
+    assert!((baseline("After 12pt") - baseline("Before 12pt") - 2.0 * pitch).abs() < 0.01);
+    assert!(
+        (baseline("After 20pt") - baseline("Before 20pt") - pitch * (1.0 + 20.0 / 12.0)).abs()
+            < 0.01
+    );
+}

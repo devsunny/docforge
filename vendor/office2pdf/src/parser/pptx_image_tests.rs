@@ -1,0 +1,1566 @@
+use super::*;
+use crate::ir::ImageCrop;
+use crate::test_support::make_test_svg;
+use std::io::{Cursor, Write};
+use zip::write::SimpleFileOptions as FileOptions;
+
+/// Create a minimal valid BMP (1×1 pixel, red) for test images.
+pub(super) fn make_test_bmp() -> Vec<u8> {
+    let mut bmp = Vec::new();
+    // BMP header (14 bytes)
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&70u32.to_le_bytes()); // file size
+    bmp.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    bmp.extend_from_slice(&54u32.to_le_bytes()); // pixel data offset
+    // DIB header (40 bytes)
+    bmp.extend_from_slice(&40u32.to_le_bytes()); // header size
+    bmp.extend_from_slice(&1i32.to_le_bytes()); // width
+    bmp.extend_from_slice(&1i32.to_le_bytes()); // height
+    bmp.extend_from_slice(&1u16.to_le_bytes()); // planes
+    bmp.extend_from_slice(&24u16.to_le_bytes()); // bpp
+    bmp.extend_from_slice(&0u32.to_le_bytes()); // compression
+    bmp.extend_from_slice(&16u32.to_le_bytes()); // image size
+    bmp.extend_from_slice(&2835u32.to_le_bytes()); // h resolution
+    bmp.extend_from_slice(&2835u32.to_le_bytes()); // v resolution
+    bmp.extend_from_slice(&0u32.to_le_bytes()); // colors
+    bmp.extend_from_slice(&0u32.to_le_bytes()); // important colors
+    // Pixel data: 1 pixel (BGR) + 1 byte padding to align to 4 bytes
+    bmp.extend_from_slice(&[0x00, 0x00, 0xFF, 0x00]);
+    bmp
+}
+
+fn append_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn append_i32(out: &mut Vec<u8>, value: i32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn append_i16(out: &mut Vec<u8>, value: i16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_emf_record(out: &mut Vec<u8>, record_type: u32, body: &[u8]) {
+    append_u32(out, record_type);
+    append_u32(out, (body.len() + 8) as u32);
+    out.extend_from_slice(body);
+}
+
+fn make_test_emf_polybezier_fill() -> Vec<u8> {
+    let mut emf = Vec::new();
+
+    push_emf_record(&mut emf, 1, &[]);
+
+    let mut window_org = Vec::new();
+    append_i32(&mut window_org, 0);
+    append_i32(&mut window_org, 0);
+    push_emf_record(&mut emf, 10, &window_org);
+    push_emf_record(&mut emf, 12, &window_org);
+
+    let mut window_ext = Vec::new();
+    append_i32(&mut window_ext, 100);
+    append_i32(&mut window_ext, 100);
+    push_emf_record(&mut emf, 9, &window_ext);
+    push_emf_record(&mut emf, 11, &window_ext);
+
+    let mut polyfill = Vec::new();
+    append_u32(&mut polyfill, 2);
+    push_emf_record(&mut emf, 19, &polyfill);
+
+    let mut brush = Vec::new();
+    append_u32(&mut brush, 1);
+    append_u32(&mut brush, 0);
+    append_u32(&mut brush, 0x0000FF);
+    append_u32(&mut brush, 0);
+    push_emf_record(&mut emf, 39, &brush);
+
+    let mut select_brush = Vec::new();
+    append_u32(&mut select_brush, 1);
+    push_emf_record(&mut emf, 37, &select_brush);
+
+    let mut pen = Vec::new();
+    append_u32(&mut pen, 2);
+    append_u32(&mut pen, 44);
+    append_u32(&mut pen, 0);
+    append_u32(&mut pen, 44);
+    append_u32(&mut pen, 0);
+    append_u32(&mut pen, 5);
+    append_u32(&mut pen, 0);
+    append_u32(&mut pen, 0);
+    append_u32(&mut pen, 0);
+    append_u32(&mut pen, 0);
+    append_u32(&mut pen, 0);
+    push_emf_record(&mut emf, 95, &pen);
+
+    let mut select_pen = Vec::new();
+    append_u32(&mut select_pen, 2);
+    push_emf_record(&mut emf, 37, &select_pen);
+
+    push_emf_record(&mut emf, 59, &[]);
+
+    let mut move_to = Vec::new();
+    append_i32(&mut move_to, 10);
+    append_i32(&mut move_to, 10);
+    push_emf_record(&mut emf, 27, &move_to);
+
+    let mut bezier = Vec::new();
+    append_i32(&mut bezier, 10);
+    append_i32(&mut bezier, 10);
+    append_i32(&mut bezier, 90);
+    append_i32(&mut bezier, 90);
+    append_u32(&mut bezier, 12);
+    for (x, y) in [
+        (10, 10),
+        (90, 10),
+        (90, 10),
+        (90, 10),
+        (90, 90),
+        (90, 90),
+        (90, 90),
+        (10, 90),
+        (10, 90),
+        (10, 90),
+        (10, 10),
+        (10, 10),
+    ] {
+        append_i16(&mut bezier, x);
+        append_i16(&mut bezier, y);
+    }
+    push_emf_record(&mut emf, 88, &bezier);
+
+    push_emf_record(&mut emf, 61, &[]);
+    push_emf_record(&mut emf, 60, &[]);
+
+    let mut fill_path = Vec::new();
+    append_i32(&mut fill_path, 10);
+    append_i32(&mut fill_path, 10);
+    append_i32(&mut fill_path, 90);
+    append_i32(&mut fill_path, 90);
+    push_emf_record(&mut emf, 62, &fill_path);
+
+    let mut delete_brush = Vec::new();
+    append_u32(&mut delete_brush, 1);
+    push_emf_record(&mut emf, 40, &delete_brush);
+
+    let mut delete_pen = Vec::new();
+    append_u32(&mut delete_pen, 2);
+    push_emf_record(&mut emf, 40, &delete_pen);
+
+    let mut eof = Vec::new();
+    append_u32(&mut eof, 0);
+    append_u32(&mut eof, 0);
+    append_u32(&mut eof, 0);
+    push_emf_record(&mut emf, 14, &eof);
+
+    emf
+}
+
+fn make_test_emf_polypolygon_fill() -> Vec<u8> {
+    let mut emf = Vec::new();
+
+    push_emf_record(&mut emf, 1, &[]);
+
+    let mut window_org = Vec::new();
+    append_i32(&mut window_org, 0);
+    append_i32(&mut window_org, 0);
+    push_emf_record(&mut emf, 10, &window_org);
+    push_emf_record(&mut emf, 12, &window_org);
+
+    let mut window_ext = Vec::new();
+    append_i32(&mut window_ext, 100);
+    append_i32(&mut window_ext, 100);
+    push_emf_record(&mut emf, 9, &window_ext);
+    push_emf_record(&mut emf, 11, &window_ext);
+
+    let mut polyfill = Vec::new();
+    append_u32(&mut polyfill, 1);
+    push_emf_record(&mut emf, 19, &polyfill);
+
+    let mut brush = Vec::new();
+    append_u32(&mut brush, 1);
+    append_u32(&mut brush, 0);
+    append_u32(&mut brush, 0x00FF00);
+    append_u32(&mut brush, 0);
+    push_emf_record(&mut emf, 39, &brush);
+
+    let mut select_brush = Vec::new();
+    append_u32(&mut select_brush, 1);
+    push_emf_record(&mut emf, 37, &select_brush);
+
+    let mut pen = Vec::new();
+    append_u32(&mut pen, 2);
+    append_u32(&mut pen, 44);
+    append_u32(&mut pen, 0);
+    append_u32(&mut pen, 44);
+    append_u32(&mut pen, 0);
+    append_u32(&mut pen, 5);
+    append_u32(&mut pen, 0);
+    append_u32(&mut pen, 0);
+    append_u32(&mut pen, 0);
+    append_u32(&mut pen, 0);
+    append_u32(&mut pen, 0);
+    push_emf_record(&mut emf, 95, &pen);
+
+    let mut select_pen = Vec::new();
+    append_u32(&mut select_pen, 2);
+    push_emf_record(&mut emf, 37, &select_pen);
+
+    let mut poly_polygon = Vec::new();
+    append_i32(&mut poly_polygon, 10);
+    append_i32(&mut poly_polygon, 10);
+    append_i32(&mut poly_polygon, 90);
+    append_i32(&mut poly_polygon, 90);
+    append_u32(&mut poly_polygon, 1);
+    append_u32(&mut poly_polygon, 4);
+    append_u32(&mut poly_polygon, 4);
+    for (x, y) in [(10, 10), (90, 10), (90, 90), (10, 90)] {
+        append_i16(&mut poly_polygon, x);
+        append_i16(&mut poly_polygon, y);
+    }
+    push_emf_record(&mut emf, 91, &poly_polygon);
+
+    let mut eof = Vec::new();
+    append_u32(&mut eof, 0);
+    append_u32(&mut eof, 0);
+    append_u32(&mut eof, 0);
+    push_emf_record(&mut emf, 14, &eof);
+
+    emf
+}
+
+/// Create a picture XML element referencing an image via relationship ID.
+pub(super) fn make_pic_xml(x: i64, y: i64, cx: i64, cy: i64, r_embed: &str) -> String {
+    make_custom_pic_xml(
+        x,
+        y,
+        cx,
+        cy,
+        &format!(r#"<a:blip r:embed="{r_embed}"/><a:stretch><a:fillRect/></a:stretch>"#),
+    )
+}
+
+/// Create a picture XML element with custom `<p:blipFill>` contents.
+fn make_custom_pic_xml(x: i64, y: i64, cx: i64, cy: i64, blip_fill_xml: &str) -> String {
+    format!(
+        r#"<p:pic><p:nvPicPr><p:cNvPr id="5" name="Picture"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill>{blip_fill_xml}</p:blipFill><p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm></p:spPr></p:pic>"#
+    )
+}
+
+fn make_live_feed_svg_pic_xml(cx: i64, cy: i64, custom_geometry: &str) -> String {
+    format!(
+        r#"<p:pic><p:nvPicPr><p:cNvPr id="5" name="Cameo"/><p:cNvPicPr><a:picLocks/><a:extLst><a:ext uri="{{51228E76-BA90-4043-B771-695A4F85340A}}"><alf:liveFeedProps xmlns:alf="http://schemas.microsoft.com/office/drawing/2021/livefeed"/></a:ext></a:extLst></p:cNvPicPr><p:nvPr/></p:nvPicPr><p:blipFill><a:blip><a:extLst><a:ext uri="{{96DAC541-7B7A-43D3-B8A5-EBB9C4A54BB8}}"><asvg:svgBlip xmlns:asvg="http://schemas.microsoft.com/office/drawing/2016/SVG/main" r:embed="rId3"/></a:ext></a:extLst></a:blip><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>{custom_geometry}</p:spPr></p:pic>"#
+    )
+}
+
+fn parse_svg_picture(pic: String, svg: &str) -> String {
+    let slide_xml = make_slide_xml(&[pic]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.svg".to_string(),
+        data: svg.as_bytes().to_vec(),
+        relationship_type: None,
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    String::from_utf8(get_image(&page.elements[0]).data.clone()).expect("the asset stays an SVG")
+}
+
+/// Slide image for the test PPTX builder.
+pub(super) struct TestSlideImage {
+    pub(super) rid: String,
+    pub(super) path: String,
+    pub(super) data: Vec<u8>,
+    pub(super) relationship_type: Option<String>,
+}
+
+/// Build a PPTX file with slides that have image relationships.
+pub(super) fn build_test_pptx_with_images(
+    slide_cx_emu: i64,
+    slide_cy_emu: i64,
+    slides: &[(String, Vec<TestSlideImage>)],
+) -> Vec<u8> {
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = FileOptions::default();
+
+    // [Content_Types].xml
+    let mut ct = String::from(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+    ct.push_str(r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">"#);
+    ct.push_str(r#"<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>"#);
+    ct.push_str(r#"<Default Extension="xml" ContentType="application/xml"/>"#);
+    ct.push_str(r#"<Default Extension="png" ContentType="image/png"/>"#);
+    ct.push_str(r#"<Default Extension="bmp" ContentType="image/bmp"/>"#);
+    ct.push_str(r#"<Default Extension="jpeg" ContentType="image/jpeg"/>"#);
+    ct.push_str(r#"<Default Extension="svg" ContentType="image/svg+xml"/>"#);
+    for i in 0..slides.len() {
+        ct.push_str(&format!(
+            r#"<Override PartName="/ppt/slides/slide{}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>"#,
+            i + 1
+        ));
+    }
+    ct.push_str("</Types>");
+    zip.start_file("[Content_Types].xml", opts).unwrap();
+    zip.write_all(ct.as_bytes()).unwrap();
+
+    // _rels/.rels
+    zip.start_file("_rels/.rels", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/></Relationships>"#,
+    )
+    .unwrap();
+
+    // ppt/presentation.xml
+    let mut pres = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:sldSz cx="{}" cy="{}"/><p:sldIdLst>"#,
+        slide_cx_emu, slide_cy_emu
+    );
+    for i in 0..slides.len() {
+        pres.push_str(&format!(
+            r#"<p:sldId id="{}" r:id="rId{}"/>"#,
+            256 + i,
+            2 + i
+        ));
+    }
+    pres.push_str("</p:sldIdLst></p:presentation>");
+    zip.start_file("ppt/presentation.xml", opts).unwrap();
+    zip.write_all(pres.as_bytes()).unwrap();
+
+    // ppt/_rels/presentation.xml.rels
+    let mut pres_rels = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+    );
+    for i in 0..slides.len() {
+        pres_rels.push_str(&format!(
+            r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide{}.xml"/>"#,
+            2 + i,
+            1 + i
+        ));
+    }
+    pres_rels.push_str("</Relationships>");
+    zip.start_file("ppt/_rels/presentation.xml.rels", opts)
+        .unwrap();
+    zip.write_all(pres_rels.as_bytes()).unwrap();
+
+    // Slides and their .rels files
+    for (i, (slide_xml, slide_images)) in slides.iter().enumerate() {
+        let slide_num = i + 1;
+
+        zip.start_file(format!("ppt/slides/slide{slide_num}.xml"), opts)
+            .unwrap();
+        zip.write_all(slide_xml.as_bytes()).unwrap();
+
+        if !slide_images.is_empty() {
+            let mut rels = String::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+            );
+            for img in slide_images {
+                rels.push_str(&format!(
+                    r#"<Relationship Id="{}" Type="{}" Target="{}"/>"#,
+                    img.rid,
+                    img.relationship_type.as_deref().unwrap_or(
+                        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+                    ),
+                    img.path
+                ));
+            }
+            rels.push_str("</Relationships>");
+            zip.start_file(format!("ppt/slides/_rels/slide{slide_num}.xml.rels"), opts)
+                .unwrap();
+            zip.write_all(rels.as_bytes()).unwrap();
+
+            for img in slide_images {
+                let media_path = resolve_relative_path("ppt/slides", &img.path);
+                zip.start_file(media_path, opts).unwrap();
+                zip.write_all(&img.data).unwrap();
+            }
+        }
+    }
+
+    let cursor = zip.finish().unwrap();
+    cursor.into_inner()
+}
+
+pub(super) fn get_image(elem: &FixedElement) -> &ImageData {
+    match &elem.kind {
+        FixedElementKind::Image(img) => img,
+        other => panic!("Expected Image, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_image_basic_extraction() {
+    let bmp_data = make_test_bmp();
+    let pic = make_pic_xml(1_000_000, 500_000, 3_000_000, 2_000_000, "rId3");
+    let slide_xml = make_slide_xml(&[pic]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.bmp".to_string(),
+        data: bmp_data.clone(),
+        relationship_type: None,
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    assert_eq!(page.elements.len(), 1, "Expected 1 image element");
+
+    let elem = &page.elements[0];
+    assert!((elem.x - emu_to_pt(1_000_000)).abs() < 0.1);
+    assert!((elem.y - emu_to_pt(500_000)).abs() < 0.1);
+    assert!((elem.width - emu_to_pt(3_000_000)).abs() < 0.1);
+    assert!((elem.height - emu_to_pt(2_000_000)).abs() < 0.1);
+
+    let img = get_image(elem);
+    assert!(!img.data.is_empty(), "Image data should not be empty");
+    assert_eq!(img.data, bmp_data);
+}
+
+/// A bitmap may be the fill of an ordinary shape rather than a `<p:pic>`.
+/// The page-1 photograph in issue #1220 takes this path: dropping the
+/// `<a:blipFill>` leaves only the translucent shape painted above it.
+#[test]
+fn ordinary_shape_picture_fill_becomes_an_image_element() {
+    let bmp_data = make_test_bmp();
+    let shape = r#"<p:sp><p:nvSpPr><p:cNvPr id="5" name="Photo rectangle"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm rot="5400000" flipH="1"><a:off x="1000000" y="500000"/><a:ext cx="3000000" cy="2000000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:blipFill><a:blip r:embed="rId3"/><a:srcRect l="10000" t="20000" r="30000" b="40000"/><a:stretch><a:fillRect/></a:stretch></a:blipFill></p:spPr></p:sp>"#.to_string();
+    let slide_xml = make_slide_xml(&[shape]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.bmp".to_string(),
+        data: bmp_data.clone(),
+        relationship_type: None,
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    let page = first_fixed_page(&doc);
+    assert_eq!(page.elements.len(), 1);
+    let elem = &page.elements[0];
+    assert!((elem.x - emu_to_pt(1_000_000)).abs() < 0.1);
+    assert!((elem.y - emu_to_pt(500_000)).abs() < 0.1);
+    assert!((elem.width - emu_to_pt(3_000_000)).abs() < 0.1);
+    assert!((elem.height - emu_to_pt(2_000_000)).abs() < 0.1);
+
+    let image = get_image(elem);
+    assert_eq!(image.data, bmp_data);
+    assert_eq!(image.format, ImageFormat::Bmp);
+    assert_eq!(image.rotation_deg, Some(90.0));
+    assert!(image.flip_h);
+    assert!(!image.flip_v);
+    assert_eq!(
+        image.crop,
+        Some(ImageCrop {
+            left: 0.1,
+            top: 0.2,
+            right: 0.3,
+            bottom: 0.4,
+        })
+    );
+}
+
+/// Text belongs above a shape's picture fill in the same shape-tree slot.
+/// Emitting only the bitmap would restore the page-1 photograph in #1220 but
+/// silently drop captions from the other legal form of this construct.
+#[test]
+fn ordinary_shape_picture_fill_keeps_its_text_overlay() {
+    let shape = r#"<p:sp><p:nvSpPr><p:cNvPr id="5" name="Photo caption"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="3000000" cy="2000000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:blipFill><a:blip r:embed="rId3"/><a:stretch><a:fillRect/></a:stretch></a:blipFill></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="en-US"/><a:t>Caption</a:t></a:r></a:p></p:txBody></p:sp>"#.to_string();
+    let slide_xml = make_slide_xml(&[shape]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.bmp".to_string(),
+        data: make_test_bmp(),
+        relationship_type: None,
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let (doc, warnings) = PptxParser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    let page = first_fixed_page(&doc);
+    assert_eq!(page.elements.len(), 2);
+    assert!(matches!(page.elements[0].kind, FixedElementKind::Image(_)));
+    let FixedElementKind::TextBox(ref text_box) = page.elements[1].kind else {
+        panic!("expected text overlay, got {:?}", page.elements[1].kind);
+    };
+    assert!(text_box.fill.is_none());
+    let Block::Paragraph(ref paragraph) = text_box.content[0] else {
+        panic!("expected caption paragraph");
+    };
+    assert_eq!(paragraph.runs[0].text, "Caption");
+}
+
+#[test]
+fn test_image_format_detection() {
+    let bmp_data = make_test_bmp();
+    let pic = make_pic_xml(0, 0, 1_000_000, 1_000_000, "rId3");
+    let slide_xml = make_slide_xml(&[pic]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.bmp".to_string(),
+        data: bmp_data,
+        relationship_type: None,
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let img = get_image(&page.elements[0]);
+    assert_eq!(img.format, ImageFormat::Bmp);
+}
+
+#[test]
+fn test_emf_polybezier_image_is_converted_to_svg() {
+    let emf_data = make_test_emf_polybezier_fill();
+    let pic = make_pic_xml(0, 0, 1_000_000, 1_000_000, "rId3");
+    let slide_xml = make_slide_xml(&[pic]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.emf".to_string(),
+        data: emf_data,
+        relationship_type: None,
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    assert!(
+        warnings.is_empty(),
+        "Expected EMF image to convert without warnings, got: {warnings:?}"
+    );
+
+    let page = first_fixed_page(&doc);
+    let img = get_image(&page.elements[0]);
+    assert_eq!(img.format, ImageFormat::Svg);
+    let svg = String::from_utf8_lossy(&img.data);
+    assert!(svg.contains("<svg"));
+    assert!(svg.contains("<path"));
+    assert!(svg.contains("fill=\"#ff0000\""));
+}
+
+#[test]
+fn test_emf_polypolygon_image_is_converted_to_svg() {
+    let emf_data = make_test_emf_polypolygon_fill();
+    let pic = make_pic_xml(0, 0, 1_000_000, 1_000_000, "rId3");
+    let slide_xml = make_slide_xml(&[pic]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.emf".to_string(),
+        data: emf_data,
+        relationship_type: None,
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    assert!(
+        warnings.is_empty(),
+        "Expected EMF image to convert without warnings, got: {warnings:?}"
+    );
+
+    let page = first_fixed_page(&doc);
+    let img = get_image(&page.elements[0]);
+    assert_eq!(img.format, ImageFormat::Svg);
+    let svg = String::from_utf8_lossy(&img.data);
+    assert!(svg.contains("<svg"));
+    assert!(svg.contains("<path"));
+    assert!(svg.contains("fill=\"#00ff00\""));
+}
+
+#[test]
+fn test_svg_image_extraction() {
+    let svg_data = make_test_svg();
+    let pic = make_pic_xml(0, 0, 1_000_000, 1_000_000, "rId3");
+    let slide_xml = make_slide_xml(&[pic]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.svg".to_string(),
+        data: svg_data.clone(),
+        relationship_type: None,
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    assert_eq!(page.elements.len(), 1, "Expected 1 image element");
+
+    let img = get_image(&page.elements[0]);
+    assert_eq!(img.format, ImageFormat::Svg);
+    assert_eq!(img.data, svg_data);
+}
+
+#[test]
+fn cameo_svg_cover_crops_before_applying_its_custom_geometry() {
+    const SVG: &str = r#"<svg width="300" height="100" viewBox="10 20 300 100" xmlns="http://www.w3.org/2000/svg"><rect x="10" y="20" width="300" height="100"/></svg>"#;
+    const RECTANGLE_GEOMETRY: &str = r#"<a:custGeom><a:avLst/><a:pathLst><a:path w="100" h="100"><a:moveTo><a:pt x="0" y="0"/></a:moveTo><a:lnTo><a:pt x="100" y="0"/></a:lnTo><a:lnTo><a:pt x="100" y="100"/></a:lnTo><a:lnTo><a:pt x="0" y="100"/></a:lnTo><a:close/></a:path></a:pathLst></a:custGeom>"#;
+
+    let svg = parse_svg_picture(
+        make_live_feed_svg_pic_xml(1_000_000, 2_000_000, RECTANGLE_GEOMETRY),
+        SVG,
+    );
+
+    assert!(
+        svg.contains(r#"viewBox="135 20 50 100""#),
+        "a 3:1 feed should be centre-cropped to its 1:2 frame before scaling: {svg}"
+    );
+    assert!(
+        svg.contains(r#"width="50" height="100""#),
+        "the SVG viewport should adopt the cropped aspect ratio: {svg}"
+    );
+    assert!(
+        svg.contains("M 135 20 L 185 20 L 185 120 L 135 120 Z"),
+        "the custom picture clip should span the cropped viewBox, not be cropped with the artwork: {svg}"
+    );
+}
+
+#[test]
+fn cameo_svg_cover_crop_handles_a_tall_feed_in_a_wide_frame() {
+    const SVG: &str = r#"<svg width="100" height="300" viewBox="0 0 100 300" xmlns="http://www.w3.org/2000/svg"><rect width="100" height="300"/></svg>"#;
+
+    let svg = parse_svg_picture(make_live_feed_svg_pic_xml(2_000_000, 1_000_000, ""), SVG);
+
+    assert!(
+        svg.contains(r#"viewBox="0 125 100 50""#),
+        "a 1:3 feed should be centre-cropped to its 2:1 frame: {svg}"
+    );
+    assert!(
+        svg.contains(r#"width="100" height="50""#),
+        "the cropped viewport should have the frame's 2:1 aspect ratio: {svg}"
+    );
+}
+
+#[test]
+fn an_ordinary_svg_keeps_drawingml_stretch_semantics() {
+    const SVG: &str = r#"<svg width="300" height="100" viewBox="10 20 300 100" xmlns="http://www.w3.org/2000/svg"><rect x="10" y="20" width="300" height="100"/></svg>"#;
+    let pic = make_custom_pic_xml(
+        0,
+        0,
+        1_000_000,
+        2_000_000,
+        r#"<a:blip r:embed="rId3"/><a:stretch><a:fillRect/></a:stretch>"#,
+    );
+
+    let svg = parse_svg_picture(pic, SVG);
+
+    assert_eq!(svg, SVG, "ordinary a:stretch remains a non-uniform stretch");
+}
+
+#[test]
+fn test_image_blip_start_tag_with_children_is_extracted() {
+    let bmp_data = make_test_bmp();
+    let pic = make_custom_pic_xml(
+        0,
+        0,
+        1_000_000,
+        1_000_000,
+        r#"<a:blip r:embed="rId3"><a:extLst><a:ext uri="{28A0092B-C50C-407E-A947-70E740481C1C}"/></a:extLst></a:blip><a:stretch><a:fillRect/></a:stretch>"#,
+    );
+    let slide_xml = make_slide_xml(&[pic]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.bmp".to_string(),
+        data: bmp_data.clone(),
+        relationship_type: None,
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    assert_eq!(page.elements.len(), 1, "Expected 1 image element");
+
+    let img = get_image(&page.elements[0]);
+    assert_eq!(img.data, bmp_data);
+}
+
+#[test]
+fn test_svg_blip_is_preferred_over_base_raster() {
+    let bmp_data = make_test_bmp();
+    let svg_data = make_test_svg();
+    let pic = make_custom_pic_xml(
+        0,
+        0,
+        1_000_000,
+        1_000_000,
+        r#"<a:blip r:embed="rId3"><a:extLst><a:ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}"><asvg:svgBlip xmlns:asvg="http://schemas.microsoft.com/office/drawing/2016/SVG/main" r:embed="rId4"/></a:ext></a:extLst></a:blip><a:stretch><a:fillRect/></a:stretch>"#,
+    );
+    let slide_xml = make_slide_xml(&[pic]);
+    let slide_images = vec![
+        TestSlideImage {
+            rid: "rId3".to_string(),
+            path: "../media/image1.bmp".to_string(),
+            data: bmp_data,
+            relationship_type: None,
+        },
+        TestSlideImage {
+            rid: "rId4".to_string(),
+            path: "../media/image2.svg".to_string(),
+            data: svg_data.clone(),
+            relationship_type: None,
+        },
+    ];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let img = get_image(&page.elements[0]);
+    assert_eq!(img.format, ImageFormat::Svg);
+    assert_eq!(img.data, svg_data);
+}
+
+#[test]
+fn test_src_rect_crop_is_extracted() {
+    let bmp_data = make_test_bmp();
+    let pic = make_custom_pic_xml(
+        0,
+        0,
+        2_000_000,
+        1_000_000,
+        r#"<a:blip r:embed="rId3"/><a:srcRect l="25000" t="10000" r="5000" b="20000"/><a:stretch><a:fillRect/></a:stretch>"#,
+    );
+    let slide_xml = make_slide_xml(&[pic]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.bmp".to_string(),
+        data: bmp_data,
+        relationship_type: None,
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let img = get_image(&page.elements[0]);
+    assert_eq!(
+        img.crop,
+        Some(ImageCrop {
+            left: 0.25,
+            top: 0.10,
+            right: 0.05,
+            bottom: 0.20,
+        })
+    );
+}
+
+#[test]
+fn test_unsupported_img_layer_emits_partial_warning_but_keeps_base_image() {
+    let bmp_data = make_test_bmp();
+    let pic = make_custom_pic_xml(
+        0,
+        0,
+        1_000_000,
+        1_000_000,
+        r#"<a:blip r:embed="rId3"><a:extLst><a:ext uri="{BEBA8EAE-BF5A-486C-A8C5-ECC9F3942E4B}"><a14:imgProps xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main"><a14:imgLayer r:embed="rId4"/></a14:imgProps></a:ext></a:extLst></a:blip><a:stretch><a:fillRect/></a:stretch>"#,
+    );
+    let slide_xml = make_slide_xml(&[pic]);
+    let slide_images = vec![
+        TestSlideImage {
+            rid: "rId3".to_string(),
+            path: "../media/image1.bmp".to_string(),
+            data: bmp_data.clone(),
+            relationship_type: None,
+        },
+        TestSlideImage {
+            rid: "rId4".to_string(),
+            path: "../media/image2.wdp".to_string(),
+            data: vec![0x00, 0x01, 0x02],
+            relationship_type: Some(
+                "http://schemas.microsoft.com/office/2007/relationships/hdphoto".to_string(),
+            ),
+        },
+    ];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    assert_eq!(page.elements.len(), 1, "Base image should still render");
+    assert_eq!(get_image(&page.elements[0]).data, bmp_data);
+    assert!(
+        warnings.iter().any(|warning| matches!(
+            warning,
+            ConvertWarning::PartialElement { format, element, detail }
+                if format == "PPTX"
+                    && element.contains("slide 1")
+                    && detail.contains("image layer")
+                    && detail.contains("image2.wdp")
+        )),
+        "Expected partial warning for unsupported image layer, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn test_wdp_only_picture_emits_unsupported_warning() {
+    let pic = make_pic_xml(0, 0, 1_000_000, 1_000_000, "rId3");
+    let slide_xml = make_slide_xml(&[pic]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.wdp".to_string(),
+        data: vec![0x00, 0x01, 0x02],
+        relationship_type: Some(
+            "http://schemas.microsoft.com/office/2007/relationships/hdphoto".to_string(),
+        ),
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    assert_eq!(
+        page.elements.len(),
+        0,
+        "Unsupported WDP image should be omitted"
+    );
+    assert!(
+        warnings.iter().any(|warning| matches!(
+            warning,
+            ConvertWarning::UnsupportedElement { format, element }
+                if format == "PPTX"
+                    && element.contains("slide 1")
+                    && element.contains("image1.wdp")
+        )),
+        "Expected unsupported warning for WDP-only picture, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn test_malformed_png_is_omitted_with_warning() {
+    let pic = make_pic_xml(0, 0, 1_000_000, 1_000_000, "rId3");
+    let slide_xml = make_slide_xml(&[pic]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.png".to_string(),
+        data: b"not a png".to_vec(),
+        relationship_type: None,
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    assert!(
+        page.elements.is_empty(),
+        "Malformed image must not reach the renderer"
+    );
+    assert!(
+        warnings.iter().any(|warning| matches!(
+            warning,
+            ConvertWarning::UnsupportedElement { format, element }
+                if format == "PPTX"
+                    && element.contains("image omitted")
+                    && element.contains("image1.png")
+        )),
+        "Expected an omission warning for malformed PNG, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn test_image_dimensions_preserved() {
+    let bmp_data = make_test_bmp();
+    let pic = make_pic_xml(0, 0, 2_540_000, 1_270_000, "rId3");
+    let slide_xml = make_slide_xml(&[pic]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.bmp".to_string(),
+        data: bmp_data,
+        relationship_type: None,
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let img = get_image(&page.elements[0]);
+    let w = img.width.expect("Expected width");
+    let h = img.height.expect("Expected height");
+    assert!((w - 200.0).abs() < 0.1, "Expected ~200pt, got {w}");
+    assert!((h - 100.0).abs() < 0.1, "Expected ~100pt, got {h}");
+}
+
+#[test]
+fn test_image_with_shapes_and_text() {
+    let bmp_data = make_test_bmp();
+    let text_box = make_text_box(0, 0, 2_000_000, 500_000, "Title");
+    let rect = make_shape(
+        0,
+        600_000,
+        1_000_000,
+        500_000,
+        "rect",
+        Some("AABBCC"),
+        None,
+        None,
+    );
+    let pic = make_pic_xml(2_000_000, 600_000, 1_500_000, 1_000_000, "rId3");
+    let slide_xml = make_slide_xml(&[text_box, rect, pic]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.bmp".to_string(),
+        data: bmp_data,
+        relationship_type: None,
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    assert_eq!(page.elements.len(), 3, "Expected 3 elements");
+    assert!(matches!(
+        &page.elements[0].kind,
+        FixedElementKind::TextBox(_)
+    ));
+    assert!(matches!(&page.elements[1].kind, FixedElementKind::Shape(_)));
+    assert!(matches!(&page.elements[2].kind, FixedElementKind::Image(_)));
+}
+
+#[test]
+fn test_image_missing_rid_ignored() {
+    let pic = make_pic_xml(0, 0, 1_000_000, 1_000_000, "rId99");
+    let slide_xml = make_slide_xml(&[pic]);
+    let data = build_test_pptx(SLIDE_CX, SLIDE_CY, &[slide_xml]);
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    assert_eq!(
+        page.elements.len(),
+        0,
+        "Missing image ref should be skipped"
+    );
+}
+
+#[test]
+fn test_multiple_images_on_slide() {
+    let bmp_data = make_test_bmp();
+    let pic1 = make_pic_xml(0, 0, 1_000_000, 1_000_000, "rId3");
+    let pic2 = make_pic_xml(2_000_000, 0, 1_500_000, 1_000_000, "rId4");
+    let slide_xml = make_slide_xml(&[pic1, pic2]);
+    let slide_images = vec![
+        TestSlideImage {
+            rid: "rId3".to_string(),
+            path: "../media/image1.bmp".to_string(),
+            data: bmp_data.clone(),
+            relationship_type: None,
+        },
+        TestSlideImage {
+            rid: "rId4".to_string(),
+            path: "../media/image2.bmp".to_string(),
+            data: bmp_data,
+            relationship_type: None,
+        },
+    ];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    assert_eq!(page.elements.len(), 2, "Expected 2 image elements");
+    assert!(matches!(&page.elements[0].kind, FixedElementKind::Image(_)));
+    assert!(matches!(&page.elements[1].kind, FixedElementKind::Image(_)));
+}
+
+/// Create a picture XML with custom `<p:spPr>` inner content.
+fn make_pic_xml_with_sp_pr(
+    x: i64,
+    y: i64,
+    cx: i64,
+    cy: i64,
+    r_embed: &str,
+    extra_sp_pr: &str,
+) -> String {
+    format!(
+        r#"<p:pic><p:nvPicPr><p:cNvPr id="5" name="Picture"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="{r_embed}"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>{extra_sp_pr}</p:spPr></p:pic>"#
+    )
+}
+
+#[test]
+fn test_picture_border_solid() {
+    let bmp_data = make_test_bmp();
+    // 19050 EMU = 1.5pt line width, color = 980000 (dark red)
+    let pic = make_pic_xml_with_sp_pr(
+        0,
+        0,
+        2_000_000,
+        1_000_000,
+        "rId3",
+        r#"<a:ln w="19050"><a:solidFill><a:srgbClr val="980000"/></a:solidFill></a:ln>"#,
+    );
+    let slide_xml = make_slide_xml(&[pic]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.bmp".to_string(),
+        data: bmp_data,
+        relationship_type: None,
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    assert_eq!(page.elements.len(), 1);
+
+    let img = get_image(&page.elements[0]);
+    let stroke = img.stroke.as_ref().expect("Expected border stroke");
+    assert!(
+        (stroke.width - 1.5).abs() < 0.01,
+        "Expected 1.5pt, got {}",
+        stroke.width
+    );
+    assert_eq!(stroke.color.r, 0x98);
+    assert_eq!(stroke.color.g, 0x00);
+    assert_eq!(stroke.color.b, 0x00);
+    assert_eq!(stroke.style, BorderLineStyle::Solid);
+}
+
+#[test]
+fn test_picture_no_border() {
+    let bmp_data = make_test_bmp();
+    let pic = make_pic_xml(0, 0, 1_000_000, 1_000_000, "rId3");
+    let slide_xml = make_slide_xml(&[pic]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.bmp".to_string(),
+        data: bmp_data,
+        relationship_type: None,
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let img = get_image(&page.elements[0]);
+    assert!(
+        img.stroke.is_none(),
+        "Expected no stroke for picture without <a:ln>"
+    );
+}
+
+#[test]
+fn test_picture_border_dashed() {
+    let bmp_data = make_test_bmp();
+    let pic = make_pic_xml_with_sp_pr(
+        0,
+        0,
+        1_000_000,
+        1_000_000,
+        "rId3",
+        r#"<a:ln w="25400"><a:solidFill><a:srgbClr val="0000FF"/></a:solidFill><a:prstDash val="dash"/></a:ln>"#,
+    );
+    let slide_xml = make_slide_xml(&[pic]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.bmp".to_string(),
+        data: bmp_data,
+        relationship_type: None,
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let img = get_image(&page.elements[0]);
+    let stroke = img.stroke.as_ref().expect("Expected dashed border");
+    assert!(
+        (stroke.width - 2.0).abs() < 0.01,
+        "Expected 2.0pt, got {}",
+        stroke.width
+    );
+    assert_eq!(stroke.color.b, 0xFF);
+    assert_eq!(stroke.style, BorderLineStyle::Dashed);
+}
+
+#[test]
+fn test_picture_alpha_mod_fix_bakes_transparency() {
+    // <a:alphaModFix amt="40000"/> = 40% opacity; Typst has no image
+    // opacity, so the alpha channel must carry it.
+    let bmp_data = make_test_bmp();
+    let pic_xml = r#"<p:pic><p:nvPicPr><p:cNvPr id="5" name="P"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId7"><a:alphaModFix amt="40000"/></a:blip><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm></p:spPr></p:pic>"#;
+    let slide_xml = make_slide_xml(&[pic_xml.to_string()]);
+    let data = build_test_pptx_with_images(
+        SLIDE_CX,
+        SLIDE_CY,
+        &[(
+            slide_xml,
+            vec![TestSlideImage {
+                rid: "rId7".to_string(),
+                path: "image1.bmp".to_string(),
+                data: bmp_data,
+                relationship_type: None,
+            }],
+        )],
+    );
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let page = first_fixed_page(&doc);
+    let image = get_image(&page.elements[0]);
+    assert_eq!(image.format, ImageFormat::Png);
+    let decoded = image::load_from_memory(&image.data).unwrap().into_rgba8();
+    let alpha = decoded.get_pixel(0, 0)[3];
+    assert!(
+        (alpha as i32 - 102).abs() <= 2,
+        "alpha {alpha} should be ~102"
+    );
+}
+
+#[test]
+fn grayscale_blip_effect_converts_the_layout_photo_to_luminance() {
+    let presentation_data: &[u8] =
+        include_bytes!("../../../../tests/fixtures/pptx/oxp_PB001-Input1.pptx");
+    let parser: PptxParser = PptxParser;
+    let (document, _warnings) = parser
+        .parse(presentation_data, &ConvertOptions::default())
+        .unwrap();
+    let page = first_fixed_page(&document);
+    let photo_element = page
+        .elements
+        .iter()
+        .find(|element| {
+            matches!(element.kind, FixedElementKind::Image(_))
+                && element.width > 400.0
+                && element.height > 200.0
+        })
+        .expect("the title-slide photo from its layout is present");
+    let photo = get_image(photo_element);
+
+    assert_eq!(photo.format, ImageFormat::Png);
+    let rgba = image::load_from_memory(&photo.data).unwrap().into_rgba8();
+    assert!(
+        rgba.pixels()
+            .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2]),
+        "a:grayscl must map every photo pixel to equal RGB channels"
+    );
+}
+
+#[test]
+fn picture_grayscale_effect_preserves_alpha_mod_fix() {
+    let pic_xml = r#"<p:pic><p:nvPicPr><p:cNvPr id="5" name="P"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId7"><a:grayscl/><a:alphaModFix amt="40000"/></a:blip><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm></p:spPr></p:pic>"#;
+    let slide_xml = make_slide_xml(&[pic_xml.to_string()]);
+    let source_pixels = image::RgbaImage::from_fn(3, 1, |x, _| match x {
+        0 => image::Rgba([255, 0, 0, 128]),
+        1 => image::Rgba([0, 255, 0, 64]),
+        _ => image::Rgba([0, 0, 255, 255]),
+    });
+    let mut source_png = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(source_pixels)
+        .write_to(&mut source_png, image::ImageFormat::Png)
+        .unwrap();
+    let data = build_test_pptx_with_images(
+        SLIDE_CX,
+        SLIDE_CY,
+        &[(
+            slide_xml,
+            vec![TestSlideImage {
+                rid: "rId7".to_string(),
+                path: "image1.png".to_string(),
+                data: source_png.into_inner(),
+                relationship_type: None,
+            }],
+        )],
+    );
+
+    let (document, _warnings) = PptxParser.parse(&data, &ConvertOptions::default()).unwrap();
+    let image = get_image(&first_fixed_page(&document).elements[0]);
+    assert_eq!(image.format, ImageFormat::Png);
+    let output = image::load_from_memory(&image.data).unwrap().into_rgba8();
+    let lumas = output.pixels().map(|pixel| pixel[0]).collect::<Vec<_>>();
+    assert!(lumas[1] > lumas[0] && lumas[0] > lumas[2]);
+    assert!(
+        output
+            .pixels()
+            .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2])
+    );
+    let alphas = output.pixels().map(|pixel| pixel[3]).collect::<Vec<_>>();
+    assert_eq!(alphas, [51, 26, 102]);
+}
+
+#[test]
+fn ordinary_shape_picture_fill_honors_grayscale_effect() {
+    let shape = r#"<p:sp><p:nvSpPr><p:cNvPr id="5" name="Photo rectangle"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:blipFill><a:blip r:embed="rId3"><a:grayscl/></a:blip></a:blipFill></p:spPr></p:sp>"#.to_string();
+    let slide_xml = make_slide_xml(&[shape]);
+    let data = build_test_pptx_with_images(
+        SLIDE_CX,
+        SLIDE_CY,
+        &[(
+            slide_xml,
+            vec![TestSlideImage {
+                rid: "rId3".to_string(),
+                path: "image1.bmp".to_string(),
+                data: make_test_bmp(),
+                relationship_type: None,
+            }],
+        )],
+    );
+
+    let (document, _warnings) = PptxParser.parse(&data, &ConvertOptions::default()).unwrap();
+    let image = get_image(&first_fixed_page(&document).elements[0]);
+    assert_eq!(image.format, ImageFormat::Png);
+    let rgba = image::load_from_memory(&image.data).unwrap().into_rgba8();
+    assert!(
+        rgba.pixels()
+            .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2])
+    );
+}
+
+#[test]
+fn test_picture_without_alpha_keeps_original_bytes() {
+    let bmp_data = make_test_bmp();
+    let pic_xml = make_pic_xml(0, 0, 914_400, 914_400, "rId7");
+    let slide_xml = make_slide_xml(&[pic_xml]);
+    let data = build_test_pptx_with_images(
+        SLIDE_CX,
+        SLIDE_CY,
+        &[(
+            slide_xml,
+            vec![TestSlideImage {
+                rid: "rId7".to_string(),
+                path: "image1.bmp".to_string(),
+                data: bmp_data.clone(),
+                relationship_type: None,
+            }],
+        )],
+    );
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let page = first_fixed_page(&doc);
+    let image = get_image(&page.elements[0]);
+    assert_eq!(image.data, bmp_data);
+}
+
+#[test]
+fn test_picture_crop_to_ellipse_sets_clip_shape() {
+    // An 8x8 opaque image so the corners fall outside the inscribed ellipse.
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        8,
+        8,
+        image::Rgba([10, 20, 30, 255]),
+    ))
+    .write_to(&mut png, image::ImageFormat::Png)
+    .unwrap();
+    let bmp_data = png.into_inner();
+    let pic_xml = r#"<p:pic><p:nvPicPr><p:cNvPr id="5" name="P"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId7"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm><a:prstGeom prst="ellipse"><a:avLst/></a:prstGeom></p:spPr></p:pic>"#;
+    let slide_xml = make_slide_xml(&[pic_xml.to_string()]);
+    let data = build_test_pptx_with_images(
+        SLIDE_CX,
+        SLIDE_CY,
+        &[(
+            slide_xml,
+            vec![TestSlideImage {
+                rid: "rId7".to_string(),
+                path: "image1.png".to_string(),
+                data: bmp_data,
+                relationship_type: None,
+            }],
+        )],
+    );
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let page = first_fixed_page(&doc);
+    let image = get_image(&page.elements[0]);
+    // Elliptical clips are baked into the alpha channel (PNG re-encode).
+    assert_eq!(image.clip_shape, None);
+    assert_eq!(image.format, ImageFormat::Png);
+    let decoded = image::load_from_memory(&image.data).unwrap().into_rgba8();
+    assert_eq!(
+        decoded.get_pixel(0, 0)[3],
+        0,
+        "corner outside ellipse must be transparent"
+    );
+}
+
+#[test]
+fn test_picture_crop_to_round_rect_uses_adjust() {
+    let bmp_data = make_test_bmp();
+    let pic_xml = r#"<p:pic><p:nvPicPr><p:cNvPr id="5" name="P"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId7"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm><a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val 25000"/></a:avLst></a:prstGeom></p:spPr></p:pic>"#;
+    let slide_xml = make_slide_xml(&[pic_xml.to_string()]);
+    let data = build_test_pptx_with_images(
+        SLIDE_CX,
+        SLIDE_CY,
+        &[(
+            slide_xml,
+            vec![TestSlideImage {
+                rid: "rId7".to_string(),
+                path: "image1.bmp".to_string(),
+                data: bmp_data,
+                relationship_type: None,
+            }],
+        )],
+    );
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let page = first_fixed_page(&doc);
+    let image = get_image(&page.elements[0]);
+    assert_eq!(image.clip_shape, Some(ImageClipShape::RoundedRect(0.25)));
+}
+
+#[test]
+fn test_plain_rect_picture_has_no_clip_shape() {
+    let bmp_data = make_test_bmp();
+    let pic_xml = make_pic_xml(0, 0, 914_400, 914_400, "rId7");
+    let slide_xml = make_slide_xml(&[pic_xml]);
+    let data = build_test_pptx_with_images(
+        SLIDE_CX,
+        SLIDE_CY,
+        &[(
+            slide_xml,
+            vec![TestSlideImage {
+                rid: "rId7".to_string(),
+                path: "image1.bmp".to_string(),
+                data: bmp_data,
+                relationship_type: None,
+            }],
+        )],
+    );
+
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+    let page = first_fixed_page(&doc);
+    assert_eq!(get_image(&page.elements[0]).clip_shape, None);
+}
+
+#[test]
+fn test_picture_outer_shadow_parsed() {
+    // a:effectLst/a:outerShdw on p:pic was dropped, losing the card-like
+    // frame around chart images (issue #360).
+    let bmp_data = make_test_bmp();
+    let pic = r##"<p:pic><p:nvPicPr><p:cNvPr id="5" name="Chart"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId3"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="2000000" cy="1000000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:effectLst><a:outerShdw blurRad="114300" dist="38100" dir="5400000" algn="bl" rotWithShape="0"><a:srgbClr val="000000"><a:alpha val="22000"/></a:srgbClr></a:outerShdw></a:effectLst></p:spPr></p:pic>"##;
+    let slide_xml = make_slide_xml(&[pic.to_string()]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.bmp".to_string(),
+        data: bmp_data,
+        relationship_type: None,
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let img = get_image(&page.elements[0]);
+    let shadow = img.shadow.as_ref().expect("picture shadow must be parsed");
+    assert!((shadow.opacity - 0.22).abs() < 0.01);
+    assert!((shadow.distance - 3.0).abs() < 0.1, "38100 EMU = 3pt");
+}
+
+/// A picture inside a rotated `<p:grpSp>` takes the group's angle, the way a
+/// shape and a text box already do (issue #895).
+///
+/// `GroupTransform::apply` orbits every child around the group centre but only
+/// composed the angle into a `Shape` and, since #894, a `TextBox`. A picture
+/// was moved into place and then drawn upright: measured against a LibreOffice
+/// 24.2 export of a 90°-rotated group holding a 4x2 bitmap, the reference drew
+/// it 47.2 x 125.9pt where we drew it 126.0 x 47.2pt.
+#[test]
+fn a_picture_in_a_rotated_group_takes_the_groups_angle() {
+    let bmp_data = make_test_bmp();
+    let pic = make_pic_xml(0, 0, 1_600_000, 600_000, "rId3");
+    let group = format!(
+        r#"<p:grpSp><p:nvGrpSpPr><p:cNvPr id="10" name="G"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm rot="5400000"><a:off x="4000000" y="2000000"/><a:ext cx="1600000" cy="600000"/><a:chOff x="0" y="0"/><a:chExt cx="1600000" cy="600000"/></a:xfrm></p:grpSpPr>{pic}</p:grpSp>"#
+    );
+    let slide_xml = make_slide_xml(&[group]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.bmp".to_string(),
+        data: bmp_data,
+        relationship_type: None,
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let image = get_image(&page.elements[0]);
+    let rotation = image
+        .rotation_deg
+        .expect("a picture in a rotated group must carry the group's angle");
+    assert!(
+        (rotation - 90.0).abs() < 0.01,
+        "expected 90 degrees, got {rotation}"
+    );
+}
+
+/// Triangulation: the group's angle adds to the picture's own, and an
+/// unrotated group leaves a picture unrotated.
+#[test]
+fn a_group_angle_adds_to_a_pictures_own_rotation() {
+    for (group_rot, pic_rot, expected) in [
+        (Some(5_400_000_i64), Some(1_800_000_i64), Some(120.0_f64)),
+        (None, None, None),
+    ] {
+        let pic_xfrm = match pic_rot {
+            Some(rot) => format!(r#"<a:xfrm rot="{rot}">"#),
+            None => "<a:xfrm>".to_string(),
+        };
+        let pic = format!(
+            r#"<p:pic><p:nvPicPr><p:cNvPr id="5" name="Picture"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId3"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr>{pic_xfrm}<a:off x="0" y="0"/><a:ext cx="1600000" cy="600000"/></a:xfrm></p:spPr></p:pic>"#
+        );
+        let group_xfrm = match group_rot {
+            Some(rot) => format!(r#"<a:xfrm rot="{rot}">"#),
+            None => "<a:xfrm>".to_string(),
+        };
+        let group = format!(
+            r#"<p:grpSp><p:nvGrpSpPr><p:cNvPr id="10" name="G"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr>{group_xfrm}<a:off x="4000000" y="2000000"/><a:ext cx="1600000" cy="600000"/><a:chOff x="0" y="0"/><a:chExt cx="1600000" cy="600000"/></a:xfrm></p:grpSpPr>{pic}</p:grpSp>"#
+        );
+        let slide_xml = make_slide_xml(&[group]);
+        let slide_images = vec![TestSlideImage {
+            rid: "rId3".to_string(),
+            path: "../media/image1.bmp".to_string(),
+            data: make_test_bmp(),
+            relationship_type: None,
+        }];
+        let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+        let parser = PptxParser;
+        let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+        let page = first_fixed_page(&doc);
+        match (get_image(&page.elements[0]).rotation_deg, expected) {
+            (None, None) => {}
+            (Some(actual), Some(want)) => assert!(
+                (actual - want).abs() < 0.01,
+                "expected {want} degrees, got {actual}"
+            ),
+            (actual, want) => panic!("expected {want:?}, got {actual:?}"),
+        }
+    }
+}
+
+/// Picture mirrors live on the same `a:xfrm` as rotation. Dropping them left
+/// rotated, cropped SVG artwork on the wrong side of its frame (issue #1017).
+#[test]
+fn a_picture_keeps_both_frame_flip_attributes() {
+    let pic = r#"<p:pic><p:nvPicPr><p:cNvPr id="5" name="Picture"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId3"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm rot="5400000" flipH="true" flipV="1"><a:off x="0" y="0"/><a:ext cx="1600000" cy="600000"/></a:xfrm></p:spPr></p:pic>"#;
+    let slide_xml = make_slide_xml(&[pic.to_string()]);
+    let slide_images = vec![TestSlideImage {
+        rid: "rId3".to_string(),
+        path: "../media/image1.bmp".to_string(),
+        data: make_test_bmp(),
+        relationship_type: None,
+    }];
+    let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+    let parser = PptxParser;
+    let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+    let page = first_fixed_page(&doc);
+    let image = get_image(&page.elements[0]);
+    assert!(image.flip_h, "flipH=true must survive parsing");
+    assert!(image.flip_v, "flipV=1 must survive parsing");
+    assert_eq!(image.rotation_deg, Some(90.0));
+}
+
+/// A picture outline carries its `a:ln/@cap` too: `p:pic/p:spPr/a:ln` is the
+/// same DrawingML line as a shape's, so an explicit `rnd` or `sq` has to reach
+/// the image's stroke rather than ending flat (issue #1682).
+#[test]
+fn picture_outline_carries_its_stated_line_cap() {
+    for (cap_attribute, expected) in [
+        ("", LineCap::Flat),
+        (r#" cap="flat""#, LineCap::Flat),
+        (r#" cap="rnd""#, LineCap::Round),
+        (r#" cap="sq""#, LineCap::Square),
+    ] {
+        let bmp_data = make_test_bmp();
+        let pic = make_pic_xml_with_sp_pr(
+            0,
+            0,
+            2_000_000,
+            1_000_000,
+            "rId3",
+            &format!(
+                r#"<a:ln w="19050"{cap_attribute}><a:solidFill><a:srgbClr val="980000"/></a:solidFill></a:ln>"#
+            ),
+        );
+        let slide_xml = make_slide_xml(&[pic]);
+        let slide_images = vec![TestSlideImage {
+            rid: "rId3".to_string(),
+            path: "../media/image1.bmp".to_string(),
+            data: bmp_data,
+            relationship_type: None,
+        }];
+        let data = build_test_pptx_with_images(SLIDE_CX, SLIDE_CY, &[(slide_xml, slide_images)]);
+        let parser = PptxParser;
+        let (doc, _warnings) = parser.parse(&data, &ConvertOptions::default()).unwrap();
+
+        let page = first_fixed_page(&doc);
+        let img = get_image(&page.elements[0]);
+        let stroke = img.stroke.as_ref().expect("expected a picture outline");
+        assert_eq!(stroke.cap, expected, "cap attribute `{cap_attribute}`");
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn picture_and_shape_fills_share_the_destination_rectangle_mapping() {
+    for is_shape in [false, true] {
+        for is_svg in [false, true] {
+            for fill in [
+                "<a:fillRect l=\"-25000\" t=\"10000\" r=\"50000\" b=\"20000\"/>",
+                "<a:fillRect l=\"-25%\" t=\"10%\" r=\"50%\" b=\"20%\"></a:fillRect>",
+            ] {
+                let fill_xml = format!(
+                    "<a:blip r:embed=\"rId3\"/><a:srcRect l=\"25000\"/><a:stretch>{fill}</a:stretch>"
+                );
+                let element = if is_shape {
+                    format!(
+                        r#"<p:sp><p:nvSpPr><p:cNvPr id="5" name="Grid"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="1270000" y="635000"/><a:ext cx="2540000" cy="1270000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:blipFill>{fill_xml}</a:blipFill></p:spPr></p:sp>"#
+                    )
+                } else {
+                    make_custom_pic_xml(1_270_000, 635_000, 2_540_000, 1_270_000, &fill_xml)
+                };
+                let source = build_test_pptx_with_images(
+                    SLIDE_CX,
+                    SLIDE_CY,
+                    &[(
+                        make_slide_xml(&[element]),
+                        vec![TestSlideImage {
+                            rid: "rId3".into(),
+                            path: if is_svg {
+                                "../media/grid.svg"
+                            } else {
+                                "../media/grid.bmp"
+                            }
+                            .into(),
+                            data: if is_svg {
+                                make_test_svg()
+                            } else {
+                                make_test_bmp()
+                            },
+                            relationship_type: None,
+                        }],
+                    )],
+                );
+                let (document, warnings) = PptxParser
+                    .parse(&source, &ConvertOptions::default())
+                    .unwrap();
+                assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+                let generated = crate::render::typst_gen::generate_typst(&document).unwrap();
+                let images =
+                    crate::render::pdf::compiled_image_bounds(&generated.source, &generated.images)
+                        .unwrap();
+                assert_eq!(images.len(), 1);
+                let bounds = images[0];
+                for (actual, expected) in [
+                    (bounds.left_pt, 50.0),
+                    (bounds.top_pt, 60.0),
+                    (bounds.width_pt, 150.0),
+                    (bounds.height_pt, 70.0),
+                ] {
+                    assert!(
+                        (actual - expected).abs() < 0.01,
+                        "{is_shape} {fill}: {images:?}"
+                    );
+                }
+                assert!(bounds.is_clipped);
+            }
+        }
+    }
+}

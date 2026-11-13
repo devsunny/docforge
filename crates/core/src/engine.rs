@@ -106,12 +106,18 @@ impl EngineRegistry {
     }
 
     pub fn native_only() -> Self {
-        Self::new(vec![Arc::new(crate::native::NativeEngine::new())])
+        Self::new(vec![
+            Arc::new(crate::native::NativeEngine::new()),
+            Arc::new(crate::ocr::NativeOcrEngine),
+        ])
     }
 
     /// Build the default registry, probing optional external tools.
     pub fn detect() -> Self {
-        let mut engines: Vec<Arc<dyn Engine>> = vec![Arc::new(crate::native::NativeEngine::new())];
+        let mut engines: Vec<Arc<dyn Engine>> = vec![
+            Arc::new(crate::native::NativeEngine::new()),
+            Arc::new(crate::ocr::NativeOcrEngine),
+        ];
         engines.extend(crate::external::detected_engines());
         Self::new(engines)
     }

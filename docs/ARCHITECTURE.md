@@ -4,7 +4,7 @@
 
 1. **One catalog, two interfaces.** The 100 conversions in `catalog/conversions.json` are the product contract. REST and MCP read the same catalog, the same planner, and the same engines.
 2. **Arbitrary source/target pairs where possible.** Direct catalog rows are preferred, but the planner can chain engines across intermediate formats. This is how `PPTX → JPG` works via `PPTX → PDF → JPG`, or `DOC → DOCX` via LibreOffice or `DOC → TXT → DOCX`.
-3. **Graceful degradation.** The native Rust engine runs without external binaries. Optional engines are probed at startup; missing tools are visible in `/api/v1/engines` and excluded from routing.
+3. **Graceful degradation.** The native Rust engines run without external binaries, including DOCX/PPTX/XLSX→PDF (Typst), PDF→raster, and English/Latin OCR. Optional engines are probed at startup; missing tools are visible in `/api/v1/engines` and excluded from routing.
 4. **OAuth is part of the product.** Docker Compose uses **Keycloak** (RS256 JWT, PKCE, DCR) as the local identity provider; DocForge serves RFC 9728 resource metadata and validates Keycloak tokens via the realm JWKS. A self-contained Ed25519 authorization server remains available with `AUTH_MODE=embedded` for zero-dependency runs and tests.
 
 ## Runtime topology
@@ -47,6 +47,9 @@ Catalog rows carry availability computed by the planner at startup, but the plan
 | `document/` | `Document` block model; DOCX/ODT/RTF/PDF/EPUB/PPTX readers/writers |
 | `data.rs` | CSV/TSV/XLSX/XLS/ODS, JSON/YAML/TOML/XML, VCF/ICS, images, CBZ |
 | `native.rs` | Route matrix and dispatch for the pure-Rust engine |
+| `office.rs` | DOCX/PPTX/XLSX → PDF through vendored `office2pdf`/Typst |
+| `pdf_raster.rs` | Pure-Rust PDF page rasterization through `pdf-render` |
+| `ocr.rs` | Native OCR engine through embedded `ocrs` models |
 | `external.rs` | LibreOffice, Pandoc, Poppler, Ghostscript, ImageMagick, Calibre, Tesseract, 7-Zip, DjVu, gxps, antiword, FFmpeg, iWork |
 | `detect.rs` | Content-based detection |
 | `service.rs` | Planner + engine execution + inline byte conversion |

@@ -1,0 +1,874 @@
+//! Column-wise pagination for sheets wider than the printable page.
+//!
+//! Excel prints columns that overflow the page width on subsequent pages
+//! (default order: down, then over). office2pdf previously clipped them at
+//! the right page edge, silently losing content.
+//!
+//! An unwrapped line that spills past a page-column boundary is printed
+//! again on the next page-column, shifted left by the width already printed
+//! (issue #1381); see [`slice_table_columns`].
+//!
+//! A drawing-only sheet has no columns to split on, so its page-columns come
+//! from the drawings' extents instead ([`split_drawing_only_page`],
+//! issue #713).
+
+use crate::ir::{
+    Block, HFInline, HeaderFooter, SheetChart, SheetClipWindow, SheetPage, Table, TableCell,
+    TableRow,
+};
+
+/// Upper bound on overflow pages per sheet chunk. Pathological sheets (used
+/// ranges thousands of columns wide) would otherwise explode into thousands
+/// of pages and blow the Typst compiler's stack; columns beyond the cap stay
+/// on the last page (clipped, the pre-pagination behavior).
+const MAX_COLUMN_GROUPS: usize = 12;
+
+/// Worksheet print scaling: an explicit percentage, or fit-to-page bounds.
+/// Fit-to-page takes precedence; among its two bounds Excel obeys the tighter.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(super) struct SheetFit {
+    /// Whether `<sheetPr><pageSetUpPr fitToPage="1"/>` selects fit-to-page.
+    ///
+    /// This is not implied by the two bounds below: a sheet can select
+    /// fit-to-page and still leave both directions unbounded
+    /// (`fitToWidth="0" fitToHeight="0"`), which scales nothing but does
+    /// suppress [`Self::print_percentage`] (issue #1817).
+    pub(super) fits_to_page: bool,
+    /// `<pageSetup scale>` as the sheet declares it — Excel's "Adjust to: N%
+    /// normal size". Already filtered to a percentage that changes a
+    /// dimension, so it always scales once it is the selected mode
+    /// (issue #1817).
+    pub(super) print_percentage: Option<u32>,
+    /// `fitToWidth` when it binds; `None` leaves the column direction free.
+    pub(super) pages_wide: Option<u32>,
+    /// `fitToHeight` when it binds; `None` leaves the row direction free.
+    pub(super) pages_tall: Option<u32>,
+    /// The printed grid height of the *whole* sheet in points, which is what
+    /// the row bound is measured against. The page handed to pagination may
+    /// carry one streaming chunk or one explicit-break segment of that sheet,
+    /// so its own rows cannot supply the total. Unread when `pages_tall` is
+    /// `None`.
+    pub(super) sheet_height_pt: f64,
+}
+
+/// Split a sheet page into column groups that each fit the printable width.
+/// Returns the page unchanged when everything fits. `title_columns` is the
+/// 0-based inclusive-exclusive range of print-title columns (from
+/// `_xlnm.Print_Titles`) repeated at the left of every overflow page.
+pub(super) fn split_sheet_page_by_width(
+    page: SheetPage,
+    title_columns: Option<(usize, usize)>,
+    fit: SheetFit,
+    header_footer_scales_with_doc: bool,
+) -> Vec<SheetPage> {
+    let page: SheetPage = fit_page_to_pages(page, fit, header_footer_scales_with_doc);
+    let printable_width: f64 = page.size.width - page.margins.left - page.margins.right;
+    let total_width: f64 = page.table.column_widths.iter().sum();
+    if total_width <= printable_width || page.table.column_widths.len() <= 1 {
+        return vec![page];
+    }
+
+    let title_columns: Option<(usize, usize)> = title_columns
+        .map(|(start, end)| (start, end.min(page.table.column_widths.len())))
+        .filter(|(start, end)| start < end);
+    // Reserve the repeated title width so overflow groups still fit the
+    // page. The first group holds the title columns physically (they never
+    // get prepended to it), so it packs against the full printable width —
+    // reserving there too underpacked page 1 by the title width (issue #623
+    // adversarial review, finding 3).
+    let title_width: f64 = title_columns
+        .map(|(start, end)| page.table.column_widths[start..end].iter().sum())
+        .unwrap_or(0.0);
+    let widest_column: f64 = page.table.column_widths.iter().cloned().fold(0.0, f64::max);
+    let first_group_packing_width: f64 = printable_width.max(widest_column);
+    let overflow_packing_width: f64 = (printable_width - title_width).max(widest_column);
+
+    let mut groups: Vec<(usize, usize)> = column_groups(
+        &page.table.column_widths,
+        first_group_packing_width,
+        overflow_packing_width,
+    );
+    if groups.len() <= 1 {
+        return vec![page];
+    }
+    if groups.len() > MAX_COLUMN_GROUPS {
+        let column_count = page.table.column_widths.len();
+        groups.truncate(MAX_COLUMN_GROUPS);
+        if let Some(last) = groups.last_mut() {
+            last.1 = column_count;
+        }
+    }
+
+    let title_table: Option<Table> =
+        title_columns.map(|(start, end)| slice_table_columns(&page.table, start, end).table);
+
+    let mut result: Vec<SheetPage> = Vec::with_capacity(groups.len());
+    let mut last_group_inked_row_count: usize = 0;
+    for (index, &(start, end)) in groups.iter().enumerate() {
+        let ColumnGroupSlice {
+            mut table,
+            inked_row_count,
+        } = slice_table_columns(&page.table, start, end);
+        last_group_inked_row_count = inked_row_count;
+        // Excel repeats title columns on pages that no longer show them.
+        let mut repeated_title_width_pt: f64 = 0.0;
+        if let (Some(title_table), Some((title_start, _))) = (title_table.as_ref(), title_columns)
+            && start > title_start
+        {
+            table = prepend_title_columns(title_table, table);
+            repeated_title_width_pt = title_width;
+        }
+        // The window this page-column prints, in sheet points, and where its
+        // own columns begin on the page once the repeated titles are in front.
+        let window_left_pt: f64 = page.table.column_widths[..start].iter().sum();
+        let window = SheetClipWindow {
+            left_pt: repeated_title_width_pt,
+            width_pt: page.table.column_widths[start..end].iter().sum(),
+        };
+        result.push(SheetPage {
+            name: page.name.clone(),
+            size: page.size,
+            margins: page.margins,
+            table,
+            header: page.header.clone(),
+            footer: page.footer.clone(),
+            charts: charts_on_page_column(&page.charts, window_left_pt, window, index == 0),
+            // Images, text boxes and shapes anchor to rows of the first
+            // column group only.
+            images: if index == 0 {
+                page.images.clone()
+            } else {
+                Vec::new()
+            },
+            text_boxes: if index == 0 {
+                page.text_boxes.clone()
+            } else {
+                Vec::new()
+            },
+            shapes: if index == 0 {
+                page.shapes.clone()
+            } else {
+                Vec::new()
+            },
+        });
+    }
+    end_sequence_at_last_inked_row(&mut result, last_group_inked_row_count);
+    result
+}
+
+/// The charts one page-column prints: every anchored chart that reaches into
+/// its window, translated onto the page and clipped to the window.
+///
+/// Excel prints a chart that crosses a horizontal print boundary on both
+/// tiles: clipped at the printed sheet edge of the first, and continued on the
+/// next shifted left by the width the first tile already printed. On the
+/// native export of the reported budget workbook the month labels resume on
+/// the second tile exactly one first-tile width to the left of where they
+/// would have stood past the edge (issue #1598). Keeping every chart on the
+/// first tile alone painted the crossing chart into that page's right margin
+/// and left the next tile's chart band blank.
+///
+/// `window_left_pt` is where the page-column begins in sheet points; `window`
+/// is where its own columns begin on the page and how wide they print. A chart
+/// whose right edge sits exactly on the boundary paints nothing past it and is
+/// not continued. A chart no drawing anchors flows after the grid and stays on
+/// the first page-column, as before.
+fn charts_on_page_column(
+    charts: &[SheetChart],
+    window_left_pt: f64,
+    window: SheetClipWindow,
+    is_first_page_column: bool,
+) -> Vec<SheetChart> {
+    charts
+        .iter()
+        .filter_map(|chart| {
+            let Some(placement) = chart.placement else {
+                return is_first_page_column.then(|| chart.clone());
+            };
+            let painted_width_pt: f64 = placement.width * placement.print_scale;
+            let reaches_window: bool = placement.x_offset_pt + painted_width_pt > window_left_pt
+                && placement.x_offset_pt < window_left_pt + window.width_pt;
+            if !reaches_window {
+                return None;
+            }
+            let mut paged: SheetChart = chart.clone();
+            paged.placement = Some(crate::ir::SheetChartPlacement {
+                x_offset_pt: window.left_pt + (placement.x_offset_pt - window_left_pt),
+                clip_window: Some(window),
+                ..placement
+            });
+            Some(paged)
+        })
+        .collect()
+}
+
+/// Shrink a worksheet shape whole: its anchor offset and extent, the line
+/// geometry inside that extent, and its stroke width.
+fn scale_sheet_shape(sheet_shape: &mut crate::ir::SheetShape, scale: f64) {
+    use crate::ir::ShapeKind;
+
+    sheet_shape.x_offset_pt *= scale;
+    sheet_shape.y_offset_pt *= scale;
+    sheet_shape.width *= scale;
+    sheet_shape.height *= scale;
+    match &mut sheet_shape.shape.kind {
+        ShapeKind::Line { x1, y1, x2, y2, .. } => {
+            *x1 *= scale;
+            *y1 *= scale;
+            *x2 *= scale;
+            *y2 *= scale;
+        }
+        ShapeKind::Polyline { points, .. } => {
+            for (x, y) in points.iter_mut() {
+                *x *= scale;
+                *y *= scale;
+            }
+        }
+        // Every other kind is normalised to its extent, which is scaled above.
+        ShapeKind::Rectangle
+        | ShapeKind::Ellipse
+        | ShapeKind::RoundedRectangle { .. }
+        | ShapeKind::Polygon { .. }
+        | ShapeKind::Path { .. } => {}
+    }
+    if let Some(stroke) = sheet_shape.shape.stroke.as_mut() {
+        stroke.width *= scale;
+    }
+}
+
+/// Whether a cell paints anything of its own: text, a fill, a border, or a
+/// conditional-format decoration. A continued line is judged by
+/// [`SpillContinuation::paints`] where it is placed.
+fn cell_carries_ink(cell: &TableCell) -> bool {
+    cell_carries_text(cell)
+        || cell.background.is_some()
+        || cell.border.as_ref().is_some_and(|border| {
+            border.top.is_some()
+                || border.bottom.is_some()
+                || border.left.is_some()
+                || border.right.is_some()
+        })
+        || cell.data_bar.is_some()
+        || cell.sparkline.is_some()
+        || cell.icon_text.is_some()
+}
+
+/// End the printed page sequence at its last row carrying ink.
+///
+/// Excel prints the page-columns down, then over, and stops after the last
+/// page that paints anything. One-factor native Excel-for-Mac exports of
+/// `100-customers.xlsx` (issue #1714): shortening the occupation values of
+/// the last vertical band so nothing spills there prints 5 pages instead of
+/// 6, the down-page run followed by only the two strip pages that carry a
+/// tail; shortening the middle band's values instead still prints 6, the
+/// blank strip page for that band included. So only the last page-column
+/// ends early, at its last inked row, and a page-column before it keeps
+/// every row so a blank band inside the sequence still prints. The rows
+/// removed are trailing ones, which leaves every earlier band boundary where
+/// the renderer would have placed it.
+///
+/// Printed gridlines and headings paint every row of the range and no probe
+/// has measured whether Excel still ends the sequence early then, so such a
+/// sheet keeps all of its rows. A last page-column that carries a chart
+/// continuation and no inked cell keeps its rows too: the chart is ink and
+/// the tile prints.
+fn end_sequence_at_last_inked_row(pages: &mut Vec<SheetPage>, last_inked_row_count: usize) {
+    if pages.len() <= 1 {
+        return;
+    }
+    let Some(last) = pages.last_mut() else {
+        return;
+    };
+    if last.table.prints_gridlines || last.table.prints_headings {
+        return;
+    }
+    if last_inked_row_count == 0 {
+        // A chart continued onto this page-column paints there even though
+        // no cell does, so the tile still prints (issue #1598).
+        if last.charts.is_empty() {
+            pages.pop();
+        }
+        return;
+    }
+    let kept: usize = last_inked_row_count.max(last.table.header_row_count);
+    last.table.rows.truncate(kept);
+}
+
+/// Apply an explicit print percentage, or shrink to the selected fit bounds.
+///
+/// A sheet with `<pageSetUpPr fitToPage="1"/>` and `fitToWidth="1"` asks Excel
+/// to scale it onto one page wide rather than to spill the overflow onto a
+/// second strip. Reading neither attribute printed the repository workbook on
+/// 53 pages where Excel prints 23 (issue #530).
+///
+/// `fitToHeight` bounds the row direction the same way, and ECMA-376 defaults
+/// it to one page just as it defaults `fitToWidth`, so a sheet naming neither
+/// is asking to be squeezed onto a single page both ways. Excel obeys the
+/// tighter of the two bounds: the reported college-budget workbook fits A3's
+/// width at 0.89 and its height at 0.78, and its native export is one page at
+/// 0.78 (issue #1181).
+///
+/// Excel scales the whole sheet, not the columns alone, so the row heights and
+/// the type scale with the widths — the audited sheet's 10pt body text prints
+/// at 7.50pt, the same 0.75 the columns take.
+///
+/// An explicit percentage is a different instruction: it is not a bound to be
+/// satisfied but a factor to apply, so it multiplies the sheet outright and
+/// enlarges it when it names more than 100%. Fit-to-page, by contrast, never
+/// scales *up* to fill a page, so a sheet that already fits is left alone.
+/// Retaining 100% dimensions for a sheet declaring `scale="85"` left adjacent
+/// row-6 label origins 108pt apart against native Excel's 91.8pt (issue
+/// #1817).
+///
+/// Scaling happens before the column groups are packed, so a shrunk sheet fits
+/// correspondingly more columns and rows on each page, as Excel's does.
+fn fit_page_to_pages(
+    page: SheetPage,
+    fit: SheetFit,
+    header_footer_scales_with_doc: bool,
+) -> SheetPage {
+    // The two modes are alternatives, and this is where the sheet's choice is
+    // resolved: Excel greys the "Adjust to" box out while "Fit to" is
+    // selected but keeps whatever percentage the file last carried rather
+    // than clearing it, so a real workbook can declare both. Applying both
+    // would scale the sheet twice.
+    if !fit.fits_to_page
+        && let Some(percentage) = fit.print_percentage
+    {
+        return scale_sheet_page(
+            page,
+            f64::from(percentage) / 100.0,
+            header_footer_scales_with_doc,
+        );
+    }
+    let printable_width: f64 = page.size.width - page.margins.left - page.margins.right;
+    let total_width: f64 = page.table.column_widths.iter().sum();
+    let printable_height: f64 = page.size.height - page.margins.top - page.margins.bottom;
+    let Some(scale) = [
+        fit_scale(fit.pages_wide, printable_width, total_width),
+        fit_scale(fit.pages_tall, printable_height, fit.sheet_height_pt),
+    ]
+    .into_iter()
+    .flatten()
+    .reduce(f64::min) else {
+        return page;
+    };
+    if scale >= 1.0 {
+        return page;
+    }
+    scale_sheet_page(page, scale, header_footer_scales_with_doc)
+}
+
+/// The scale that fits `total_pt` of sheet into `pages` pages of `printable_pt`,
+/// or `None` when that direction is unconstrained — either unbounded by the
+/// file (a declared zero is Excel's "as many pages as it takes") or unmeasurable.
+///
+/// Excel's auto-fit scale is a whole percent, truncated rather than rounded so
+/// the content is guaranteed to fit. Keeping the raw ratio leaves every derived
+/// type size a fraction of a point off the printed sheet — the audited sheet
+/// came out at 7.55pt against Excel's 7.50pt.
+fn fit_scale(pages: Option<u32>, printable_pt: f64, total_pt: f64) -> Option<f64> {
+    let pages: u32 = pages.filter(|pages| *pages > 0)?;
+    if printable_pt <= 0.0 || total_pt <= 0.0 {
+        return None;
+    }
+    let exact_scale: f64 = (printable_pt * f64::from(pages)) / total_pt;
+    Some((exact_scale * 100.0).floor() / 100.0)
+}
+
+/// Multiply a sheet's widths, heights, type sizes, cell padding, and anchored
+/// drawings by `scale`.
+///
+/// Padding has to scale with the rest: it is a fixed per-row overhead, so
+/// leaving it at full size while the rows shrink costs a constant slice of
+/// every row and accumulates into whole extra pages over a long sheet.
+///
+/// The header and footer scale too, unless the sheet opts out.
+/// `headerFooter/@scaleWithDoc` defaults to 1 (ECMA-376 §18.3.1.46), so Excel
+/// shrinks them with the sheet; leaving them at full size printed the Gantt
+/// template's 8pt `&8` run beside 5.85pt body text (issue #940).
+fn scale_sheet_page(
+    mut page: SheetPage,
+    scale: f64,
+    header_footer_scales_with_doc: bool,
+) -> SheetPage {
+    if header_footer_scales_with_doc {
+        for header_footer in [page.header.as_mut(), page.footer.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            scale_header_footer_with_sheet(header_footer, scale);
+        }
+    }
+    // Every size below is multiplied by the scale outright. The factor itself
+    // rides on the table because a rule Excel evaluates at the declared size
+    // and scales afterwards cannot be recovered from the products — the
+    // wrapped-line advance of issue #1163 is one.
+    page.table.print_scale = Some(page.table.print_scale.unwrap_or(1.0) * scale);
+    for width in &mut page.table.column_widths {
+        *width *= scale;
+    }
+    // Normal-font XLSX cells inherit this value instead of carrying an own
+    // padding override, so it has to follow the same print scale explicitly.
+    if let Some(padding) = page.table.default_cell_padding.as_mut() {
+        padding.top *= scale;
+        padding.right *= scale;
+        padding.bottom *= scale;
+        padding.left *= scale;
+    }
+    // An anchored chart is measured against the sheet's own columns and rows,
+    // so the scale that shrinks those has to shrink the chart with them —
+    // otherwise the fitted grid slides out from under a full-size chart. On
+    // the reported workbook the 0.82 scale left the chart 183pt wider than
+    // the band it is anchored to, spilling past the printable edge (#982).
+    //
+    // The scale rides on the placement rather than being folded into its frame
+    // because Excel shrinks the whole drawing, not just the box around it: the
+    // chart's tick labels, category labels and legend scale with it. Shrinking
+    // the frame alone printed them at the size the chart XML declares, about
+    // 22% larger than the native export's (#1069).
+    for placement in page
+        .charts
+        .iter_mut()
+        .filter_map(|chart| chart.placement.as_mut())
+    {
+        placement.x_offset_pt *= scale;
+        placement.y_offset_pt *= scale;
+        placement.print_scale *= scale;
+    }
+    // A picture is anchored to the same columns and rows, so it shrinks with
+    // them too. Scaling the grid alone printed the reported workbook's photo
+    // at 234.95 x 171.05pt against the native export's 192.66 x 140.26 —
+    // 1/0.82 in each axis, the print scale never reaching it — and 84.83pt
+    // further down the page (#1111).
+    //
+    // The scale goes into the frame rather than riding beside it as the
+    // chart's does: a picture carries no text of its own, so there is nothing
+    // in it that a plain resize would leave at full size.
+    for image in &mut page.images {
+        image.x_offset_pt *= scale;
+        image.y_offset_pt *= scale;
+        if let Some(width) = image.image.width.as_mut() {
+            *width *= scale;
+        }
+        if let Some(height) = image.image.height.as_mut() {
+            *height *= scale;
+        }
+    }
+    // A line shape is anchored to the same columns and rows, and Excel scales
+    // its stroke with the page: the budget workbook's `a:ln w="12700"`
+    // separators trace as 0.78pt lines on its 0.78-fitted export (#1566).
+    for sheet_shape in &mut page.shapes {
+        scale_sheet_shape(sheet_shape, scale);
+    }
+    for row in &mut page.table.rows {
+        if let Some(height) = row.height.as_mut() {
+            *height *= scale;
+        }
+        for cell in &mut row.cells {
+            if let Some(padding) = cell.padding.as_mut() {
+                padding.top *= scale;
+                padding.right *= scale;
+                padding.bottom *= scale;
+                padding.left *= scale;
+            }
+            for block in &mut cell.content {
+                scale_block_font_sizes(block, scale);
+            }
+        }
+    }
+    page
+}
+
+/// Scale every run of a header or footer and retain the same factor for its
+/// horizontal sheet-coordinate box.
+///
+/// A run that states no size takes the renderer's default rather than being
+/// left alone: it is the size the run actually prints at, and skipping it left
+/// the Gantt template's leading `_x000D_` at 11pt while everything around it
+/// shrank (issue #940).
+///
+/// Excel applies the fit factor to the story's coordinates too. Retaining it
+/// separately lets the renderer reconstruct the scaled horizontal seat without
+/// scaling these already-adjusted font sizes a second time (issue #1510).
+fn scale_header_footer_with_sheet(header_footer: &mut HeaderFooter, scale: f64) {
+    header_footer.sheet_print_scale = Some(header_footer.sheet_print_scale.unwrap_or(1.0) * scale);
+    for paragraph in &mut header_footer.paragraphs {
+        for element in &mut paragraph.elements {
+            if let HFInline::Run(run) = element {
+                let size_pt: f64 = run
+                    .style
+                    .font_size
+                    .unwrap_or(crate::defaults::TYPST_DEFAULT_FONT_SIZE_PT);
+                run.style.font_size = Some(size_pt * scale);
+            }
+        }
+    }
+}
+
+fn scale_block_font_sizes(block: &mut Block, scale: f64) {
+    match block {
+        Block::Paragraph(paragraph) => {
+            for run in &mut paragraph.runs {
+                if let Some(size) = run.style.font_size.as_mut() {
+                    *size *= scale;
+                }
+            }
+        }
+        Block::Table(table) => {
+            for row in &mut table.rows {
+                for cell in &mut row.cells {
+                    for nested in &mut cell.content {
+                        scale_block_font_sizes(nested, scale);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Concatenate the repeated title columns before a column group's table.
+fn prepend_title_columns(title_table: &Table, group_table: Table) -> Table {
+    let mut column_widths: Vec<f64> = title_table.column_widths.clone();
+    column_widths.extend(group_table.column_widths.iter().copied());
+
+    let rows: Vec<TableRow> = title_table
+        .rows
+        .iter()
+        .zip(group_table.rows)
+        .map(|(title_row, group_row)| {
+            let mut cells: Vec<TableCell> = title_row.cells.clone();
+            cells.extend(group_row.cells);
+            TableRow {
+                cant_split: false,
+                minimum_height: None,
+                cells,
+                height: group_row.height,
+            }
+        })
+        .collect();
+
+    Table {
+        rows,
+        column_widths,
+        ..group_table
+    }
+}
+
+/// Greedily pack columns left-to-right into groups whose summed width fits
+/// their capacity; every group holds at least one column. The first group
+/// packs against `first_group_width` (the full printable width — it shows
+/// the title columns in place); later groups pack against
+/// `overflow_group_width`, which reserves room for the prepended titles.
+fn column_groups(
+    column_widths: &[f64],
+    first_group_width: f64,
+    overflow_group_width: f64,
+) -> Vec<(usize, usize)> {
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    let mut start: usize = 0;
+    let mut acc: f64 = 0.0;
+    for (index, width) in column_widths.iter().enumerate() {
+        let capacity: f64 = if groups.is_empty() {
+            first_group_width
+        } else {
+            overflow_group_width
+        };
+        if index > start && acc + width > capacity {
+            groups.push((start, index));
+            start = index;
+            acc = 0.0;
+        }
+        acc += width;
+    }
+    groups.push((start, column_widths.len()));
+    groups
+}
+
+/// The tail of an unwrapped line that reaches past a page-column boundary
+/// from a cell printed before it.
+struct SpillContinuation<'a> {
+    /// The cell whose line continues.
+    source: &'a TableCell,
+    /// Width of the line already printed before the boundary, from the
+    /// source cell's own left gridline.
+    offset_pt: f64,
+    /// Width the line still reaches past the boundary.
+    remaining_pt: f64,
+}
+
+/// The continuation `cell`, starting at column `cell_start` before
+/// `boundary`, sends past that boundary — `None` when it ends first.
+///
+/// Both the reach and the line have to cross. `spill_width` is the reach the
+/// line may paint across, in whole columns, and it bounds where the clip cuts
+/// the text off; `spill_line_extent` is the line itself, which usually ends
+/// inside that reach. Excel prints nothing on the next page-column for a line
+/// that ends on the boundary — `Customer Group Developer` reaches its
+/// page-column's last point exactly and stops (issue #1659) — so a line short
+/// of it is not redrawn there at all. A cell carrying no line extent — a
+/// synthetic table — is taken to fill its reach.
+///
+/// A merged cell's spill is the merge's own width, so it never reaches past
+/// the merge and never continues this way; the straddling merge is handled
+/// by [`slice_table_columns`]'s blanking branch instead.
+fn spill_continuation_past<'a>(
+    cell: &'a TableCell,
+    cell_start: usize,
+    boundary: usize,
+    column_widths: &[f64],
+) -> Option<SpillContinuation<'a>> {
+    let spill_width: f64 = cell.spill_width?;
+    let offset_pt: f64 = column_widths[cell_start..boundary].iter().sum();
+    let remaining_pt: f64 = spill_width - offset_pt;
+    let reach_pt: f64 = cell
+        .spill_line_extent
+        .map_or(spill_width, |extent| extent.reach_pt().min(spill_width));
+    (remaining_pt > 0.0 && reach_pt > offset_pt).then_some(SpillContinuation {
+        source: cell,
+        offset_pt,
+        remaining_pt,
+    })
+}
+
+/// Whether a cell paints any text of its own. A cell beyond the used range
+/// carries no blocks; an explicit empty string carries a run with no text.
+fn cell_carries_text(cell: &TableCell) -> bool {
+    cell.content.iter().any(|block| match block {
+        Block::Paragraph(paragraph) => paragraph.runs.iter().any(|run| !run.text.is_empty()),
+        _ => true,
+    })
+}
+
+/// Build a table containing only columns `[start, end)`, truncating cell
+/// spans at the group boundary. A merged cell that starts before the group
+/// keeps its geometry (background/border) but blanks its content.
+///
+/// An unmerged cell whose unwrapped line spills past the boundary is printed
+/// again on this page-column: Excel redraws the whole line in the group's
+/// first cell, shifted left by the width it already printed, and clips it at
+/// the page-column's edge. On the native export of
+/// `tests/fixtures/xlsx/customers_overflow_strip.xlsx` every tail on the strip
+/// sits exactly the first page-column's 450pt to the left of where the same
+/// word stands on page 1 (issue #1381). The continuation keeps the source's
+/// inset and vertical seat so its baseline matches; the fill and border are
+/// the strip cell's own.
+///
+/// The merge blanking is a stopgap, not a match for how a spreadsheet
+/// application prints the continuation. A LibreOffice render of
+/// `tests/fixtures/xlsx/merged_row_overflows_page_column.xlsx` redraws the
+/// merge's line on the following page-column at a negative x so its tail lands
+/// there, rather than leaving the cell empty (#631); no native Excel export
+/// of a straddling merge has been measured yet.
+fn slice_table_columns(table: &Table, start: usize, end: usize) -> ColumnGroupSlice {
+    let column_count: usize = table.column_widths.len();
+    // Tracks rows still covered by a row-spanning cell, per column.
+    let mut rowspan_remaining: Vec<usize> = vec![0; column_count];
+    let group_width: f64 = table.column_widths[start..end].iter().sum();
+
+    let mut rows: Vec<TableRow> = Vec::with_capacity(table.rows.len());
+    let mut inked_row_count: usize = 0;
+    for row in &table.rows {
+        let mut column_cursor: usize = 0;
+        let mut cells: Vec<TableCell> = Vec::new();
+        let mut row_paints: bool = false;
+        // The line, if any, still reaching into this group from a cell on an
+        // earlier page-column. Only a row's last text before the boundary can
+        // reach it: any later text or merge blocks the spill first.
+        let mut pending_continuation: Option<SpillContinuation<'_>> = None;
+
+        for cell in &row.cells {
+            while column_cursor < column_count && rowspan_remaining[column_cursor] > 0 {
+                rowspan_remaining[column_cursor] -= 1;
+                column_cursor += 1;
+            }
+            if column_cursor >= column_count {
+                break;
+            }
+
+            let span: usize = cell.col_span.max(1) as usize;
+            let cell_start: usize = column_cursor;
+            let cell_end: usize = (column_cursor + span).min(column_count);
+
+            if cell.row_span > 1 {
+                for occupied in rowspan_remaining.iter_mut().take(cell_end).skip(cell_start) {
+                    *occupied = (cell.row_span - 1) as usize;
+                }
+            }
+
+            if cell_end <= start {
+                if let Some(continuation) =
+                    spill_continuation_past(cell, cell_start, start, &table.column_widths)
+                {
+                    pending_continuation = Some(continuation);
+                } else if cell_carries_text(cell) || span > 1 {
+                    pending_continuation = None;
+                }
+            }
+
+            let overlap_start: usize = cell_start.max(start);
+            let overlap_end: usize = cell_end.min(end);
+            if overlap_start < overlap_end {
+                let mut sliced: TableCell = cell.clone();
+                sliced.col_span = (overlap_end - overlap_start) as u32;
+                if cell_start < start {
+                    // Continuation of a merge that began on an earlier page.
+                    sliced.content = Vec::new();
+                    sliced.spill_width = None;
+                } else if let Some(spill) = sliced.spill_width {
+                    // The spill width was measured against the whole sheet, so
+                    // it can reach far past the columns this page actually
+                    // carries — on a sheet wide enough to split, past the paper
+                    // edge, losing the ink entirely (#631). Clamp it to what
+                    // remains of the group from this cell's left edge.
+                    let available: f64 = table.column_widths[overlap_start..end].iter().sum();
+                    sliced.spill_width = Some(spill.min(available));
+                }
+                // A straddling merge paints on here even with its content
+                // blanked: the merge's line continues on this page-column in
+                // a spreadsheet application (#631).
+                let mut cell_paints: bool = cell_start < start || cell_carries_ink(&sliced);
+                if cell_start == start
+                    && span == 1
+                    && cell.row_span <= 1
+                    && !cell_carries_text(cell)
+                    && let Some(continuation) = pending_continuation.take()
+                {
+                    sliced.content = continuation.source.content.clone();
+                    sliced.spill_width = Some(continuation.remaining_pt.min(group_width));
+                    sliced.spill_continuation_offset_pt = Some(continuation.offset_pt);
+                    sliced.padding = continuation.source.padding;
+                    sliced.vertical_align = continuation.source.vertical_align;
+                    cell_paints = true;
+                }
+                row_paints |= cell_paints;
+                cells.push(sliced);
+            }
+
+            column_cursor = cell_end;
+        }
+
+        // Columns occupied only by rowspans still need their counters advanced.
+        while column_cursor < column_count {
+            if rowspan_remaining[column_cursor] > 0 {
+                rowspan_remaining[column_cursor] -= 1;
+            }
+            column_cursor += 1;
+        }
+
+        rows.push(TableRow {
+            cant_split: false,
+            minimum_height: None,
+            cells,
+            height: row.height,
+        });
+        if row_paints {
+            inked_row_count = rows.len();
+        }
+    }
+
+    let table = Table {
+        rows,
+        column_widths: table.column_widths[start..end].to_vec(),
+        header_row_count: table.header_row_count,
+        non_repeating_header_row_count: table.non_repeating_header_row_count,
+        alignment: table.alignment,
+        default_cell_padding: table.default_cell_padding,
+        use_content_driven_row_heights: table.use_content_driven_row_heights,
+        default_vertical_align: table.default_vertical_align,
+        seats_bottom_aligned_text_on_descender: table.seats_bottom_aligned_text_on_descender,
+        bottom_aligned_descent_floor_pt: table.bottom_aligned_descent_floor_pt,
+        border_paint_model: table.border_paint_model,
+        prints_gridlines: table.prints_gridlines,
+        prints_headings: table.prints_headings,
+        centers_between_print_margins: table.centers_between_print_margins,
+        print_scale: table.print_scale,
+    };
+    ColumnGroupSlice {
+        table,
+        inked_row_count,
+    }
+}
+
+/// One page-column's table and how far down it paints anything.
+struct ColumnGroupSlice {
+    table: Table,
+    /// One past the last row with a cell that paints text, a continued
+    /// line, a fill, a border, a decoration, or a straddling merge; zero
+    /// when nothing in the group paints.
+    inked_row_count: usize,
+}
+
+/// Split a drawing-only sheet into page-columns at printable-width
+/// boundaries.
+///
+/// Excel prints a drawing that crosses the printable edge clipped there and
+/// continues it on the next page-column. The empty-sheet branch previously
+/// emitted one page and let the pictures overflow the right margin — the
+/// tomcat of `WithDrawing.xlsx` ran 36pt past the printable edge on a single
+/// page where Excel prints two (issue #713). The table is empty, so
+/// [`split_sheet_page_by_width`] has no column widths to split on; the
+/// drawings' extents drive the paging instead.
+///
+/// Every image on a split page carries [`crate::ir::SheetImage::clip_width_pt`]
+/// so the renderer clips it to its page-column window; a continued copy also
+/// carries a negative `x_offset_pt`. Charts follow the same windows through
+/// [`charts_on_page_column`]; text boxes and shapes stay on the first
+/// page-column, like the column splitter keeps them on its first group.
+pub(super) fn split_drawing_only_page(page: SheetPage) -> Vec<SheetPage> {
+    let printable_width: f64 = page.size.width - page.margins.left - page.margins.right;
+    if printable_width <= 0.0 {
+        return vec![page];
+    }
+    let right_extent: f64 = page
+        .images
+        .iter()
+        .map(|image| image.x_offset_pt + image.image.width.unwrap_or(0.0))
+        .fold(0.0, f64::max);
+    if right_extent <= printable_width {
+        return vec![page];
+    }
+    let group_count: usize =
+        ((right_extent / printable_width).ceil() as usize).clamp(2, MAX_COLUMN_GROUPS);
+
+    (0..group_count)
+        .map(|group| {
+            let window_left: f64 = group as f64 * printable_width;
+            let mut paged: SheetPage = page.clone();
+            paged.images = page
+                .images
+                .iter()
+                .filter(|image| {
+                    let width: f64 = image.image.width.unwrap_or(0.0);
+                    image.x_offset_pt + width > window_left
+                        && image.x_offset_pt < window_left + printable_width
+                })
+                .map(|image| {
+                    let mut paged_image = image.clone();
+                    paged_image.x_offset_pt -= window_left;
+                    paged_image.clip_width_pt = Some(printable_width);
+                    paged_image
+                })
+                .collect();
+            paged.charts = charts_on_page_column(
+                &page.charts,
+                window_left,
+                SheetClipWindow {
+                    left_pt: 0.0,
+                    width_pt: printable_width,
+                },
+                group == 0,
+            );
+            if group > 0 {
+                paged.text_boxes = Vec::new();
+                paged.shapes = Vec::new();
+            }
+            paged
+        })
+        .collect()
+}
+
+#[cfg(test)]
+#[path = "xlsx_pagination_tests.rs"]
+mod tests;
