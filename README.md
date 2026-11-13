@@ -316,28 +316,40 @@ curl -X POST http://127.0.0.1:8080/api/v1/convert \
 
 ## Conversion engines
 
-The native engine is pure Rust and always available. External engines are probed at startup; missing tools are listed by `/api/v1/engines` but excluded from routing. This is why the same catalog can be "available" or "unavailable" depending on deployment.
+DocForge ships two pure-Rust engines and probes optional external tools at startup. The native engines are always available; missing external tools are shown by `/api/v1/engines` and excluded from routing.
 
-| Engine | Tool | Typical formats |
+### Native engines
+
+| Engine | Coverage | Notes |
 | --- | --- | --- |
-| Native | — | TXT/MD/HTML/DOCX/ODT/RTF/PDF/EPUB/PPTX, CSV/TSV/XLSX/ODS/JSON/XML/YAML/TOML, VCF/ICS, JPG/PNG/TIFF/WEBP/BMP/SVG, CBZ, EML, Outlook MSG; DOCX/PPTX/XLSX→PDF via Typst; PDF→PNG/JPG/TIFF; English/Latin OCR |
-| LibreOffice | `soffice` | DOC/DOCX/ODT/RTF, PPT/PPTX/ODP, XLS/XLSX/ODS, PDF, HTML |
-| Pandoc | `pandoc` | Markdown, HTML, DOCX, ODT, EPUB, LaTeX, RTF, PPTX |
-| Poppler | `pdftotext`, `pdftoppm`, `pdftohtml`, `pdftocairo` | PDF â†’ text/HTML/SVG/raster |
-| Ghostscript | `gs` | PS â†” PDF, PDF â†’ raster |
-| ImageMagick | `magick` | Images, HEIC, SVG, PDF raster |
-| Calibre | `ebook-convert` | EPUB â†” MOBI, EPUB â†’ PDF/DOCX |
+| `native` | TXT/MD/HTML/DOCX/ODT/RTF/PDF/EPUB/PPTX; CSV/TSV/XLSX/ODS/JSON/XML/YAML/TOML; VCF/ICS; JPG/PNG/TIFF/WEBP/BMP/SVG; CBZ; EML; Outlook MSG | Structural document engine plus native data/image adapters |
+| `native` | DOCX/PPTX/XLSX → PDF | `office2pdf`/Typst renderer; cost 6, falls back to the structural renderer if a file is unsupported |
+| `native` | PDF → PNG/JPG/TIFF | `pdf-render`; selected page or first page, DPI from `options.pdf.dpi`; transparency flattened onto white |
+| `native-ocr` | Images → TXT/PDF; PDF → TXT (OCR) | Embedded `ocrs` models for English/Latin; no external binary or model download |
+
+Native Office-to-PDF is preferred on a cost tie with LibreOffice, so a normal installation uses the pure-Rust path first. PDF rasterization is also native-first; Poppler/Ghostscript remain available for PDF features the native renderer does not cover. Native OCR is a fallback: when Tesseract is installed its lower advertised cost keeps it preferred for higher accuracy, additional languages, and searchable PDF.
+
+### Optional external engines
+
+| Engine | Tool | Unlocks / role |
+| --- | --- | --- |
+| LibreOffice | `soffice` | Legacy DOC/PPT/XLS, exact/high-fidelity Office/ODF layout, fallback for complex files |
+| Pandoc | `pandoc` | Broad Markdown/HTML/DOCX/ODT/EPUB/LaTeX/RTF/PPTX structural conversions |
+| Poppler | `pdftotext`, `pdftoppm`, `pdftohtml`, `pdftocairo` | PDF → SVG/vector output, text/HTML, and raster fallback |
+| Ghostscript | `gs` | PS ↔ PDF, XPS, and PDF raster fallback |
+| ImageMagick | `magick` | HEIC, image operations, and fallback rasterization |
+| Calibre | `ebook-convert` | EPUB ↔ MOBI, EPUB → PDF/DOCX |
 | Tesseract | `tesseract` + Poppler | Higher-accuracy/multi-language OCR, searchable PDF |
 | 7-Zip | `7z` | CBR extraction |
-| DjVuLibre | `ddjvu`, `cjb2`, `djvm` | DjVu â†” PDF |
-| gxps | `gxps` | XPS â†’ PDF |
-| antiword | `antiword` | Legacy DOC â†’ TXT |
-| FFmpeg | `ffmpeg` | HEIC â†’ JPG/PNG |
+| DjVuLibre | `ddjvu`, `cjb2`, `djvm` | DjVu ↔ PDF |
+| gxps | `gxps` | XPS → PDF |
+| antiword | `antiword` | Legacy DOC → TXT |
+| FFmpeg | `ffmpeg` | HEIC → JPG/PNG |
 | Apple iWork | `osascript` | Pages/Key/Numbers (macOS only) |
 
-The full [Dockerfile](Dockerfile) installs the Linux-capable set. Pages/Key/Numbers are only available on macOS because they rely on AppleScript export; the catalog still lists them and reports them unavailable elsewhere.
+The full [Dockerfile](Dockerfile) installs the Linux-capable external set. Pages/Key/Numbers are only available on macOS because they rely on AppleScript export.
 
-**Fidelity notes.** The native document route preserves block structure (headings, paragraphs, lists, tables, code) rather than pixel layout. DOCX/PPTX/XLSX→PDF uses the native `office2pdf`/Typst renderer and falls back to the structural model if a file is unsupported; LibreOffice remains available for exact/complex layout. PDF rasterization uses the pure-Rust `pdf-render` engine. PDF text extraction uses the PDF text layer; scanned PDFs use native `ocrs` (English/Latin) when Tesseract is not installed (`options.ocr=true`). PDF → raster converts the selected/first page unless an engine supports multi-page output. PDF table extraction is heuristic.
+**Fidelity notes.** The structural native document route preserves block structure (headings, paragraphs, lists, tables, code), not typography. DOCX/PPTX/XLSX→PDF uses `office2pdf`/Typst and is substantially richer, but is not a pixel-perfect LibreOffice clone; LibreOffice remains available for exact/complex layout. PDF rasterization uses `pdf-render` and returns the selected/first page unless an engine supports multi-page output. PDF text extraction uses the PDF text layer; scanned PDFs use native `ocrs` (English/Latin) when Tesseract is not installed (`options.ocr=true`). PDF table extraction is heuristic.
 
 See [Conversions](docs/CONVERSIONS.md) for the full routing policy and per-category notes, and [Third-party notices](THIRD_PARTY.md) for bundled engine/model licenses.
 
