@@ -78,3 +78,11 @@ usvg = "0.44.0"
 uuid = { version = "1.11.0", features = ["serde", "v4"] }
 which = "7.0.0"
 zip = { version = "=2.2.2", default-features = false, features = ["deflate"] }
+djvu-rs = { version = "0.45.0", features = ["pdf"] }
+rars = { version = "0.12.4", default-features = false, features = ["write"] }
+heic-rs = { version = "0.1.4", default-features = false, features = ["std"] }
+rust-docx = "0.3.1"
+epub3-kindle = { version = "0.5.1", default-features = false }
+mobi = "0.8.0"
+iwork = "0.4.0"
+stet = "0.10.0"

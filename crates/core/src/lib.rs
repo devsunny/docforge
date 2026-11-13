@@ -10,6 +10,8 @@ pub mod external;
 pub mod format;
 pub mod graph;
 pub mod native;
+pub mod native_extra;
+pub mod native_extra2;
 pub mod ocr;
 pub mod office;
 pub mod options;

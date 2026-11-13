@@ -48,6 +48,13 @@ The pure-Rust engine handles:
 - **Office → PDF:** DOCX/PPTX/XLSX → PDF through `office2pdf`/Typst, with the structural document/workbook renderer as fallback.
 - **PDF raster:** PDF → PNG/JPG/TIFF through the pure-Rust `pdf-render` engine, selected page or first page.
 - **OCR:** English/Latin image/PDF OCR through embedded `ocrs` models; no external binary required.
+- **DjVu:** DJVU → PDF/TXT/Markdown through `djvu-rs`.
+- **Comics:** CBR/RAR → PDF through `rars` extraction.
+- **HEIC:** HEIC → PDF/JPG/PNG through `heic-rs`.
+- **Legacy Word:** DOC → DOCX or DOC → PDF through `rust-docx` (PDF uses Typst with a structural fallback).
+- **E-books:** MOBI → EPUB through `mobi`; EPUB → MOBI through `epub3-kindle`.
+- **iWork:** Pages/Numbers/Keynote content extraction through `iwork`.
+- **PostScript:** PS → PDF/PNG through the `stet` interpreter.
 - **Structured data:** JSON ↔ YAML/TOML/XML/CSV/XLSX, XML ↔ JSON/CSV, CSV ↔ TSV/JSON/XML/VCF/ICS, JSON/CSV → XLSX/PDF/DOCX.
 - **Spreadsheets:** CSV/TSV/XLSX/XLS/ODS → CSV/TSV/XLSX/ODS/JSON/XML/HTML/Markdown/PDF/DOCX.
 - **Contacts/calendar:** VCF/ICS ↔ CSV, and as document tables.
@@ -82,7 +89,10 @@ The full Docker image installs the Linux-capable subset. Apple iWork formats are
 - **Scanned PDFs:** use OCR. Native PDF text extraction returns an error when the text layer is empty; native `ocrs` supports English/Latin, while Tesseract adds language coverage and searchable PDF.
 - **PDF tables:** native `PDF→CSV/XLSX` uses whitespace/run heuristics; complex merged tables should use a dedicated table extractor.
 - **Multi-page image output:** PDF→JPG/PNG/TIFF currently returns the selected (or first) page. Use a job pipeline or a dedicated raster tool for page archives.
-- **Apple iWork:** only on macOS with Pages/Keynote/Numbers installed.
+- **Apple iWork:** native extraction preserves text/tables/slides, not layout. Use macOS AppleScript export for exact layout.
+- **Native PostScript:** PS → PDF is rasterized at `options.pdf.dpi`; Ghostscript remains available for vector fidelity.
+- **Native e-books:** legacy MOBI → EPUB is supported; KF8-only MOBI/AZW3 should use Calibre.
+- **Native CBR/DjVu/HEIC:** common files are supported; fall back to 7-Zip, DjVuLibre, or ImageMagick for unsupported codecs.
 - **DCR/auth storage:** in-memory; restart invalidates clients, codes, refresh tokens, and the signing key unless replaced.
 - **Unicode shaping:** the native PDF writer embeds a Latin/Cyrillic/Greek-capable font; complex scripts (Arabic/Indic/CJK) need an external PDF engine.
 

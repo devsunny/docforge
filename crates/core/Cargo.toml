@@ -47,6 +47,14 @@ uuid.workspace = true
 which.workspace = true
 zip.workspace = true
 
+djvu-rs.workspace = true
+rars.workspace = true
+heic-rs.workspace = true
+rust-docx.workspace = true
+epub3-kindle.workspace = true
+mobi.workspace = true
+iwork.workspace = true
+stet.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true }

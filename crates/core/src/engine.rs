@@ -94,6 +94,20 @@ pub struct EngineDescriptor {
     pub priority: u32,
 }
 
+fn native_engines() -> Vec<Arc<dyn Engine>> {
+    vec![
+        Arc::new(crate::native::NativeEngine::new()),
+        Arc::new(crate::ocr::NativeOcrEngine),
+        Arc::new(crate::native_extra::DjvuEngine),
+        Arc::new(crate::native_extra::CbrEngine),
+        Arc::new(crate::native_extra::HeicEngine),
+        Arc::new(crate::native_extra::LegacyDocEngine),
+        Arc::new(crate::native_extra2::EbookEngine),
+        Arc::new(crate::native_extra2::IworkEngine),
+        Arc::new(crate::native_extra2::PostScriptEngine),
+    ]
+}
+
 pub struct EngineRegistry {
     engines: Vec<Arc<dyn Engine>>,
 }
@@ -106,18 +120,12 @@ impl EngineRegistry {
     }
 
     pub fn native_only() -> Self {
-        Self::new(vec![
-            Arc::new(crate::native::NativeEngine::new()),
-            Arc::new(crate::ocr::NativeOcrEngine),
-        ])
+        Self::new(native_engines())
     }
 
     /// Build the default registry, probing optional external tools.
     pub fn detect() -> Self {
-        let mut engines: Vec<Arc<dyn Engine>> = vec![
-            Arc::new(crate::native::NativeEngine::new()),
-            Arc::new(crate::ocr::NativeOcrEngine),
-        ];
+        let mut engines: Vec<Arc<dyn Engine>> = native_engines();
         engines.extend(crate::external::detected_engines());
         Self::new(engines)
     }

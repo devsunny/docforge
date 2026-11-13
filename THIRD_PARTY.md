@@ -24,6 +24,19 @@ licenses.
 - The `ocrs` Rust code is MIT OR Apache-2.0; the model files are data assets
   under CC BY-SA 4.0.
 
+## Native format engines
+
+| Crate | License | Use |
+| --- | --- | --- |
+| `djvu-rs` | MIT | DjVu parsing, rendering, PDF/text export |
+| `rars` | Apache-2.0 | RAR/CBR extraction |
+| `heic-rs` | MIT OR Apache-2.0 | HEIC/HEIF decoding |
+| `rust-docx` | MIT | Legacy Word parsing and DOCX serialization |
+| `epub3-kindle` | MIT | EPUB → MOBI |
+| `mobi` | MIT | MOBI parsing |
+| `iwork` | MIT | Pages/Numbers/Keynote content extraction |
+| `stet` | Apache-2.0 OR MIT | PostScript interpretation/rendering; embeds URW base-35 fonts under SIL OFL 1.1 |
+
 ## Rust crates
 
 All other Rust dependencies are declared in `Cargo.toml` / `Cargo.lock` and

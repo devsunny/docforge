@@ -47,6 +47,8 @@ Catalog rows carry availability computed by the planner at startup, but the plan
 | `document/` | `Document` block model; DOCX/ODT/RTF/PDF/EPUB/PPTX readers/writers |
 | `data.rs` | CSV/TSV/XLSX/XLS/ODS, JSON/YAML/TOML/XML, VCF/ICS, images, CBZ |
 | `native.rs` | Route matrix and dispatch for the pure-Rust engine |
+| `native_extra.rs` | DjVu, CBR/RAR, HEIC, and legacy Word adapters |
+| `native_extra2.rs` | MOBI/EPUB, Apple iWork, and PostScript adapters |
 | `office.rs` | DOCX/PPTX/XLSX → PDF through vendored `office2pdf`/Typst |
 | `pdf_raster.rs` | Pure-Rust PDF page rasterization through `pdf-render` |
 | `ocr.rs` | Native OCR engine through embedded `ocrs` models |
